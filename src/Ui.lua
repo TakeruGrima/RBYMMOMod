@@ -67,6 +67,9 @@ local DIGITS = {
 -- for whatever opens next
 local ownedTitles = {}
 
+-- remembered cursor rows, so reopening a menu lands where you left it
+local cursor = {}
+
 local function ownTitle(title)
   ownedTitles[title] = true
   return title
@@ -145,6 +148,12 @@ function M:install()
 
   -- ------- the main MMO menu
 
+  -- The MMO menu is a START submenu, so it looks like one: a bordered box
+  -- in the same corner, double-spaced rows, the blinking arrow, and B
+  -- returning to START rather than dumping you into the world. Menu (not
+  -- ListMenu) is the widget for that -- ListMenu is the full-screen
+  -- inventory list the bag and the PC use, which is why this screen used to
+  -- take over the whole display for four short commands.
   screens:register(SCREEN.MAIN, { new = function(game)
     local client = ctx.client
     local items = {}
@@ -158,8 +167,6 @@ function M:install()
     -- their address or stop hosting -- the menu offered to start a game
     -- they were already running.
     if connected or hosting then
-      -- the address to read out to friends, re-viewable for as long as the
-      -- game is up; this is the only place it is shown after starting
       if hosting then
         items[#items + 1] = {
           label = "ADDRESS",
@@ -167,22 +174,20 @@ function M:install()
         }
       end
       if connected then
-      items[#items + 1] = {
-        label = "PLAYERS",
-        right = hosting
-          and ("%d/%d"):format(ctx.roster.count + 1, client:hostLimit())
-          or tostring(ctx.roster.count),
-        onSelect = function() mod.ui.push(game, SCREEN.ROSTER) end,
-      }
-      items[#items + 1] = {
-        label = "CHAT",
-        right = ctx.chat.unread > 0 and ("+" .. ctx.chat.unread) or nil,
-        onSelect = function() mod.ui.push(game, SCREEN.CHATLOG) end,
-      }
-      items[#items + 1] = {
-        label = "SAY",
-        onSelect = function() mod.ui.push(game, SCREEN.SCOPE) end,
-      }
+        items[#items + 1] = {
+          label = "PLAYERS",
+          onSelect = function() mod.ui.push(game, SCREEN.ROSTER) end,
+        }
+        -- an asterisk for unread, the way the original marks state in a
+        -- label rather than with a second column the box has no room for
+        items[#items + 1] = {
+          label = ctx.chat.unread > 0 and "CHAT*" or "CHAT",
+          onSelect = function() mod.ui.push(game, SCREEN.CHATLOG) end,
+        }
+        items[#items + 1] = {
+          label = "SAY",
+          onSelect = function() mod.ui.push(game, SCREEN.SCOPE) end,
+        }
       end
       items[#items + 1] = {
         label = hosting and "END GAME" or "LEAVE",
@@ -218,31 +223,72 @@ function M:install()
       }
     end
 
-    return mod.ui.ListMenu.new(game, "MMO", items, {
-      onChoose = function(item, menu)
-        menu:close()
-        if item.onSelect then item.onSelect() end
-      end,
+    local menu = mod.ui.Menu.new(game, items, {
+      tx = 9, ty = 0, tw = 11,
+      -- the same ceiling the START menu uses: (18 rows - 2 border) / 2
+      maxVisible = 8,
+      -- B goes back where it came from, like every vanilla submenu
+      onCancel = function() mod.ui.push(game, "StartMenu") end,
     })
+    -- the cursor survives closing the menu, as the original's does
+    menu.index = math.min(cursor.main or 1, math.max(1, #items))
+    menu:clampScroll()
+    local baseUpdate = menu.update
+    menu.update = function(self, dt)
+      baseUpdate(self, dt)
+      cursor.main = self.index
+    end
+    return menu
   end })
 
   -- ------- hosting: pick the limit, then start
 
+  -- How many players, as a menu of sizes rather than a bare number box.
+  --
+  -- This was QuantityBox, the engine's *shop* quantity widget, which drew
+  -- "x02" in a corner with nothing to say what it counted -- the player had
+  -- no way to know they were choosing a room size. Named rows say it
+  -- outright, and a bordered list is the shape the original uses for a
+  -- choice like this anyway.
+  local SIZES = { 2, 4, 8, 16, 32, 64 }
+
   screens:register(SCREEN.HOSTSET, { new = function(game)
     local client = ctx.client
-    -- QuantityBox is the engine's number picker; it wraps 1..max, so the
-    -- floor is enforced on the way out rather than by the widget
-    return mod.ui.QuantityBox.new(game, {
-      max = Config.MAX_PLAYERS,
-      start = client:maxPlayers(),
-      onDone = function(qty)
-        if not qty then return end
-        client:setMaxPlayers(qty)
-        if client:host(game) then
-          mod.ui.push(game, SCREEN.HOSTINFO)
-        end
-      end,
+    local current = client:maxPlayers()
+
+    local sizes = {}
+    for _, n in ipairs(SIZES) do sizes[#sizes + 1] = n end
+    -- a number set in the options pane is still reachable here, even if it
+    -- is not one of the round ones
+    local known = false
+    for _, n in ipairs(sizes) do if n == current then known = true end end
+    if not known then
+      sizes[#sizes + 1] = current
+      table.sort(sizes)
+    end
+
+    local items, start = {}, 1
+    for i, n in ipairs(sizes) do
+      if n == current then start = i end
+      items[#items + 1] = {
+        label = ("%d PLAYERS"):format(n),
+        onSelect = function()
+          client:setMaxPlayers(n)
+          if client:host(game) then
+            mod.ui.push(game, SCREEN.HOSTINFO)
+          end
+        end,
+      }
+    end
+
+    local menu = mod.ui.Menu.new(game, items, {
+      tx = 8, ty = 0, tw = 12, maxVisible = 8,
+      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
     })
+    -- open on what is already configured, so confirming is one button
+    menu.index = start
+    menu:clampScroll()
+    return menu
   end })
 
   screens:register(SCREEN.HOSTINFO, { new = function(game)
@@ -290,15 +336,22 @@ function M:install()
         value = player.id,
       }
     end
+    -- A roster is genuinely a list -- variable length, with a status
+    -- column -- so this one stays the full-screen ListMenu the bag and the
+    -- PC use, rather than a command box.
     return mod.ui.ListMenu.new(game, "PLAYERS", items, {
       pageJump = true,
       onChoose = function(item, menu)
         menu:close()
         local player = ctx.roster:get(item.value)
         if player then
-          mod.ui.push(game, SCREEN.ACTIONS, { playerId = player.id })
+          mod.ui.push(game, SCREEN.ACTIONS, {
+            playerId = player.id,
+            onCancel = function() mod.ui.push(game, SCREEN.ROSTER) end,
+          })
         end
       end,
+      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
     })
   end })
 
@@ -310,40 +363,93 @@ function M:install()
       return mod.ui.TextBox.new(game, "They just went\noffline.")
     end
 
+    -- Three commands about the person in front of you: a small box, the
+    -- way the original asks CUT/SURF or a party submenu. Sized to the
+    -- widest label by Menu itself and nudged on-screen, so it stays right
+    -- however long a trainer's name is.
     local items = {
       { label = "TRADE", kind = "trade" },
       { label = "BATTLE", kind = "battle" },
       { label = "WHISPER" },
     }
 
-    return mod.ui.ListMenu.new(game, player.name, items, {
-      onChoose = function(item, menu)
-        menu:close()
-        if item.kind then
-          ctx.sessions:request(player, item.kind)
+    for _, item in ipairs(items) do
+      local kind = item.kind
+      item.onSelect = function()
+        if kind then
+          ctx.sessions:request(player, kind)
         else
           mod.ui.push(game, SCREEN.COMPOSE,
             { scope = "private", to = player.id, toName = player.name })
         end
-      end,
+      end
+    end
+
+    return mod.ui.Menu.new(game, items, {
+      -- low and to the right, clear of the two characters this menu is
+      -- about: a command box that covers the person you are talking to
+      -- reads as a bug even when it is not one
+      tx = 11, ty = 7, tw = 9,
+      -- back to whatever opened this: the roster if you came from the menu,
+      -- the world if you walked up and pressed A
+      onCancel = opts and opts.onCancel,
     })
   end })
 
   -- ------- the chat log
 
+  -- Chat lines are the one thing here that will not fit a Game Boy row.
+  -- A 60-character message is three times the width of the screen, and
+  -- ListMenu draws a label as one line, so it would simply run off the
+  -- edge. Wrap on spaces and indent the continuations, the way the
+  -- original's text boxes break a sentence.
+  -- 15, not 18: ListMenu indents its rows past the cursor column, so the
+  -- full screen width is not what a row actually gets. Wrapping to the
+  -- theoretical width put the last word hard against the right edge.
+  local CHAT_COLS = 15
+
+  local function wrapLine(text, first, rest)
+    local rows, line = {}, first
+    for word in tostring(text):gmatch("%S+") do
+      local candidate = line == "" and word or (line .. " " .. word)
+      if #candidate > CHAT_COLS and line ~= "" then
+        rows[#rows + 1] = line
+        line = rest .. word
+      else
+        line = candidate
+      end
+    end
+    if line ~= "" then rows[#rows + 1] = line end
+    return rows
+  end
+
   screens:register(SCREEN.CHATLOG, { new = function(game)
     ctx.chat:markRead()
     local items = {}
     for _, entry in ipairs(ctx.chat:recent(Config.CHAT_HISTORY)) do
-      items[#items + 1] = { label = ctx.chat:line(entry) }
+      -- Speaker on its own row, message wrapped beneath it.
+      --
+      -- Running them together ate the width and, worse, merged the scope
+      -- tag into the name: "G" + "HOSTY" read as "GHOSTY". Brackets keep
+      -- the tag distinct, and giving the message its own rows means it gets
+      -- the full 18 columns instead of whatever the name left over.
+      local tag = Chat.TAG[entry.scope] or "?"
+      items[#items + 1] = { label = ("[%s]%s:"):format(tag, entry.name) }
+      for _, row in ipairs(wrapLine(entry.text, " ", " ")) do
+        items[#items + 1] = { label = row }
+      end
     end
     if #items == 0 then
       items[#items + 1] = { label = "No messages yet." }
     end
-    return mod.ui.ListMenu.new(game, "CHAT", items, {
+    -- newest last, so open on the bottom the way a chat log should read
+    local menu = mod.ui.ListMenu.new(game, "CHAT", items, {
       pageJump = true,
       onChoose = function(_, menu) menu:close() end,
+      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
     })
+    menu.index = #items
+    return menu
   end })
 
   -- ------- pick a scope, then type
@@ -353,11 +459,15 @@ function M:install()
       { label = "EVERYONE", scope = "global" },
       { label = "NEARBY", scope = "local" },
     }
-    return mod.ui.ListMenu.new(game, "SAY TO", items, {
-      onChoose = function(item, menu)
-        menu:close()
-        mod.ui.push(game, SCREEN.COMPOSE, { scope = item.scope })
-      end,
+    for _, item in ipairs(items) do
+      local scope = item.scope
+      item.onSelect = function()
+        mod.ui.push(game, SCREEN.COMPOSE, { scope = scope })
+      end
+    end
+    return mod.ui.Menu.new(game, items, {
+      tx = 9, ty = 0, tw = 11,
+      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
     })
   end })
 

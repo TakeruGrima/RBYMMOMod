@@ -311,7 +311,18 @@ return function(game)
 
         H.await(game, "host_address_checked", 60 * 120)
         H.closeToOverworld(game)
-        if H.openMmo(game) and H.selectLabel(game, "LEAVE") then
+        local opened = H.openMmo(game)
+        if opened then
+          U.wait(25)
+          U.shot(game, SHOT_DIR .. "/join-mmo-menu.png")
+          if H.selectLabel(game, "CHAT") then
+            U.wait(35)
+            U.shot(game, SHOT_DIR .. "/join-chat-log.png")
+            U.tap(game, "b")   -- CHAT's onCancel puts the MMO menu back
+            U.wait(25)
+          end
+        end
+        if opened and H.selectLabel(game, "LEAVE") then
           H.drivePrompts(game, function()
             return not exports.isConnected()
           end, 60 * 30)

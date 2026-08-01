@@ -74,22 +74,12 @@ return function(game)
     return
   end
 
-  -- QuantityBox starts at the saved/default limit and steps by one; walk it
-  -- down to LIMIT so the cap under test is the one this run chose
-  U.wait(15)
-  local box = H.top(game)
-  check(box ~= nil and box.qty ~= nil, "the limit picker opened")
-  if box and box.qty then
-    local guard = 0
-    while box.qty > LIMIT and guard < 80 do
-      U.tap(game, "down")
-      U.wait(2)
-      guard = guard + 1
-    end
-    check(box.qty == LIMIT, "the limit reads " .. LIMIT)
-  end
+  -- the size picker is a named list now, so the run picks its row by name
+  U.wait(20)
+  check(H.classify(H.top(game)) == "menu", "the limit picker opened")
   U.shot(game, SHOT_DIR .. "/host-limit.png")
-  U.tap(game, "a")
+  local picked = H.selectLabel(game, ("%d PLAYERS"):format(LIMIT))
+  check(picked, "chose " .. LIMIT .. " PLAYERS")
   U.wait(30)
 
   -- ------- the listener is real
@@ -309,7 +299,12 @@ return function(game)
 
     H.closeToOverworld(game)
     local address = exports.hostAddress()
-    if H.openMmo(game) and H.selectLabel(game, "ADDRESS") then
+    local opened = H.openMmo(game)
+    if opened then
+      U.wait(25)
+      U.shot(game, SHOT_DIR .. "/host-mmo-menu.png")
+    end
+    if opened and H.selectLabel(game, "ADDRESS") then
       U.wait(30)
       local shown = H.textOf(H.top(game))
       log("address screen reads:", shown)

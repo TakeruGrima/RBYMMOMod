@@ -31,12 +31,22 @@ end
 -- tapped "down" a fixed number of times would break the moment the menu
 -- changed shape. Menu and ListMenu both expose `items` and a 1-based
 -- `index`, so the cursor distance can be computed instead.
+-- Matches a row by label, tolerating a trailing marker: the CHAT row reads
+-- "CHAT*" while messages are unread, and a driver that demanded an exact
+-- string would fail for the wrong reason.
+local function labelMatches(actual, wanted)
+  if actual == wanted then return true end
+  return type(actual) == "string"
+    and actual:sub(1, #wanted) == wanted
+    and actual:sub(#wanted + 1):match("^[%*%s]*$") ~= nil
+end
+
 function M.selectLabel(game, label, frames)
   local ok = M.waitFor(game, function()
     local top = M.top(game)
     if not (top and type(top.items) == "table") then return false end
     for _, item in ipairs(top.items) do
-      if item.label == label then return true end
+      if labelMatches(item.label, label) then return true end
     end
     return false
   end, frames or 240, "menu row " .. label)
@@ -45,7 +55,7 @@ function M.selectLabel(game, label, frames)
   local menu = M.top(game)
   local target
   for i, item in ipairs(menu.items) do
-    if item.label == label then target = i break end
+    if labelMatches(item.label, label) then target = i break end
   end
 
   local steps = (target - (menu.index or 1)) % #menu.items

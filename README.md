@@ -48,13 +48,15 @@ lockstep simulation a cable link runs.
 
 ## While you're in a game
 
-`START > MMO` changes with what you're doing:
+`START > MMO` opens a bordered box in the corner, like any other START
+submenu — B goes back to START, the cursor remembers where you left it, and
+the world stays visible behind. It changes with what you're doing:
 
 | Row | When | What it does |
 | --- | --- | --- |
 | `ADDRESS` | hosting | shows your address again — read it out whenever a friend asks |
 | `PLAYERS` | connected | who's on, and `n/limit` if you're hosting |
-| `CHAT` / `SAY` | connected | the log, and sending in a scope |
+| `CHAT` / `SAY` | connected | the log (`CHAT*` when unread), and sending in a scope |
 | `LEAVE` | joined someone | disconnect and **carry on playing single-player** |
 | `END GAME` | hosting | asks first — it ends the game for everyone |
 
