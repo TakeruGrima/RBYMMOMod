@@ -45,7 +45,10 @@ return function(game)
   -- makes "the trade happened" checkable rather than a matter of faith.
   local Pokemon = require("src.pokemon.Pokemon")
   game.save.party = { Pokemon.new(game.data, "CHARIZARD", 50) }
-  log("in the overworld as HOSTY with", table.concat(H.partySpecies(game), ","))
+  -- so the driven battle actually resolves; see frontloadDamage
+  local lead = H.frontloadDamage(game.data, game.save.party[1])
+  log("in the overworld as HOSTY with", table.concat(H.partySpecies(game), ","),
+      "leading with", tostring(lead))
 
   local exports = H.requireMod(game, TAG)
   if not exports then

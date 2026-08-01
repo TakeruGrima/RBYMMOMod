@@ -229,6 +229,34 @@ function M.drivePrompts(game, done, frames, onStep)
   return done and done() or false
 end
 
+-- Put the hardest-hitting move in slot 1.
+--
+-- drivePrompts answers a battle menu by taking whatever is under the
+-- cursor: FIGHT, then move 1. Gen 1 leads do not cooperate -- CHARIZARD at
+-- 50 opens with LEER and PIKACHU at 30 with GROWL, both zero power -- so
+-- two driven parties would lower each other's stats until PP ran out and
+-- the test burned its whole budget without a decision.
+--
+-- Reordering rather than injecting a move keeps the mon otherwise
+-- authentic, and picking by power rather than by name means this works for
+-- any species without hardcoding move ids that differ between versions.
+function M.frontloadDamage(data, mon)
+  local best, bestPower
+  for i, mv in ipairs(mon.moves or {}) do
+    local def = data.moves[mv.id]
+    local power = def and def.power or 0
+    if power > 0 and (bestPower == nil or power > bestPower) then
+      best, bestPower = i, power
+    end
+  end
+  if not best or best == 1 then
+    return mon.moves and mon.moves[1] and mon.moves[1].id or nil
+  end
+  local mv = table.remove(mon.moves, best)
+  table.insert(mon.moves, 1, mv)
+  return mv.id
+end
+
 -- species in party order, for asserting a trade actually swapped something
 function M.partySpecies(game)
   local out = {}

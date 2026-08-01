@@ -45,7 +45,10 @@ return function(game)
   end
   local Pokemon = require("src.pokemon.Pokemon")
   game.save.party = { Pokemon.new(game.data, "PIKACHU", 30) }
-  log("in the overworld as GUESTY with", table.concat(H.partySpecies(game), ","))
+  -- so the driven battle actually resolves; see frontloadDamage
+  local lead = H.frontloadDamage(game.data, game.save.party[1])
+  log("in the overworld as GUESTY with", table.concat(H.partySpecies(game), ","),
+      "leading with", tostring(lead))
 
   local exports = H.requireMod(game, TAG)
   if not exports then
