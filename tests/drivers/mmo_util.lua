@@ -112,6 +112,56 @@ function M.closeToOverworld(game, tries)
   return false
 end
 
+-- ------- phase barriers
+--
+-- The two drivers are separate processes with no channel between them but
+-- the filesystem. Polling "has the other side got there yet" with sleeps is
+-- what made the early runs flaky, so each phase is gated on an explicit
+-- marker instead.
+
+local SYNC_DIR = os.getenv("MMO_SYNC_DIR") or "/tmp/rby_mmo_sync"
+
+function M.syncPath(name)
+  return SYNC_DIR .. "/" .. name
+end
+
+function M.signal(name)
+  os.execute('mkdir -p "' .. SYNC_DIR .. '" 2>/dev/null')
+  local handle = io.open(M.syncPath(name), "w")
+  if handle then
+    handle:write("1")
+    handle:close()
+  end
+end
+
+function M.await(game, name, frames)
+  return M.waitFor(game, function()
+    local handle = io.open(M.syncPath(name), "r")
+    if not handle then return false end
+    handle:close()
+    return true
+  end, frames or 60 * 90, "phase " .. name)
+end
+
+-- this game's own player cell
+function M.playerCell(game)
+  local ow
+  for i = #game.stack.states, 1, -1 do
+    if game.stack.states[i].isOverworld then ow = game.stack.states[i] break end
+  end
+  ow = ow or game.overworld
+  if not (ow and ow.map and ow.player) then return nil end
+  return { mapId = ow.map.id, x = ow.player.cellX, y = ow.player.cellY }
+end
+
+-- the other side's avatar, as this game sees it
+function M.avatarRow(exports, name)
+  for _, row in ipairs(exports.avatarState() or {}) do
+    if name == nil or row.name == name then return row end
+  end
+  return nil
+end
+
 -- open the START menu and step into MMO
 function M.openMmo(game)
   U.tap(game, "start")

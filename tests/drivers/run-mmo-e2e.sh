@@ -41,8 +41,11 @@ command -v love >/dev/null 2>&1 || fail "love is not on PATH (brew install --cas
 [ -d data/generated ] || fail "no data/generated -- import a ROM first:
      scripts/setup.sh --rom \"/path/to/Poke Red.gb\""
 
+SYNC_DIR="${MMO_SYNC_DIR:-/tmp/rby_mmo_sync}"
 rm -f "$ADDR_FILE" "$HOST_LOG" "$GUEST_LOG"
-mkdir -p "$SHOT_DIR"
+# stale phase markers would let a rerun skip straight past every barrier
+rm -rf "$SYNC_DIR"
+mkdir -p "$SHOT_DIR" "$SYNC_DIR"
 
 # The mod ships experimental, so the loader leaves it disabled unless
 # options.mods has an entry for it. Each instance gets its own LOVE identity
@@ -99,7 +102,7 @@ trap cleanup EXIT
 
 echo "  host limit: $LIMIT   shots: $SHOT_DIR"
 echo "  starting host..."
-MMO_ADDR_FILE="$ADDR_FILE" SHOT_DIR="$SHOT_DIR" MMO_LIMIT="$LIMIT" \
+MMO_ADDR_FILE="$ADDR_FILE" SHOT_DIR="$SHOT_DIR" MMO_LIMIT="$LIMIT" MMO_SYNC_DIR="$SYNC_DIR" \
   POKEPORT_IDENTITY="$HOST_ID" POKEPORT_DRIVER="$DRIVERS/mmo_host.lua" \
   love . >"$HOST_LOG" 2>&1 &
 HOST_PID=$!
@@ -118,7 +121,7 @@ done
 echo "  host is up at $(cat "$ADDR_FILE")"
 
 echo "  starting guest..."
-MMO_ADDR_FILE="$ADDR_FILE" SHOT_DIR="$SHOT_DIR" \
+MMO_ADDR_FILE="$ADDR_FILE" SHOT_DIR="$SHOT_DIR" MMO_SYNC_DIR="$SYNC_DIR" \
   POKEPORT_IDENTITY="$GUEST_ID" POKEPORT_DRIVER="$DRIVERS/mmo_join.lua" \
   love . >"$GUEST_LOG" 2>&1 &
 GUEST_PID=$!

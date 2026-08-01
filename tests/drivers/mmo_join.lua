@@ -7,6 +7,15 @@
 --
 --   POKEPORT_IDENTITY=mmoguest POKEPORT_DRIVER=mods/rby_mmo/tests/drivers/mmo_join.lua love .
 
+local function mod_current(game)
+  local ow
+  for i = #game.stack.states, 1, -1 do
+    if game.stack.states[i].isOverworld then ow = game.stack.states[i] break end
+  end
+  ow = ow or game.overworld
+  return { mapId = ow.map.id, x = ow.player.cellX, y = ow.player.cellY }
+end
+
 return function(game)
   local H = dofile("mods/rby_mmo/tests/drivers/mmo_util.lua")
   local U = H.U
@@ -131,21 +140,108 @@ return function(game)
   log("walked")
   U.shot(game, SHOT_DIR .. "/join-after-walk.png")
 
-  -- ------- chat crosses the wire in both directions
+  -- ------- 2. the host's movement reaches this side
+  --
+  -- The mirror of the host's own check: the host is a player here like any
+  -- other, and its avatar has to walk here too.
+
+  H.await(game, "host_walk_start")
+  local before = H.avatarRow(exports)
+  local fromX, fromY = before and before.rosterX, before and before.rosterY
+  log(("host baseline (%s,%s)"):format(tostring(fromX), tostring(fromY)))
+  H.signal("guest_baseline_taken")
+  H.await(game, "host_walk_done")
+
+  local hostMoved = H.waitFor(game, function()
+    local row = H.avatarRow(exports)
+    return row and (row.rosterX ~= fromX or row.rosterY ~= fromY)
+  end, 60 * 40, "the host to move on this side")
+  check(hostMoved, "the host's movement reaches the guest")
+
+  local hostAvatarFollowed = H.waitFor(game, function()
+    local row = H.avatarRow(exports)
+    return row and row.spawned
+      and math.abs((row.avatarX or -99) - row.rosterX) < 0.01
+      and math.abs((row.avatarY or -99) - row.rosterY) < 0.01
+  end, 60 * 40, "the host's avatar to catch up")
+  check(hostAvatarFollowed, "and its avatar walks to where the host is")
+  U.shot(game, SHOT_DIR .. "/join-host-walked.png")
+
+  -- ------- 3. chat crosses the wire in both directions
 
   local heardHost = H.waitFor(game, function()
     for _, line in ipairs(exports.chat()) do
       if line.text == "HELLO FROM HOST" then return true end
     end
     return false
-  end, 60 * 30, "the host's chat line")
+  end, 60 * 60, "the host's chat line")
   check(heardHost, "the host's chat arrived")
 
   exports.say("global", "HELLO FROM GUEST")
   log("said hello")
-  U.wait(180)
+  U.wait(60)
 
-  U.wait(120)
+  -- ------- 1. leave the map and come back
+
+  local home = mod_current(game)
+  U.teleport(game, "PALLET_TOWN", 5, 6, "down")
+  U.wait(60)
+  log("left for PALLET_TOWN")
+  H.signal("guest_left_map")
+
+  H.await(game, "host_saw_despawn")
+  U.teleport(game, home.mapId, home.x, home.y, "down")
+  U.wait(60)
+  log("back on " .. tostring(home.mapId))
+  H.signal("guest_back_on_map")
+
+  -- ------- 4. interact with the host, and get the trade/battle menu
+
+  H.await(game, "host_ready_for_interact")
+  local hostRow = H.avatarRow(exports)
+  check(hostRow ~= nil and hostRow.rosterX ~= nil,
+        "the host has a cell to stand next to")
+
+  if hostRow and hostRow.rosterX then
+    -- stand directly below the host and face up at them
+    U.teleport(game, hostRow.map, hostRow.rosterX, hostRow.rosterY + 1, "up")
+    U.wait(90)
+
+    local facing = H.waitFor(game, function()
+      local row = H.avatarRow(exports)
+      return row and row.spawned
+        and math.abs((row.avatarX or -99) - hostRow.rosterX) < 0.01
+        and math.abs((row.avatarY or -99) - hostRow.rosterY) < 0.01
+    end, 60 * 30, "the host's avatar to settle on its cell")
+    check(facing, "the host's avatar is on the cell we are facing")
+
+    U.shot(game, SHOT_DIR .. "/join-before-interact.png")
+    U.tap(game, "a")
+    U.wait(60)
+
+    local top = H.top(game)
+    local labels = {}
+    for _, item in ipairs((top and top.items) or {}) do
+      labels[#labels + 1] = tostring(item.label)
+    end
+    log("interact menu:", table.concat(labels, ","))
+
+    local function has(want)
+      for _, label in ipairs(labels) do
+        if label == want then return true end
+      end
+      return false
+    end
+
+    check(#labels > 0, "pressing A on another player opens a menu")
+    check(has("TRADE"), "the menu offers TRADE")
+    check(has("BATTLE"), "the menu offers BATTLE")
+    U.shot(game, SHOT_DIR .. "/join-interact-menu.png")
+    H.closeToOverworld(game)
+  end
+  H.signal("guest_interact_done")
+
+  U.wait(60)
   log("RESULT " .. failures .. " failure(s)")
   log("DONE")
 end

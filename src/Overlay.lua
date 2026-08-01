@@ -62,6 +62,14 @@ function M:draw(game, viewport)
   if not (ctx.client and ctx.client:isConnected()) then return end
   if not (viewport and viewport.scale and viewport.scale > 0) then return end
 
+  -- render.hud composites over the *finished* frame -- menus and text boxes
+  -- included -- so a nameplate drawn unconditionally lands on top of
+  -- whatever UI is open. These labels annotate the world, so they are drawn
+  -- only while the world is what the player is actually looking at.
+  local top = game and game.stack and game.stack:top()
+  local overworld = mod.world and mod.world:overworld()
+  if not (top and overworld and top == overworld) then return end
+
   local current = World.current()
   if not (current and current.mapId and current.x and current.y) then return end
 

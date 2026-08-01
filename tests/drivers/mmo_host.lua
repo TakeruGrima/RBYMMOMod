@@ -181,10 +181,78 @@ return function(game)
     check(sawWalking, "and was seen mid-step -- the walk actually animates")
     U.shot(game, SHOT_DIR .. "/host-guest-moved.png")
 
-    -- chat, in the direction the unit tests cannot see: over the wire
+    -- ------- 2. the host's own movement reaches the guest
+    --
+    -- Only the guest can judge this, so the host walks between two markers
+    -- and the guest asserts what it saw.
+
+    H.signal("host_walk_start")
+    -- Wait for the guest to take its baseline before moving. Signalling and
+    -- walking immediately raced it: the guest could sample *after* the walk
+    -- and then wait forever for a change that had already happened.
+    H.await(game, "guest_baseline_taken")
+
+    local wasAt = H.playerCell(game)
+    -- left/right rather than down: Red's bedroom is small and a few tiles
+    -- south runs into furniture, which would make "the host did not move"
+    -- a map-geometry result rather than a networking one
+    for _ = 1, 2 do
+      U.hold(game, "left", 22)
+      U.wait(8)
+    end
+    U.hold(game, "right", 22)
+    U.wait(8)
+    local nowAt = H.playerCell(game)
+    log(("host walked (%s,%s) -> (%s,%s)"):format(
+      tostring(wasAt and wasAt.x), tostring(wasAt and wasAt.y),
+      tostring(nowAt and nowAt.x), tostring(nowAt and nowAt.y)))
+    check(nowAt and wasAt and (nowAt.x ~= wasAt.x or nowAt.y ~= wasAt.y),
+          "the host's own player actually moved")
+    H.signal("host_walk_done")
+
+    -- ------- 3. chat both ways
+
     exports.say("global", "HELLO FROM HOST")
     log("said hello")
-    U.wait(180)
+    local heardGuest = H.waitFor(game, function()
+      for _, line in ipairs(exports.chat()) do
+        if line.text == "HELLO FROM GUEST" then return true end
+      end
+      return false
+    end, 60 * 60, "the guest's chat line")
+    check(heardGuest, "the guest's chat reached the host")
+
+    -- ------- 1. the guest leaves the map, and comes back
+    --
+    -- A remote player on another map must not be drawn on this one; the
+    -- roster keeps them, the avatar does not.
+
+    H.await(game, "guest_left_map")
+    local despawned = H.waitFor(game, function()
+      local row = H.avatarRow(exports)
+      return row ~= nil and row.spawned == false
+    end, 60 * 40, "the avatar to despawn")
+    check(despawned, "a player who leaves the map loses their avatar")
+    local stillListed = #exports.players() > 0
+    check(stillListed, "but stays on the roster")
+    H.signal("host_saw_despawn")
+
+    H.await(game, "guest_back_on_map")
+    local respawned = H.waitFor(game, function()
+      local row = H.avatarRow(exports)
+      return row ~= nil and row.spawned == true
+    end, 60 * 40, "the avatar to come back")
+    check(respawned, "and gets it back on returning to the map")
+    U.shot(game, SHOT_DIR .. "/host-guest-returned.png")
+
+    -- ------- 4. hold still so the guest can interact
+    --
+    -- The guest teleports next to this cell and presses A; the host just
+    -- has to be somewhere known and stay there.
+
+    H.signal("host_ready_for_interact")
+    H.await(game, "guest_interact_done")
+    U.shot(game, SHOT_DIR .. "/host-after-interact.png")
   end
 
   -- ------- teardown
