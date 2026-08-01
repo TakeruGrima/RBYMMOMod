@@ -20,6 +20,7 @@ return function(game)
   local LIMIT = tonumber(os.getenv("MMO_LIMIT") or "") or 2
 
   local function log(...) U.log(TAG, ...) end
+  local events = H.captureEvents({ "battle.started", "battle.ended", "link.desync" })
   local failures = 0
   local function check(ok, what)
     if ok then
@@ -40,7 +41,11 @@ return function(game)
   if game.save and game.save.player then
     game.save.player.name = "HOSTY"
   end
-  log("in the overworld as HOSTY")
+  -- A trade needs something to trade. Distinct species per side is what
+  -- makes "the trade happened" checkable rather than a matter of faith.
+  local Pokemon = require("src.pokemon.Pokemon")
+  game.save.party = { Pokemon.new(game.data, "CHARIZARD", 50) }
+  log("in the overworld as HOSTY with", table.concat(H.partySpecies(game), ","))
 
   local exports = H.requireMod(game, TAG)
   if not exports then
@@ -120,7 +125,7 @@ return function(game)
 
   local sawGuest = H.waitFor(game, function()
     return #exports.players() > 0
-  end, 60 * 150, "the guest to connect")
+  end, 60 * 420, "the guest to connect")
   check(sawGuest, "a remote player joined over a real socket")
 
   if sawGuest then
@@ -253,6 +258,46 @@ return function(game)
     H.signal("host_ready_for_interact")
     H.await(game, "guest_interact_done")
     U.shot(game, SHOT_DIR .. "/host-after-interact.png")
+
+    -- ------- 5. a real trade, run to completion over the wire
+    --
+    -- The guest asks; this side gets "GUESTY wants to trade!", the party
+    -- picker, and the confirm. Both sides answer whatever is in front of
+    -- them until the party actually changes.
+
+    H.await(game, "guest_trade_requested")
+    local wanted = "PIKACHU"
+    local traded = H.drivePrompts(game, function()
+      return H.partySpecies(game)[1] == wanted
+    end, 60 * 90)
+    log("host party now:", table.concat(H.partySpecies(game), ","))
+    check(traded, "the host received the guest's " .. wanted)
+    U.shot(game, SHOT_DIR .. "/host-after-trade.png")
+    H.signal("host_trade_done")
+
+    -- ------- 6. a real link battle, run to a decision
+    --
+    -- This is the engine's own LinkBattle -- the lockstep simulation a
+    -- cable link runs -- carried over this mod's hub by SessionNet. The
+    -- assertions are on engine events rather than on anything this mod
+    -- reports, and link.desync is the one that matters: two games
+    -- disagreeing mid-battle is exactly what lockstep exists to prevent.
+
+    H.await(game, "guest_battle_requested", 60 * 90)
+    local started = H.drivePrompts(game, function()
+      return events["battle.started"] > 0
+    end, 60 * 60)
+    check(started, "a link battle started on the host")
+
+    local ended = H.drivePrompts(game, function()
+      return events["battle.ended"] > 0
+    end, 60 * 240)
+    check(ended, "and ran to a decision")
+    check(events["link.desync"] == 0, "with no desync reported")
+    log(("battle events: started=%d ended=%d desync=%d"):format(
+      events["battle.started"], events["battle.ended"], events["link.desync"]))
+    U.shot(game, SHOT_DIR .. "/host-after-battle.png")
+    H.signal("host_battle_done")
   end
 
   -- ------- teardown

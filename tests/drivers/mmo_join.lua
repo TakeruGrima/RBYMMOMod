@@ -24,6 +24,7 @@ return function(game)
   local SHOT_DIR = os.getenv("SHOT_DIR") or "/tmp/rby_mmo_shots"
 
   local function log(...) U.log(TAG, ...) end
+  local events = H.captureEvents({ "battle.started", "battle.ended", "link.desync" })
   local failures = 0
   local function check(ok, what)
     if ok then
@@ -42,7 +43,9 @@ return function(game)
   if game.save and game.save.player then
     game.save.player.name = "GUESTY"
   end
-  log("in the overworld as GUESTY")
+  local Pokemon = require("src.pokemon.Pokemon")
+  game.save.party = { Pokemon.new(game.data, "PIKACHU", 30) }
+  log("in the overworld as GUESTY with", table.concat(H.partySpecies(game), ","))
 
   local exports = H.requireMod(game, TAG)
   if not exports then
@@ -237,9 +240,75 @@ return function(game)
     check(has("TRADE"), "the menu offers TRADE")
     check(has("BATTLE"), "the menu offers BATTLE")
     U.shot(game, SHOT_DIR .. "/join-interact-menu.png")
-    H.closeToOverworld(game)
+
+    -- ------- 5. take the menu up on it: a real trade, end to end
+    --
+    -- Everything past here runs the engine's own TradeSession over the
+    -- hub: the party goes on the wire, both sides pick and confirm, and
+    -- TradeSession:apply files the received mon. Nothing about the trade
+    -- itself is this mod's code.
+
+    H.signal("guest_interact_done")
+    if H.selectLabel(game, "TRADE") then
+      log("asked to trade")
+      H.signal("guest_trade_requested")
+
+      local wanted = "CHARIZARD"
+      local traded = H.drivePrompts(game, function()
+        return H.partySpecies(game)[1] == wanted
+      end, 60 * 90)
+      log("guest party now:", table.concat(H.partySpecies(game), ","))
+      check(traded, "the guest received the host's " .. wanted)
+      U.shot(game, SHOT_DIR .. "/join-after-trade.png")
+      H.await(game, "host_trade_done", 60 * 60)
+
+      -- ------- 6. and a real link battle, to a decision
+      --
+      -- Both sides now hold the mon the other traded over, so the battle
+      -- also proves the traded party is what actually fights.
+
+      H.closeToOverworld(game)
+      U.wait(30)
+      local reopened = false
+      if H.top(game) == nil or H.top(game).isOverworld
+         or H.top(game) == game.overworld then
+        U.tap(game, "a")   -- still facing the host's avatar
+        U.wait(45)
+        reopened = H.classify(H.top(game)) == "menu"
+      end
+      check(reopened, "the interact menu opens again for a battle")
+
+      if reopened and H.selectLabel(game, "BATTLE") then
+        log("asked to battle")
+        H.signal("guest_battle_requested")
+
+        local started = H.drivePrompts(game, function()
+          return events["battle.started"] > 0
+        end, 60 * 60)
+        check(started, "a link battle started on the guest")
+
+        local ended = H.drivePrompts(game, function()
+          return events["battle.ended"] > 0
+        end, 60 * 240)
+        check(ended, "and ran to a decision")
+        check(events["link.desync"] == 0, "with no desync reported")
+        log(("battle events: started=%d ended=%d desync=%d"):format(
+          events["battle.started"], events["battle.ended"],
+          events["link.desync"]))
+        U.shot(game, SHOT_DIR .. "/join-after-battle.png")
+        H.await(game, "host_battle_done", 60 * 120)
+      else
+        check(false, "could not select BATTLE")
+        H.signal("guest_battle_requested")
+      end
+    else
+      check(false, "could not select TRADE")
+      H.signal("guest_trade_requested")
+    end
+  else
+    H.signal("guest_interact_done")
+    H.signal("guest_trade_requested")
   end
-  H.signal("guest_interact_done")
 
   U.wait(60)
   log("RESULT " .. failures .. " failure(s)")

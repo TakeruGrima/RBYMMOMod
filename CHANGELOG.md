@@ -59,6 +59,20 @@ were visible to the headless suites.
 - **A modal "Connected." box** sat over the world for the whole session. Routine
   status is a log line now; only things worth interrupting for get a box.
 
+### Proven end to end
+
+Two real LÖVE instances, a real socket, driven through the game's own menus
+(`tests/drivers/run-mmo-e2e.sh`):
+
+- **A trade completes.** Host `CHARIZARD` → `PIKACHU`, guest `PIKACHU` →
+  `CHARIZARD`. That is the engine's own `Protocol.TradeSession` running over
+  this mod's hub, including `apply()` filing the received mon.
+- **A link battle runs to a decision** with `battle.started`,
+  `battle.ended` and **zero `link.desync`** on both sides — the lockstep
+  simulation stayed in agreement across two processes.
+- Map transitions, host↔guest movement, chat both ways, and the interact
+  menu offering TRADE and BATTLE.
+
 ### Notes
 
 - `affects_link` is `false` and the suite asserts the link surface is

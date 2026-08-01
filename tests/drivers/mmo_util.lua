@@ -162,6 +162,89 @@ function M.avatarRow(exports, name)
   return nil
 end
 
+-- ------- driving a session's prompts
+--
+-- A trade puts a sequence of boxes in front of both players -- "X wants to
+-- trade!", the party picker, "Trade for Y?", then the result -- and the two
+-- sides do not see them at the same moments. Rather than scripting an exact
+-- order per side (which would be a different script for host and guest, and
+-- would break the moment a prompt moved), both sides run this: answer
+-- whatever is on top, affirmatively, until `done` says the flow finished.
+--
+-- The three shapes are distinguishable by their fields:
+--   ListMenu / Menu -> has `items`      (the party picker)
+--   ChoiceBox       -> has `onChoose` and `index` but no `items`
+--   TextBox         -> neither
+local function classify(top)
+  if not top then return nil end
+  if type(top.items) == "table" then return "menu" end
+  if top.onChoose ~= nil and top.index ~= nil then return "choice" end
+  return "text"
+end
+
+M.classify = classify
+
+function M.drivePrompts(game, done, frames, onStep)
+  for _ = 1, frames or 60 * 60 do
+    if done and done() then return true end
+    local top = M.top(game)
+    local kind = classify(top)
+    if kind == "choice" then
+      -- YES is index 1; walk the cursor there rather than assuming it
+      local guard = 0
+      while (M.top(game) == top) and (top.index or 1) > 1 and guard < 4 do
+        U.tap(game, "up")
+        U.wait(3)
+        guard = guard + 1
+      end
+      U.tap(game, "a")
+      U.wait(12)
+    elseif kind == "menu" then
+      -- the party picker: take whatever is under the cursor (slot 1)
+      U.tap(game, "a")
+      U.wait(12)
+    elseif kind == "text" then
+      U.tap(game, "a")
+      U.wait(8)
+    else
+      U.wait(4)
+    end
+    if onStep then onStep(kind) end
+  end
+  return done and done() or false
+end
+
+-- species in party order, for asserting a trade actually swapped something
+function M.partySpecies(game)
+  local out = {}
+  for _, mon in ipairs((game.save and game.save.party) or {}) do
+    out[#out + 1] = tostring(mon.species)
+  end
+  return out
+end
+
+-- Record engine events by wrapping Runtime.emit.
+--
+-- Same trick tests/drivers/online_match_host.lua uses. Subscribing through
+-- the event bus would work too, but wrapping catches everything regardless
+-- of which bus a mod installed, and a battle is exactly where an assertion
+-- must not depend on this mod's own plumbing being correct.
+--
+-- link.desync is the one to watch: two games disagreeing mid-battle is the
+-- failure a lockstep simulation exists to prevent, and it is silent
+-- otherwise.
+function M.captureEvents(names)
+  local Runtime = require("src.mods.Runtime")
+  local seen = {}
+  for _, name in ipairs(names) do seen[name] = 0 end
+  local realEmit = Runtime.emit
+  Runtime.emit = function(name, payload)
+    if seen[name] ~= nil then seen[name] = seen[name] + 1 end
+    return realEmit(name, payload)
+  end
+  return seen
+end
+
 -- open the START menu and step into MMO
 function M.openMmo(game)
   U.tap(game, "start")
