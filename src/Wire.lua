@@ -113,6 +113,45 @@ function M.mapId(value)
   return value:sub(1, 64)
 end
 
+-- Is this relay payload a shape we are willing to pass on?
+--
+-- The hub never reads a relay payload -- it is the engine's link vocabulary
+-- -- so depth and size are the only things it can judge. They are worth
+-- judging: src/link/Json.lua decodes inside a pcall and so tolerates very
+-- deep input, but *re-encoding* that same value on the way out throws
+-- around 6000 levels, and that throw reaches the host's error handler and
+-- stops the game for everybody. A ~12KB line from one player could end
+-- everyone else's session.
+--
+-- Rejects rather than trims: a silently truncated trade payload is worse
+-- than a dropped message.
+--
+-- Walks with an explicit stack, never recursion -- a recursive validator
+-- would blow the very stack it exists to protect.
+function M.payloadOk(value, maxDepth, maxNodes)
+  if type(value) ~= "table" then return false end
+  maxDepth = maxDepth or Config.PAYLOAD_MAX_DEPTH
+  maxNodes = maxNodes or Config.PAYLOAD_MAX_NODES
+
+  local stack, top, nodes = { { value, 1 } }, 1, 0
+  while top > 0 do
+    local entry = stack[top]
+    stack[top] = nil
+    top = top - 1
+    local node, depth = entry[1], entry[2]
+    if depth > maxDepth then return false end
+    for _, v in pairs(node) do
+      nodes = nodes + 1
+      if nodes > maxNodes then return false end
+      if type(v) == "table" then
+        top = top + 1
+        stack[top] = { v, depth + 1 }
+      end
+    end
+  end
+  return true
+end
+
 -- Presence as it appears in a welcome roster, a join, or a move.  Position
 -- is optional so a player sitting in a menu or a battle can still be listed
 -- without claiming a cell in the world.

@@ -268,6 +268,35 @@ eq(partial.x, nil, "x goes with it")
 eq(Wire.presence({ id = "p4", name = "BROCK" }).sprite, Config.DEFAULT_SPRITE,
    "a missing sprite falls back rather than failing")
 
+-- ------- payload shape (the relay's only defence)
+
+local function nest(depth)
+  local node = { leaf = 1 }
+  for _ = 1, depth do node = { node } end
+  return node
+end
+
+eq(Wire.payloadOk({ type = "party", mons = { { species = "PIKACHU" } } }), true,
+   "an ordinary link payload passes")
+eq(Wire.payloadOk(nest(6)), true, "so does a party-shaped nesting depth")
+eq(Wire.payloadOk("not a table"), false, "a scalar is not a payload")
+eq(Wire.payloadOk(nil), false, "nor is nothing")
+
+-- The regression. src/link/Json.lua decodes inside a pcall and tolerates
+-- input far deeper than Json.encode can re-emit, so a payload nested a few
+-- thousand levels used to decode fine and then throw while being forwarded
+-- -- taking the host's whole game down with it. ~12KB of brackets, well
+-- under the line cap, from any player already in a session with you.
+eq(Wire.payloadOk(nest(6000)), false, "a payload deep enough to break the "
+   .. "encoder is refused before it is forwarded")
+eq(Wire.payloadOk(nest(Config.PAYLOAD_MAX_DEPTH + 5)), false,
+   "and so is anything past the depth budget")
+
+-- breadth is bounded too, so a flat-but-enormous payload cannot get through
+local wide = {}
+for i = 1, Config.PAYLOAD_MAX_NODES + 50 do wide[i] = i end
+eq(Wire.payloadOk(wide), false, "an over-wide payload is refused")
+
 -- ------- Roster
 
 local roster = Roster.new()
@@ -494,17 +523,54 @@ eq(#bobWelcome.players, 1, "the second sees the first on the roster")
 eq(bobWelcome.players[1].name, "ANN", "by name")
 check(saw(annPeer, Wire.JOIN), "and the first is told about the second")
 
-local fourthPeer = fakePeer()
-eq(hub:accept(fourthPeer), nil, "the fourth is refused")
+-- The cap is charged at hello, not on connect. A socket that has not
+-- introduced itself is not a player, so it gets accepted and then refused
+-- when it tries to claim a seat.
+local fourth, fourthPeer = join(hub, "FOURTH", "PALLET", 1, 1)
+check(fourth ~= nil, "a fourth connection is accepted")
 local refusal = take(fourthPeer, Wire.ERROR)
-check(refusal ~= nil, "with a message")
+check(refusal ~= nil, "but refused when it says hello")
 check(refusal.message:find("full"), "saying it is full")
 check(refusal.message:find("3"), "and naming the limit")
 check(fourthPeer.closed, "and the connection is closed")
+eq(hub.players, 3, "so it never became a player")
+
+-- ------- an idle connection cannot hold a seat
+--
+-- This is the slot-exhaustion fix. Charging the player cap on connect meant
+-- four sockets that said nothing locked everyone out of a four-player game.
+
+local idleHub = Hub.new({ maxPlayers = 2 })
+local idlePeer = fakePeer()
+local idle = idleHub:accept(idlePeer)
+check(idle ~= nil, "a silent connection is accepted")
+eq(idleHub.players, 0, "but is not a player")
+eq(idleHub:isFull(), false, "and does not fill the game")
+
+-- two real players still fit alongside it
+check(select(1, join(idleHub, "ONE")) ~= nil, "a real player still fits")
+check(select(1, join(idleHub, "TWO")) ~= nil, "and so does a second")
+eq(idleHub.players, 2, "both became players")
+eq(idleHub:isFull(), true, "which is what fills the game")
+
+-- ...and the silent one is reaped once its welcome runs out
+idleHub:update(Config.HELLO_TIMEOUT + 1)
+check(idlePeer.closed, "the silent connection is dropped after the deadline")
+check(take(idlePeer, Wire.ERROR) ~= nil, "having been told why")
+eq(idleHub.clients[idle.id], nil, "and is gone from the table")
+
+-- a flood of silent connections is bounded rather than unbounded
+local floodHub = Hub.new({ maxPlayers = 2 })
+local accepted = 0
+for _ = 1, Config.MAX_PENDING + 6 do
+  if floodHub:accept(fakePeer()) then accepted = accepted + 1 end
+end
+eq(accepted, Config.MAX_PENDING, "pending connections are capped")
+eq(floodHub.players, 0, "and none of them are players")
 
 -- the host occupies a slot like anyone else, so a freed one reopens
 hub:drop(cal)
-eq(hub.count, 2, "dropping frees a seat")
+eq(hub.players, 2, "dropping frees a seat")
 check(saw(annPeer, Wire.PART), "and the others are told")
 local late = join(hub, "LATE", "PALLET", 1, 1)
 check(late ~= nil, "which the next player can take")
@@ -605,9 +671,10 @@ eq(ended.reason, "peer_left", "with a reason")
 
 -- ------- refusals and liveness
 
-local stranger = fakePeer()
-local strangerClient = hub:accept(stranger)
-eq(strangerClient, nil, "the room is full again")
+-- the cap is charged at hello, so a stranger connects and is then refused
+local stranger, strangerPeer = join(hub, "STRANGER", "PALLET", 1, 1)
+check(take(strangerPeer, Wire.ERROR) ~= nil, "the room is full again")
+eq(hub.players, 3, "and the stranger never became a player")
 
 local hub2 = Hub.new({ maxPlayers = 4 })
 local oldPeer = fakePeer()
@@ -672,12 +739,19 @@ check(hostMsgs[1].id ~= nil, "carrying an id")
 
 -- the second slot is the one friend a limit of 2 allows
 local guestPeer = fakePeer()
-check(hosted.hub:accept(guestPeer) ~= nil, "one friend fits alongside the host")
+local guestClient = hosted.hub:accept(guestPeer)
+hosted.hub:receive(guestClient, { type = Wire.HELLO, proto = Config.PROTOCOL,
+                                  name = "FRIEND" })
+check(take(guestPeer, Wire.WELCOME) ~= nil, "one friend fits alongside the host")
 local thirdPeer = fakePeer()
-eq(hosted.hub:accept(thirdPeer), nil, "a second friend does not")
+local third = hosted.hub:accept(thirdPeer)
+hosted.hub:receive(third, { type = Wire.HELLO, proto = Config.PROTOCOL,
+                            name = "THIRD" })
+check(take(thirdPeer, Wire.ERROR) ~= nil, "a second friend does not")
 
+-- the friend is still on; only the host's own seat is given back
 localNet:close()
-eq(hosted.hub.count, 1, "closing the local net frees the host's slot")
+eq(hosted.hub.players, 1, "closing the local net frees the host's own slot")
 
 -- ------------------------------------------------------------------
 -- 5. Avatar step routing

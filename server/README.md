@@ -93,6 +93,15 @@ Be clear-eyed about this before you expose a port.
 - Every inbound field is re-derived through a sanitiser; nothing arrives
   trusted, and a malformed line is dropped rather than fatal.
 - Chat is rate-limited to roughly two messages a second per sender.
+- A connection that has not said hello does **not** hold a player seat, and
+  is dropped if it stays silent. Charging the cap on connect meant four idle
+  sockets could lock everyone out of a four-player game.
+- Relay payloads are forwarded unread, but their *shape* is bounded. The
+  decoder tolerates input far deeper than the encoder can re-emit, so a
+  deeply nested payload used to throw while being forwarded and take the
+  whole hub down with it.
+- A message that will not serialise costs its own connection and nothing
+  else. No single peer should be able to end everybody's session.
 - Identity is **the connection**, nothing more. There are no accounts, no
   passwords, and no bans: anyone who can reach the port can join under any
   name, including one already in use.

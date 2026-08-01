@@ -29,8 +29,9 @@ function M.new(opts)
   opts = opts or {}
   return setmetatable({
     limit = Config.clampPlayers(opts.maxPlayers),
-    clients = {},     -- id -> client
-    count = 0,
+    clients = {},     -- id -> client (greeted or not)
+    count = 0,        -- connections
+    players = 0,      -- of those, the ones that have said hello
     sessions = {},    -- sessionId -> { a, b, kind }
     nextId = 1,
     nextSession = 1,
@@ -38,8 +39,14 @@ function M.new(opts)
   }, M)
 end
 
+-- Full means no room for another *player*. A connection that has not said
+-- hello is not a player, and must not be able to hold a seat.
 function M:isFull()
-  return self.count >= self.limit
+  return self.players >= self.limit
+end
+
+function M:pendingCount()
+  return self.count - self.players
 end
 
 -- ------- plumbing
@@ -78,18 +85,31 @@ function M:refuse(peer, message)
   peer:close()
 end
 
+-- Refuse someone who has a client record, and drop it in the same breath.
+-- A connection turned away at hello will never become a player, so leaving
+-- it in the table would hold a pending slot until the reaper came round.
+function M:refuseClient(client, message)
+  self:refuse(client.peer, message)
+  self:drop(client)
+end
+
 -- ------- connection lifecycle
 
 -- A peer that got this far has a socket (or a loopback) but has not said
 -- hello yet, so it is not a player and does not appear on anyone's roster.
--- The cap is checked here rather than at hello because refusing after the
--- handshake would mean a player briefly existed.
+--
+-- The player cap is therefore NOT applied here -- that is checked at hello.
+-- Charging it on connect meant a peer that connected and said nothing held
+-- a seat forever, so four silent sockets could lock everyone out of a
+-- four-player game. What is bounded here is the number of un-greeted
+-- connections, and update() reaps the ones that never introduce themselves.
 function M:accept(peer)
-  if self:isFull() then
-    self:refuse(peer, ("This hub is full (%d players)."):format(self.limit))
+  if self:pendingCount() >= Config.MAX_PENDING then
+    self:refuse(peer, "Too many connections. Try again.")
     return nil
   end
   local client = {
+    since = self.clock,
     id = tostring(self.nextId),
     peer = peer,
     ready = false,
@@ -111,6 +131,7 @@ function M:drop(client)
   self:endSession(client, "peer_left")
   self.clients[client.id] = nil
   self.count = self.count - 1
+  if client.ready then self.players = self.players - 1 end
   -- an outstanding request pointed at a player who just left would let the
   -- asker wait forever for an answer nobody can give
   for _, other in pairs(self.clients) do
@@ -177,12 +198,17 @@ local handlers = {}
 handlers[Wire.HELLO] = function(self, client, msg)
   if client.ready then return end
   if Wire.int(msg.proto, 0, 9999) ~= Config.PROTOCOL then
-    return self:refuse(client.peer, ("This game speaks protocol %d; yours "
+    return self:refuseClient(client, ("This game speaks protocol %d; yours "
       .. "speaks %s."):format(Config.PROTOCOL, tostring(msg.proto)))
   end
   local name = Wire.name(msg.name)
   if not name then
-    return self:refuse(client.peer, "That trainer name can't be used here.")
+    return self:refuseClient(client, "That trainer name can't be used here.")
+  end
+  -- the seat is claimed here, by someone who has identified themselves
+  if self:isFull() then
+    return self:refuseClient(client,
+      ("This hub is full (%d players)."):format(self.limit))
   end
 
   client.name = name
@@ -192,6 +218,7 @@ handlers[Wire.HELLO] = function(self, client, msg)
   client.y = Wire.int(msg.y, 0, 4096)
   client.facing = Wire.facing(msg.facing) or "down"
   client.ready = true
+  self.players = self.players + 1
 
   local players = {}
   for id, other in pairs(self.clients) do
@@ -293,7 +320,7 @@ handlers[Wire.RELAY] = function(self, client, msg)
   local peer = self:peerOf(client)
   if not peer then return end
   if Wire.id(msg.to) ~= peer.id then return end
-  if type(msg.payload) ~= "table" then return end
+  if not Wire.payloadOk(msg.payload) then return end
   -- The hub does not read the payload. It is the engine's own link
   -- vocabulary, and interpreting it here would couple this to a protocol
   -- the game already owns.
@@ -319,6 +346,24 @@ end
 
 function M:update(dt)
   self.clock = self.clock + (dt or 0)
+
+  -- Reap connections that never introduced themselves. Without this a peer
+  -- can hold a slot indefinitely simply by saying nothing.
+  local stale
+  for _, client in pairs(self.clients) do
+    if not client.ready
+       and (self.clock - (client.since or 0)) > Config.HELLO_TIMEOUT then
+      stale = stale or {}
+      stale[#stale + 1] = client
+    end
+  end
+  for _, client in ipairs(stale or {}) do
+    if client.peer then
+      client.peer:send({ type = Wire.ERROR, message = "Took too long to join." })
+      client.peer:close()
+    end
+    self:drop(client)
+  end
 end
 
 -- Tell everyone the game is over, then forget them. Called when the host
@@ -334,7 +379,7 @@ function M:shutdown(message)
       client.peer:close()
     end
   end
-  self.clients, self.count, self.sessions = {}, 0, {}
+  self.clients, self.count, self.players, self.sessions = {}, 0, 0, {}
 end
 
 M.presenceOf = presenceOf

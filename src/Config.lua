@@ -64,6 +64,21 @@ M.COMPOSE_MAX = 16
 M.PING_INTERVAL = 10
 M.TIMEOUT = 30
 
+-- Connections that have not said hello yet.
+--
+-- A peer gets a slot the moment its socket lands, before it has identified
+-- itself. Counting those against the host's player cap let four idle TCP
+-- connections lock everyone out of a 4-player game, so un-greeted peers get
+-- their own, larger allowance and a deadline to introduce themselves.
+M.MAX_PENDING = 8
+M.HELLO_TIMEOUT = 10
+
+-- Relay payloads are forwarded unread, so their *shape* is all that can be
+-- checked. A packed party is five or six levels deep; these leave enormous
+-- headroom while refusing the nesting that breaks the encoder.
+M.PAYLOAD_MAX_DEPTH = 32
+M.PAYLOAD_MAX_NODES = 4096
+
 -- Smallest gap between two chat messages from one player.  Not moderation
 -- -- just enough that nobody can fill everyone else's scrollback faster
 -- than it can be read.  Mirrors the 500ms gate in server/hub.js.

@@ -188,6 +188,20 @@ function M.drivePrompts(game, done, frames, onStep)
   for _ = 1, frames or 60 * 60 do
     if done and done() then return true end
     local top = M.top(game)
+
+    -- The overworld is NOT a prompt. It has no `items` and no `onChoose`,
+    -- so classify() called it a text box and this loop mashed A into the
+    -- open world -- pressing A on doors and NPCs and walking into grass.
+    -- One run wandered the host out of Red's house, through Pallet Town and
+    -- Oak's lab, onto Route 1, and left it fighting wild Pokemon while the
+    -- trade it was supposed to be answering timed out. Wait for a real
+    -- prompt instead.
+    if top == nil or top == game.overworld or top.isOverworld then
+      U.wait(4)
+      if onStep then onStep(nil) end
+      goto continue
+    end
+
     local kind = classify(top)
     if kind == "choice" then
       -- YES is index 1; walk the cursor there rather than assuming it
@@ -210,6 +224,7 @@ function M.drivePrompts(game, done, frames, onStep)
       U.wait(4)
     end
     if onStep then onStep(kind) end
+    ::continue::
   end
   return done and done() or false
 end

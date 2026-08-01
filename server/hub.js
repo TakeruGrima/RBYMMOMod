@@ -115,7 +115,42 @@ const SCOPES = new Set(['global', 'local', 'private']);
 function send(client, type, payload) {
   if (!client || client.socket.destroyed) return;
   const msg = Object.assign({}, payload, { type });
-  client.socket.write(JSON.stringify(msg) + '\n');
+  // stringify can throw (RangeError on deeply nested input, TypeError on a
+  // cycle). One peer's message must never be able to take the hub down for
+  // everyone, so a message that will not serialise costs that connection
+  // and nothing else.
+  let line;
+  try {
+    line = JSON.stringify(msg) + '\n';
+  } catch (err) {
+    log(`dropping ${client.id}: message would not serialise (${err.message})`);
+    client.socket.destroy();
+    return;
+  }
+  client.socket.write(line);
+}
+
+// Relay payloads are forwarded unread, so shape is all that can be judged.
+// Iterative on purpose: a recursive check would blow the same stack it is
+// meant to protect. Mirrors Wire.payloadOk on the Lua side.
+const PAYLOAD_MAX_DEPTH = 32;
+const PAYLOAD_MAX_NODES = 4096;
+
+function payloadOk(value) {
+  if (value === null || typeof value !== 'object') return false;
+  const stack = [[value, 1]];
+  let nodes = 0;
+  while (stack.length) {
+    const [node, depth] = stack.pop();
+    if (depth > PAYLOAD_MAX_DEPTH) return false;
+    for (const child of Object.values(node)) {
+      if (++nodes > PAYLOAD_MAX_NODES) return false;
+      if (child !== null && typeof child === 'object') {
+        stack.push([child, depth + 1]);
+      }
+    }
+  }
+  return true;
 }
 
 function fail(client, message) {
@@ -313,7 +348,7 @@ handlers['mmo.relay'] = (client, msg) => {
   const peer = peerOf(client);
   if (!peer) return;
   if (cleanId(msg.to) !== peer.id) return;
-  if (msg.payload === null || typeof msg.payload !== 'object') return;
+  if (!payloadOk(msg.payload)) return;
   // The hub does not read the payload. It is the engine's own link
   // vocabulary, and interpreting it here would couple this process to a
   // protocol the game already owns.

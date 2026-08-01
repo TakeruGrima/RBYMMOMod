@@ -72,7 +72,20 @@ function Peer:send(msg)
   local Json = json()
   local conn = self.conn
   if not Json or conn.dead then return end
-  conn.tx = conn.tx .. Json.encode(msg) .. "\n"
+  -- Encoding is guarded because it can genuinely fail: Json.decode tolerates
+  -- input far deeper than Json.encode can re-emit, so a hostile relay
+  -- payload used to throw here, escape into update()'s handler and stop
+  -- hosting for everyone. One peer's message must never be able to end
+  -- everybody's game -- so a message that will not encode kills that
+  -- connection and nothing else.
+  local ok, encoded = pcall(Json.encode, msg)
+  if not ok then
+    mod.log:warn("dropping a connection whose message could not be encoded "
+      .. "(%s)", tostring(encoded))
+    conn.dead = true
+    return
+  end
+  conn.tx = conn.tx .. encoded .. "\n"
 end
 
 function Peer:close()
@@ -128,8 +141,10 @@ function M:stop(message)
   return true
 end
 
+-- players, not connections: a socket that has not said hello is not someone
+-- you are playing with
 function M:playerCount()
-  return self.hub and self.hub.count or 0
+  return self.hub and self.hub.players or 0
 end
 
 function M:limit()
@@ -227,9 +242,19 @@ local function drainLines(self, conn)
     conn.rx = conn.rx:sub(nl + 1)
     if #line > 0 and conn.client then
       local msg = Json.decode(line)
-      if msg then self.hub:receive(conn.client, msg) end
       -- a line that will not decode is dropped, not fatal: one bad frame
       -- from one peer must not take the game down for everyone
+      if msg then
+        -- and neither must one that decodes but then misbehaves: the
+        -- blast radius of anything this peer sends is this peer
+        local ok, err = pcall(self.hub.receive, self.hub, conn.client, msg)
+        if not ok then
+          mod.log:warn("dropping a connection whose message failed (%s)",
+            tostring(err))
+          conn.dead = true
+          return
+        end
+      end
     end
   end
 end

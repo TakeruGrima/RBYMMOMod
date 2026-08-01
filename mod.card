@@ -31,6 +31,11 @@ return {
         .. "is the same thing vanilla NPCs do.",
       "The player limit is 2-64, host included, and is clamped in three "
         .. "places so it cannot be set out of range by editing a file.",
+      "Hosting opens a port with no authentication: anyone who can reach "
+        .. "it can join under any name, and positions are self-reported, so "
+        .. "NEARBY chat is not an enforceable boundary. Host for people you "
+        .. "know. Idle connections, payload shape and chat rate are bounded; "
+        .. "identity is not.",
       "Two implementations of one protocol -- Hub.lua in-game and hub.js "
         .. "for a dedicated server -- can drift. Both are pinned by suites "
         .. "asserting the same behaviours, but it is a real upkeep cost.",
