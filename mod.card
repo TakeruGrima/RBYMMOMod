@@ -1,0 +1,61 @@
+return {
+  summary = "Play Kanto with friends: see them walk, chat, trade and battle.",
+  author = "alamo",
+  tags = { "multiplayer", "mmo", "chat", "trade", "ui", "experimental" },
+
+  differences = {
+    changed = {
+      "Adds an MMO row to the START menu (above SAVE).",
+      "Draws nicknames and chat bubbles over other players in the overworld.",
+      "Spawns runtime NPCs for other players on your current map.",
+    },
+    added = {
+      "HOST GAME and JOIN GAME in the MMO menu -- no separate server to "
+        .. "install; one player hosts from inside the game and picks the "
+        .. "limit (2-64) while doing it.",
+      "Global, nearby and private chat, composed on the naming grid.",
+      "Trade and battle requests from anywhere, run by the engine's own "
+        .. "link code over the hub.",
+      "A number page on this mod's naming screens, because the vanilla "
+        .. "grid has no digits and an address cannot be typed without one.",
+    },
+    known = {
+      "No NAT traversal. A host behind a router must forward port 7788 for "
+        .. "anyone outside their LAN; a standalone hub (server/hub.js) on a "
+        .. "public box is the alternative.",
+      "No host migration. If the host leaves, the game ends for everyone -- "
+        .. "they are told rather than left hanging.",
+      "Remote players step tile to tile rather than gliding. The engine's "
+        .. "scripted-move queue would animate it, but the overworld gates "
+        .. "your own controls on that queue being empty, so using it would "
+        .. "freeze your input every time someone else moved.",
+      "The player limit is 2-64, host included, and is clamped in three "
+        .. "places so it cannot be set out of range by editing a file.",
+      "Two implementations of one protocol -- Hub.lua in-game and hub.js "
+        .. "for a dedicated server -- can drift. Both are pinned by suites "
+        .. "asserting the same behaviours, but it is a real upkeep cost.",
+      "Nameplates are positioned from the tile offset to your own player, "
+        .. "because the mod API exposes no camera position. At a map edge "
+        .. "smaller than the screen, where the camera stops scrolling but "
+        .. "you keep walking, a label can sit a tile or two off.",
+      "Interacting with another player's avatar logs 'no text for ...' from "
+        .. "the engine before the menu opens: the avatar is a real NPC with "
+        .. "no dialogue, and the engine warns on that path.",
+      "Only one trade or battle at a time, per player.",
+      "The hub has a flood gate but no moderation, accounts, or bans. Run "
+        .. "one for people you know.",
+      "No position interpolation: a remote player walks tile to tile at the "
+        .. "engine's step rate, so heavy latency reads as stuttering rather "
+        .. "than smooth motion.",
+      "Untested against a modded peer with a different link fingerprint "
+        .. "beyond what the engine's own handshake already refuses.",
+    },
+  },
+
+  credits = {
+    { who = "bryanthaboi", for_ = "Gen1Recomp, and the link stack this "
+      .. "mod's trade and battle run on unmodified" },
+  },
+
+  compat = { engine = ">=0.0.0-0 <2.0.0", modApi = 2 },
+}

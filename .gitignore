@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# packaged mod archives (built by `modkit pack`)
+*.modpkg
+
+# end-to-end driver output
+/shots/

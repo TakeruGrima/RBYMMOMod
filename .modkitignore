@@ -1,0 +1,22 @@
+# Kept out of the distributed archive.
+#
+# Entries are exact relative file paths -- modkit matches them literally, so
+# a bare "tests/" silently does nothing. Add the file, not the directory.
+
+# The suite requires engine modules (tests.modkit, src.core.Data), which is a
+# private require against the shipped package, and `pack` treats warnings as
+# fatal.
+tests/rby_mmo_test.lua
+
+# The end-to-end drivers reach engine test infrastructure
+# (tests/drivers/util.lua) and only mean anything inside a checkout.
+tests/drivers/mmo_util.lua
+tests/drivers/mmo_host.lua
+tests/drivers/mmo_join.lua
+tests/drivers/run-mmo-e2e.sh
+
+# Working notes for whoever picks this up next; not mod content.
+CLAUDE.md
+
+# server/ is deliberately NOT ignored: hub.js is plain node with no engine
+# imports, and someone who installs the package should be able to host.
