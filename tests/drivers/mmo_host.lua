@@ -298,6 +298,35 @@ return function(game)
       events["battle.started"], events["battle.ended"], events["link.desync"]))
     U.shot(game, SHOT_DIR .. "/host-after-battle.png")
     H.signal("host_battle_done")
+
+    -- ------- 7. the address stays re-viewable for as long as the game is up
+    --
+    -- It is read out once when hosting starts and then scrolls away, so the
+    -- only thing that matters is being able to get it back.
+
+    H.closeToOverworld(game)
+    local address = exports.hostAddress()
+    if H.openMmo(game) and H.selectLabel(game, "ADDRESS") then
+      U.wait(30)
+      local shown = H.textOf(H.top(game))
+      log("address screen reads:", shown)
+      check(shown:find(tostring(address), 1, true) ~= nil,
+            "the address can be re-viewed from the MMO menu")
+      U.shot(game, SHOT_DIR .. "/host-address-recheck.png")
+    else
+      check(false, "no ADDRESS row while hosting")
+    end
+    H.closeToOverworld(game)
+    H.signal("host_address_checked")
+
+    -- ------- 8. and the guest leaving is seen here
+
+    H.await(game, "guest_left_game", 60 * 120)
+    local gone = H.waitFor(game, function()
+      return #exports.players() == 0
+    end, 60 * 40, "the guest to drop off the roster")
+    check(gone, "a guest who leaves drops off the host's roster")
+    check(exports.isHosting(), "and the host is still hosting afterwards")
   end
 
   -- ------- teardown

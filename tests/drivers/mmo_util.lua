@@ -245,6 +245,20 @@ function M.captureEvents(names)
   return seen
 end
 
+-- The visible contents of a TextBox, flattened. TextBox paginates into
+-- self.pages, so this is how a driver checks that what the player is
+-- actually being shown says what it should.
+function M.textOf(top)
+  if not (top and type(top.pages) == "table") then return "" end
+  local out = {}
+  for _, page in ipairs(top.pages) do
+    if type(page) == "table" then
+      for _, line in ipairs(page) do out[#out + 1] = tostring(line) end
+    end
+  end
+  return table.concat(out, " ")
+end
+
 -- open the START menu and step into MMO
 function M.openMmo(game)
   U.tap(game, "start")

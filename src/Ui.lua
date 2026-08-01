@@ -149,16 +149,24 @@ function M:install()
     local client = ctx.client
     local items = {}
     local hosting = client:isHosting()
+    local connected = client:isConnected()
 
-    if client:isConnected() then
-      -- The host gets the same rows as everyone else plus the two that only
-      -- mean something to them: the address to read out, and ending it.
+    -- Each row is gated on what it actually needs, not on one blanket
+    -- "connected" test. Hosting and being connected are separate states: a
+    -- listener can be up while this copy's own client is not on it, and
+    -- gating everything on connected left that host with no way to read out
+    -- their address or stop hosting -- the menu offered to start a game
+    -- they were already running.
+    if connected or hosting then
+      -- the address to read out to friends, re-viewable for as long as the
+      -- game is up; this is the only place it is shown after starting
       if hosting then
         items[#items + 1] = {
           label = "ADDRESS",
           onSelect = function() mod.ui.push(game, SCREEN.HOSTINFO) end,
         }
       end
+      if connected then
       items[#items + 1] = {
         label = "PLAYERS",
         right = hosting
@@ -175,14 +183,19 @@ function M:install()
         label = "SAY",
         onSelect = function() mod.ui.push(game, SCREEN.SCOPE) end,
       }
+      end
       items[#items + 1] = {
         label = hosting and "END GAME" or "LEAVE",
         onSelect = function()
-          -- ending is destructive for everyone else, so it asks first;
-          -- walking out of someone else's game is not, so it does not
+          -- Leaving someone else's game just disconnects: the save, the
+          -- world and the party are untouched, so play carries straight on
+          -- single-player. Ending a game you host is destructive for
+          -- everyone else, so that one asks first.
           if not hosting then
             client:leave()
-            return mod.ui.push(game, SCREEN.TEXT, { text = "You left." })
+            return mod.ui.push(game, SCREEN.TEXT, {
+              text = "You left.\nStill playing!",
+            })
           end
           mod.ui.push(game, SCREEN.CONFIRM, {
             text = "End the game for\neveryone?",
@@ -237,8 +250,15 @@ function M:install()
     if not client:isHosting() then
       return mod.ui.TextBox.new(game, "You aren't hosting.")
     end
-    return mod.ui.TextBox.new(game, ("Tell your friends:\n%s"):format(
-      tostring(client:hostAddress() or "?")))
+    local address = client:hostAddress()
+    -- Net.lanIP() answers nil when it cannot work out which interface faces
+    -- the network, and "?:7788" tells a player nothing they can act on.
+    -- Name the port instead -- it is the half they need to forward anyway.
+    if type(address) ~= "string" or address:find("^%?") then
+      return mod.ui.TextBox.new(game, ("Hosting on port %d.\nYour IP is "
+        .. "hidden -- check\nyour network settings."):format(Config.DEFAULT_PORT))
+    end
+    return mod.ui.TextBox.new(game, ("Tell your friends:\n%s"):format(address))
   end })
 
   -- ------- joining: type an address, then connect

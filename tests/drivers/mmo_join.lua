@@ -297,6 +297,49 @@ return function(game)
           events["link.desync"]))
         U.shot(game, SHOT_DIR .. "/join-after-battle.png")
         H.await(game, "host_battle_done", 60 * 120)
+
+        -- ------- 7. leave the game and keep playing
+        --
+        -- Walking out of someone else's game is not quitting: the save,
+        -- the world and the party are untouched, so single-player carries
+        -- straight on. That last part is the whole point of the check --
+        -- disconnecting cleanly is easy, staying playable afterwards is
+        -- where a teardown bug would show.
+
+        H.await(game, "host_address_checked", 60 * 120)
+        H.closeToOverworld(game)
+        if H.openMmo(game) and H.selectLabel(game, "LEAVE") then
+          H.drivePrompts(game, function()
+            return not exports.isConnected()
+          end, 60 * 30)
+          check(not exports.isConnected(), "LEAVE disconnects the guest")
+          check(not exports.isHosting(), "without it having been the host")
+          check(#exports.players() == 0, "and clears the roster")
+
+          H.closeToOverworld(game)
+          U.wait(20)
+          local before = H.playerCell(game)
+          for _, dir in ipairs({ "left", "right", "up", "down" }) do
+            U.hold(game, dir, 22)
+            U.wait(8)
+            local now = H.playerCell(game)
+            if now and before and (now.x ~= before.x or now.y ~= before.y) then
+              break
+            end
+          end
+          local after = H.playerCell(game)
+          log(("after leaving: (%s,%s) -> (%s,%s)"):format(
+            tostring(before and before.x), tostring(before and before.y),
+            tostring(after and after.x), tostring(after and after.y)))
+          check(after and before
+                and (after.x ~= before.x or after.y ~= before.y),
+                "and the world is still playable afterwards")
+          check(#H.partySpecies(game) > 0, "with the party intact")
+          U.shot(game, SHOT_DIR .. "/join-after-leaving.png")
+        else
+          check(false, "no LEAVE row while connected as a guest")
+        end
+        H.signal("guest_left_game")
       else
         check(false, "could not select BATTLE")
         H.signal("guest_battle_requested")

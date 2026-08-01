@@ -46,6 +46,21 @@ tile on the engine's own step clock.
 trade evolves Kadabra and marks the mon as traded, and a battle is the same
 lockstep simulation a cable link runs.
 
+## While you're in a game
+
+`START > MMO` changes with what you're doing:
+
+| Row | When | What it does |
+| --- | --- | --- |
+| `ADDRESS` | hosting | shows your address again — read it out whenever a friend asks |
+| `PLAYERS` | connected | who's on, and `n/limit` if you're hosting |
+| `CHAT` / `SAY` | connected | the log, and sending in a scope |
+| `LEAVE` | joined someone | disconnect and **carry on playing single-player** |
+| `END GAME` | hosting | asks first — it ends the game for everyone |
+
+Leaving someone else's game is not quitting: your save, your world and your
+party are untouched, and the game keeps going exactly as it was.
+
 ## Options
 
 `MMO` in the mod manager's options pane:
@@ -102,9 +117,18 @@ bash mods/rby_mmo/tests/drivers/run-mmo-e2e.sh   # from the engine root
 
 It launches **two real LÖVE instances** with separate save identities, has
 one host and the other join over a real socket, and asserts on both sides:
-the listener comes up, the guest reaches the host's roster and vice versa,
-movement propagates, and chat crosses in both directions. Screenshots land
-in `/tmp/rby_mmo_shots`.
+
+- hosting binds a listener and publishes an address you can re-view later
+- each player reaches the other's roster, and their avatar walks (not
+  teleports) to where the network says they are
+- leaving a map despawns the avatar but keeps the player on the roster
+- chat crosses in both directions
+- pressing A on another player opens a menu offering TRADE and BATTLE
+- **a trade completes** — each side ends holding the other's Pokémon
+- **a link battle runs to a decision** with no `link.desync` on either side
+- a guest can LEAVE and carry on playing single-player
+
+Screenshots land in `/tmp/rby_mmo_shots`.
 
 Needs LÖVE on `PATH` and a ROM already imported (`scripts/setup.sh --rom …`)
 — the engine cannot boot without `data/generated/`. Two windows will open
