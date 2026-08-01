@@ -491,6 +491,7 @@ function M.install()
   -- avatar layer falling behind the network, which is invisible from the
   -- roster alone -- the end-to-end driver reads this to tell the two apart.
   mod.exports.traceAvatars = function(on) Avatars.TRACE = on and true or false end
+  mod.exports.overlayState = function() return overlay:state() end
   mod.exports.avatarState = function()
     local out = {}
     for _, player in ipairs(ctx.roster:sorted()) do

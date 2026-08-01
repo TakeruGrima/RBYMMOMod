@@ -154,7 +154,7 @@ run.release()
 -- 2. the modules, through main.lua's own resolver
 -- ------------------------------------------------------------------
 
-local stubSave, stubOptions = {}, {}
+local stubSave, stubOptions, stubPipelines = {}, {}, {}
 
 local stubMod = {
   id = "rby_mmo",
@@ -177,6 +177,19 @@ local stubMod = {
   options = {
     define = function() end,
     get = function(_, key) return stubOptions[key] end,
+  },
+  -- only what Overlay's pipeline query touches
+  content = {
+    render_pipelines = {
+      each = function(self)
+        local id = nil
+        return function()
+          id = next(stubPipelines, id)
+          if id == nil then return nil end
+          return id, stubPipelines[id]
+        end
+      end,
+    },
   },
 }
 
@@ -800,7 +813,49 @@ eq(x, 5, "landing on the target x")
 eq(y, 8, "and the target y")
 
 -- ------------------------------------------------------------------
--- 6. Settings the player changes in game
+-- 6. Playing nicely with a mod that owns the world pass
+-- ------------------------------------------------------------------
+--
+-- DramaticShapeVoxelMod registers a "voxel" render pipeline whose drawWorld
+-- replaces the overworld with a 3D diorama. This overlay places nameplates
+-- by tile offset from the local player, which is only true of the flat 2D
+-- projection -- under a diorama a label would float somewhere unrelated to
+-- the character it names. Detecting that is what lets it fall back instead
+-- of drawing nonsense.
+
+local Overlay = need("Overlay")
+local overlay = Overlay.new({ chat = Chat.new() })
+
+local function gameWith(pipelineLevels)
+  return { save = { options = { pipelines = pipelineLevels } } }
+end
+
+stubPipelines = {}
+eq(overlay:worldIsFlat(gameWith({})), true, "no pipelines means the flat world")
+eq(overlay:worldIsFlat({}), true, "and so does a save with no options")
+eq(overlay:worldIsFlat(nil), true, "and no game at all")
+
+-- a post-process pipeline does not move anything; the projection is intact
+stubPipelines = { tiltshift = { worldPresent = function() end } }
+eq(overlay:worldIsFlat(gameWith({ tiltshift = 2 })), true,
+   "a post-process pipeline leaves the projection alone")
+
+-- one that replaces the world does
+stubPipelines = {
+  voxel = { drawWorld = function() end },
+  tiltshift = { worldPresent = function() end },
+}
+eq(overlay:worldIsFlat(gameWith({ voxel = 0, tiltshift = 2 })), true,
+   "a world pipeline that is switched off still leaves it flat")
+eq(overlay:worldIsFlat(gameWith({ voxel = 1 })), false,
+   "but an active one means the flat projection no longer holds")
+eq(overlay:worldIsFlat(gameWith({ voxel = 3, tiltshift = 1 })), false,
+   "at any level, alongside any post-process")
+
+stubPipelines = {}
+
+-- ------------------------------------------------------------------
+-- 7. Settings the player changes in game
 -- ------------------------------------------------------------------
 --
 -- Menu code calls these as client:setMaxPlayers(n) -- the colon form, which

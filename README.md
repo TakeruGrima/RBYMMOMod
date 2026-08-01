@@ -137,6 +137,23 @@ Needs LÖVE on `PATH` and a ROM already imported (`scripts/setup.sh --rom …`)
 and drive themselves; clicking into them steals the input the drivers are
 queueing.
 
+## Playing with other mods
+
+Tested against
+[DramaticShapeVoxelMod](https://github.com/DramaticShape/DramaticShapeVoxelMod)
+— both load together cleanly and the whole feature set (presence, chat,
+trade, battle) works with the voxel diorama on.
+
+Remote players appear as **voxel characters**, because this mod spawns real
+overworld NPCs rather than drawing avatars itself — whoever owns the world
+pass draws them for free.
+
+Nameplates are the one thing that cannot follow. They are placed by tile
+offset from your own player, which is only true of the flat 2D projection;
+under a 3D diorama a floating label would land nowhere near the character it
+names. So when a mod owns the world pass, the overlay switches to naming
+nearby players in a corner list instead. Nothing is lost but the arrows.
+
 ## Honest limitations
 
 This is version 0.1.0 and it ships `experimental`. The things most likely to

@@ -57,6 +57,14 @@ return {
     },
   },
 
+  compat_notes = {
+    "Runs alongside DramaticShapeVoxelMod: both load clean and everything "
+      .. "works with the diorama on. Remote players render as voxel "
+      .. "characters, since this mod spawns real NPCs rather than drawing "
+      .. "avatars itself. Nameplates cannot be projected into a 3D world, "
+      .. "so they become a corner list while a mod owns the world pass.",
+  },
+
   credits = {
     { who = "bryanthaboi", for_ = "Gen1Recomp, and the link stack this "
       .. "mod's trade and battle run on unmodified" },

@@ -57,6 +57,15 @@ mkdir -p "$SHOT_DIR" "$SYNC_DIR"
 # ~/.local/share/love/<identity> on Linux, and guessing it wrong fails in
 # the most confusing way available: the game boots fine, the mod is simply
 # absent, and every later assertion blames the wrong thing.
+# Other mods to enable alongside, as a comma-free list of ids:
+#   MMO_WITH_MODS="DRAMATIC_SHAPE" bash .../run-mmo-e2e.sh
+# Coexistence is worth running for real, not just asserting at load time.
+EXTRA_MODS=""
+for id in ${MMO_WITH_MODS:-}; do
+  EXTRA_MODS="$EXTRA_MODS, $id = true"
+done
+[ -n "$EXTRA_MODS" ] && echo "  also enabling:${MMO_WITH_MODS}"
+
 PROBE="$(mktemp -d)"
 cat > "$PROBE/conf.lua" <<'PROBE_CONF'
 function love.conf(t)
@@ -81,7 +90,8 @@ enable_mod_for() {
   dir="$(save_dir_for "$1")"
   [ -n "$dir" ] || fail "could not determine LOVE's save directory for $1"
   mkdir -p "$dir"
-  printf 'return { mods = { rby_mmo = true } }\n' > "$dir/options.lua"
+  printf 'return { mods = { rby_mmo = true%s } }\n' "$EXTRA_MODS" \
+    > "$dir/options.lua"
   echo "$dir"
 }
 HOST_SAVE="$(enable_mod_for "$HOST_ID")"

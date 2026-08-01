@@ -179,6 +179,32 @@ return function(game)
     check(sawWalking, "and was seen mid-step -- the walk actually animates")
     U.shot(game, SHOT_DIR .. "/host-guest-moved.png")
 
+    -- ------- 1b. coexistence with a mod that owns the world pass
+    --
+    -- Only runs when DramaticShapeVoxelMod is installed alongside. Turning
+    -- its pipeline on is the only way to see what this mod does when the
+    -- overworld is no longer a flat 2D grid -- the nameplates cannot be
+    -- projected, so the overlay should fall back to a corner roster rather
+    -- than float labels at meaningless positions.
+    local okPipes, Pipelines = pcall(require, "src.render.Pipelines")
+    if okPipes and Pipelines and Pipelines.get and Pipelines.get("voxel") then
+      log("voxel pipeline present; switching it on")
+      Pipelines.setLevel("voxel", 1)
+      U.wait(120)
+      log(("voxel level=%s eligible=%s"):format(
+        tostring(Pipelines.level("voxel")),
+        tostring(Pipelines.eligible and Pipelines.eligible("voxel"))))
+      local st = exports.overlayState and exports.overlayState() or {}
+      log(("overlay: reached=%s here=%s gameX=%s scale=%s"):format(
+        tostring(st.reached), tostring(st.here), tostring(st.gameX),
+        tostring(st.scale)))
+      U.shot(game, SHOT_DIR .. "/host-voxel-roster.png")
+      Pipelines.setLevel("voxel", 0)
+      U.wait(60)
+    else
+      log("no voxel pipeline installed; skipping the coexistence shot")
+    end
+
     -- ------- 2. the host's own movement reaches the guest
     --
     -- Only the guest can judge this, so the host walks between two markers
