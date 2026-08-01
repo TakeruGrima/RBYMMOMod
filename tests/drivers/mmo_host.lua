@@ -105,7 +105,7 @@ return function(game)
   check(joinedSelf, "the host joined its own game over loopback")
 
   -- close the menus so the overworld is on top when the guest arrives
-  for _ = 1, 4 do U.tap(game, "b") U.wait(8) end
+  H.closeToOverworld(game)
 
   -- The guest connects to 127.0.0.1; the LAN address is what a human would
   -- read aloud, so publish both and let the joiner pick.
@@ -144,28 +144,41 @@ return function(game)
     -- is a separate question, and the one the screenshots answer badly --
     -- so read both and compare, rather than trusting a passing roster
     -- assertion to mean the world looks right.
-    U.wait(90)
-    local followed = false
-    for _ = 1, 60 do
+    --
+    -- Sampling starts immediately: the avatar catches up within a second,
+    -- so any delay here lands entirely after it has arrived and the
+    -- mid-step window is missed.
+    -- cellOf reports pixel position in cells, so it is fractional mid-step;
+    -- "arrived" is a tolerance, not equality
+    local function at(a, b)
+      return a ~= nil and b ~= nil and math.abs(a - b) < 0.01
+    end
+
+    local followed, sawWalking, samples = false, false, 0
+    for _ = 1, 400 do
       local rows = exports.avatarState()
       local row = rows and rows[1]
       if row then
-        log(("avatar: spawned=%s roster=(%s,%s) avatar=(%s,%s) map=%s/%s")
-          :format(tostring(row.spawned), tostring(row.rosterX),
-                  tostring(row.rosterY), tostring(row.avatarX),
-                  tostring(row.avatarY), tostring(row.map),
-                  tostring(row.avatarMap)))
-        if row.spawned and row.avatarX == row.rosterX
-           and row.avatarY == row.rosterY then
-          followed = true
-          break
+        if row.walking then sawWalking = true end
+        samples = samples + 1
+        if samples % 25 == 1 then
+          log(("avatar: spawned=%s roster=(%s,%s) avatar=(%s,%s) walking=%s")
+            :format(tostring(row.spawned), tostring(row.rosterX),
+                    tostring(row.rosterY), tostring(row.avatarX),
+                    tostring(row.avatarY), tostring(row.walking)))
         end
-      else
-        log("avatar: no roster rows")
+        if row.spawned and at(row.avatarX, row.rosterX)
+           and at(row.avatarY, row.rosterY) then
+          followed = true
+        end
       end
-      U.wait(30)
+      if followed and sawWalking then break end
+      -- sampled finely: a step lasts 16 frames, so a coarse poll would
+      -- miss the walking window entirely and report a false negative
+      U.wait(4)
     end
     check(followed, "the avatar caught up to where the network says it is")
+    check(sawWalking, "and was seen mid-step -- the walk actually animates")
     U.shot(game, SHOT_DIR .. "/host-guest-moved.png")
 
     -- chat, in the direction the unit tests cannot see: over the wire

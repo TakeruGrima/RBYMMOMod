@@ -500,6 +500,7 @@ function M.install()
         rosterX = player.x, rosterY = player.y,
         avatarX = ax, avatarY = ay,
         spawned = ctx.avatars.spawned[player.id] ~= nil,
+        walking = ctx.avatars:isWalking(player.id),
         avatarMap = ctx.avatars.mapId,
       }
     end

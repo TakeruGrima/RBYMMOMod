@@ -87,6 +87,31 @@ function M.requireMod(game, tag)
   return exports
 end
 
+-- Dismiss whatever is on the stack until the overworld is on top again.
+--
+-- This matters for more than tidiness: StateStack updates only the top
+-- state, so while any box or menu is up the overworld -- and every NPC in
+-- it -- is frozen. An avatar mid-step stays mid-step, which is correct in
+-- play but makes a driver that samples avatar movement behind an open text
+-- box wait forever for a step that cannot finish.
+function M.closeToOverworld(game, tries)
+  for _ = 1, tries or 24 do
+    local top = M.top(game)
+    if top == nil or top == game.overworld or top.isOverworld then return true end
+    -- a text box wants A to advance and close; a menu wants B to cancel
+    U.tap(game, "b")
+    U.wait(6)
+    if M.top(game) == top then
+      U.tap(game, "a")
+      U.wait(6)
+    end
+  end
+  local top = M.top(game)
+  U.log("WARN could not get back to the overworld; top is",
+        tostring(top and (top.title or "?")))
+  return false
+end
+
 -- open the START menu and step into MMO
 function M.openMmo(game)
   U.tap(game, "start")

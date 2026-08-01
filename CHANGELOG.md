@@ -50,7 +50,9 @@ were visible to the headless suites.
 - **Remote avatars never moved.** They were driven with `scriptMove`, the
   engine's cutscene primitive — which also gates the *local* player's input
   on the queue being empty, so it would have frozen your controls every time
-  anyone else took a step. Avatars are now placed directly.
+  anyone else took a step. Avatars now start a step directly on the NPC
+  (facing, target, moving, progress), which `NPC:update` animates over its
+  own 16 frames: the full walk cycle, none of the input lock.
 - **`SPRITE_RED` arrived as `SPRITERED`**: sprite ids were sanitised with the
   chat-text sanitiser, which strips underscores, so every remote player
   silently fell back to the default sprite.

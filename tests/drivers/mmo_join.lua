@@ -103,7 +103,7 @@ return function(game)
     return
   end
 
-  for _ = 1, 4 do U.tap(game, "b") U.wait(8) end
+  H.closeToOverworld(game)
 
   -- ------- the host is a player over here too
 

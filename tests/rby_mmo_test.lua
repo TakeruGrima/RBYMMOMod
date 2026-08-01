@@ -680,7 +680,53 @@ localNet:close()
 eq(hosted.hub.count, 1, "closing the local net frees the host's slot")
 
 -- ------------------------------------------------------------------
--- 5. Settings the player changes in game
+-- 5. Avatar step routing
+-- ------------------------------------------------------------------
+--
+-- The rest of Avatars needs a live overworld, but the routing decision is
+-- pure and is what decides whether a remote player walks or teleports.
+
+local Avatars = need("Avatars")
+
+local function step(fromX, fromY, toX, toY)
+  local dir, tx, ty = Avatars.stepToward(fromX, fromY, toX, toY)
+  return dir, tx, ty
+end
+
+eq(step(3, 6, 3, 6), nil, "already there is not a step")
+
+local dir, tx, ty = step(3, 6, 4, 6)
+eq(dir, "right", "one tile east steps right")
+eq(tx, 4, "onto the next cell")
+eq(ty, 6, "with y unchanged")
+
+eq(step(3, 6, 2, 6), "left", "west steps left")
+eq(step(3, 6, 3, 7), "down", "south steps down")
+eq(step(3, 6, 3, 5), "up", "north steps up")
+
+-- One axis at a time: the overworld grid has no diagonal step, so a
+-- diagonal target has to be walked as two separate steps.
+dir, tx, ty = step(3, 6, 5, 8)
+eq(dir, "right", "a diagonal target resolves x first")
+eq(tx, 4, "and moves exactly one tile")
+eq(ty, 6, "leaving y for the next step")
+
+-- ...and each call moves one tile, so a run of them walks the whole path
+local x, y = 3, 6
+local walked = 0
+while true do
+  local d, nx, ny = step(x, y, 5, 8)
+  if not d then break end
+  x, y = nx, ny
+  walked = walked + 1
+  if walked > 10 then break end
+end
+eq(walked, 4, "two east and two south is four steps")
+eq(x, 5, "landing on the target x")
+eq(y, 8, "and the target y")
+
+-- ------------------------------------------------------------------
+-- 6. Settings the player changes in game
 -- ------------------------------------------------------------------
 --
 -- Menu code calls these as client:setMaxPlayers(n) -- the colon form, which
