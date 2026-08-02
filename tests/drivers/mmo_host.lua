@@ -358,6 +358,23 @@ return function(game)
     end, 60 * 60)
     check(started, "a link battle started on the host")
 
+    -- What does a link battle actually show? The chosen character is an
+    -- overworld sheet; a battle draws trainer *pics*, different assets
+    -- entirely. Capture it rather than reason about it -- but wait for the
+    -- battle state to be on top first: battle.started fires before the
+    -- transition finishes, and a shot taken then is still the overworld.
+    local inBattle = H.waitFor(game, function()
+      local top = H.top(game)
+      return top ~= nil and top.enemy ~= nil
+    end, 60 * 20, "the battle screen to come up")
+    if inBattle then
+      U.wait(90)
+      local top = H.top(game)
+      log(("battle pics: enemyTrainer=%s myBack=%s"):format(
+        tostring(top.trainerPic), tostring(top.playerBackPic)))
+      U.shot(game, SHOT_DIR .. "/host-battle-open.png")
+    end
+
     local ended = H.drivePrompts(game, function()
       return events["battle.ended"] > 0
     end, 60 * 240)
