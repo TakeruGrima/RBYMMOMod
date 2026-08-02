@@ -89,6 +89,40 @@ local Card = {}
 Card.__index = Card
 Card.isOpaque = true
 
+-- The character's own portrait, taken from the overworld sheet.
+--
+-- Not a battle pic: those exist only for trainer *classes*, so most of the
+-- 36 characters have none and the card would be blank for them. Every
+-- character has an overworld sheet -- 16x96, six 16x16 frames, the first
+-- being stand-down (src/render/SpriteRenderer.lua) -- which is the
+-- front-facing pose, and the one everybody has.
+local FRONT_FRAME = { 0, 0, 16, 16 }
+local sheets = {}
+
+local function portrait(spriteId)
+  local registry = mod.content and mod.content.sprites
+  local record = registry and registry:get(spriteId)
+  local path = record and record.image
+  if type(path) ~= "string" then return nil end
+
+  local entry = sheets[path]
+  if entry == nil then
+    local ok, img = pcall(love.graphics.newImage, path)
+    if ok and img then
+      entry = {
+        image = img,
+        quad = love.graphics.newQuad(FRONT_FRAME[1], FRONT_FRAME[2],
+                                     FRONT_FRAME[3], FRONT_FRAME[4],
+                                     img:getDimensions()),
+      }
+    else
+      entry = false      -- remembered, so a missing sheet is not retried
+    end
+    sheets[path] = entry
+  end
+  return entry or nil
+end
+
 function Card.new(game, player, onCancel)
   return setmetatable({ game = game, player = player, onCancel = onCancel }, Card)
 end
@@ -112,6 +146,13 @@ function Card:draw()
 
   Font.draw(("NAME/%s"):format(tostring(p.name or "?")), 16, 24)
   Font.draw(("LOOK/%s"):format(Chars.label(p.sprite or "")), 16, 40)
+
+  -- portrait on the right, clear of the text column
+  local art = portrait(p.sprite)
+  if art then
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(art.image, art.quad, 116, 24, 0, 2, 2)
+  end
 
   local card = p.profile
   if not card then
