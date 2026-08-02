@@ -30,18 +30,18 @@ until you say otherwise — installing it is never what opens a socket.
 
 **3. One of you hosts.** `START → MMO → HOST GAME`.
 
-```
-   START → MMO                    TRAINER
-        ┌──────────────┐         ▶NAME              ASH
-        │▶ HOST GAME   │  ───▶    LOOK             LANCE
-        │  JOIN GAME   │          HOST
-        └──────────────┘
-```
-
 Character creation comes first: pick a **NAME** (your save file keeps its
 own) and a **LOOK** from the 36 walking characters in the game. Confirm, pick
-a room size, and you're live. The menu's **ADDRESS** row then shows something
-like `192.168.1.125:7788` — read it out.
+a room size, and you're live.
+
+<p align="center">
+  <img src="docs/screenshots/character-creation.png" width="270" alt="Character creation: NAME, LOOK and HOST rows">
+  <img src="docs/screenshots/character-picker.png" width="270" alt="The character list, scrolled to LANCE">
+  <img src="docs/screenshots/room-size.png" width="270" alt="Room size picker">
+</p>
+
+The menu's **ADDRESS** row then shows something like `192.168.1.125:7788` —
+read it out.
 
 **4. Everyone else joins.** `START → MMO → JOIN GAME`, make their own
 trainer, type the address, done. (**SELECT** flips the keyboard to digits —
@@ -70,6 +70,11 @@ right depth sorting, right palette — walking tile to tile on the engine's own
 16-frame step clock. Not a sprite bolted on top. Nameplates ride over their
 heads; chat bubbles pop when they talk.
 
+<p align="center">
+  <img src="docs/screenshots/overworld-presence.png" width="300" alt="Another player standing in the room with a nameplate">
+  <img src="docs/screenshots/chat-log.png" width="300" alt="The chat log showing two global messages">
+</p>
+
 ### 💬 TALK TRASH ON A GAME BOY KEYBOARD
 Three scopes, composed on the vanilla naming grid:
 
@@ -92,6 +97,11 @@ and the mon still gets stamped as traded with the original OT.
 Same deal, on the grass where you're standing. The real lockstep simulation a
 link cable runs, carried over the wire. **Zero desyncs** across the full
 end-to-end suite.
+
+<p align="center">
+  <img src="docs/screenshots/interact-menu.png" width="300" alt="PROFILE / TRADE / BATTLE / WHISPER menu">
+  <img src="docs/screenshots/link-battle.png" width="300" alt="GUESTY wants to battle!">
+</p>
 
 ### 🏠 YOU ARE THE SERVER
 `HOST GAME`, pick a room size (**2–64**), done. You're a normal player who
@@ -117,17 +127,9 @@ your screen rather than not at all.
 Walk up, press **A**, and **PROFILE** sits at the top of the menu — their
 trainer card, laid out like your own:
 
-```
-        ╔══════════════════════╗
-        ║     TRAINER CARD     ║
-        ║  NAME/HOSTY     ,d8b,║
-        ║  LOOK/LANCE     8( )8║
-        ║  IDNo/45799     `Y8Y'║
-        ║  TIME/   3:21        ║
-        ║  BADGES/5            ║
-        ║  SEEN/87  OWN/41     ║
-        ╚══════════════════════╝
-```
+<p align="center">
+  <img src="docs/screenshots/trainer-card.png" width="330" alt="Another player's trainer card, with their portrait">
+</p>
 
 Their portrait, who they are, who they're dressed as, trainer ID, hours
 played, badges earned, and how much of the dex they've seen and caught. Not
@@ -146,6 +148,10 @@ work required.
 `START → MMO` is a bordered box in the corner like any other START submenu.
 B goes back. The cursor remembers where you left it. The world stays visible
 behind it.
+
+<p align="center">
+  <img src="docs/screenshots/mmo-menu.png" width="300" alt="The MMO menu while hosting">
+</p>
 
 | Row | Shows up when | What it does |
 | --- | --- | --- |
@@ -293,9 +299,12 @@ you:
   or you all use a standalone hub on a box with a public address.
 - **No host migration.** Host leaves → the game ends for everyone. They get
   told, rather than left staring at a frozen world.
-- **Nameplates can drift a tile or two** at the edge of small maps, where the
-  camera stops scrolling but you keep walking. Fixing it properly needs a
-  camera seam the mod API doesn't expose yet.
+- **Nameplates sit about a tile low.** You can see it in the shots above —
+  the plate lands across the character's chest rather than over their head.
+  This was previously written up here as drift at the edge of small maps,
+  where the camera stops scrolling; that explanation doesn't survive a look
+  at the engine's `Camera:follow`, which does no clamping at all. So the
+  offset is real and reproducible, and the cause is still open.
 - **Only ever tested over loopback**, two instances on one desk. Real latency
   and packet loss are still an unknown.
 - **No accounts, no bans, no encryption.** Anyone who can reach the port can

@@ -79,6 +79,22 @@ return function(game)
   U.wait(20)
   check(H.classify(H.top(game)) == "menu", "character creation opened")
   U.shot(game, SHOT_DIR .. "/host-charsetup.png")
+
+  -- Open the character list, then back out of it. The run wears whatever
+  -- MMO_HOST_SPRITE asked for, so this changes nothing -- it is here because
+  -- the picker was the one screen in the flow nothing ever opened, which
+  -- meant a mistake in it could only be found by hand.
+  if H.selectLabel(game, "LOOK") then
+    U.wait(20)
+    check(H.classify(H.top(game)) == "menu", "the character picker opened")
+    U.shot(game, SHOT_DIR .. "/host-charpick.png")
+    U.tap(game, "b")
+    U.wait(20)
+    check(H.classify(H.top(game)) == "menu", "backed out to character creation")
+  else
+    check(false, "no LOOK row on character creation")
+  end
+
   check(H.selectLabel(game, "HOST"), "confirmed the trainer and moved on")
 
   -- the size picker is a named list now, so the run picks its row by name

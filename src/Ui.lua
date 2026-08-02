@@ -593,13 +593,18 @@ function M:install()
   -- theoretical width put the last word hard against the right edge.
   local CHAT_COLS = 15
 
+  -- `first` and `rest` are indents, not seed text: seeding `line` with the
+  -- indent made the opening row join it to the first word with a space, so
+  -- it sat one column right of every row beneath it -- a ragged left edge
+  -- on exactly the messages long enough to wrap.
   local function wrapLine(text, first, rest)
-    local rows, line = {}, first
+    local rows, line, indent = {}, "", first
     for word in tostring(text):gmatch("%S+") do
-      local candidate = line == "" and word or (line .. " " .. word)
+      local candidate = line == "" and (indent .. word) or (line .. " " .. word)
       if #candidate > CHAT_COLS and line ~= "" then
         rows[#rows + 1] = line
-        line = rest .. word
+        indent = rest
+        line = indent .. word
       else
         line = candidate
       end
