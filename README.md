@@ -21,8 +21,14 @@ the game — you're a player, your copy is just also the relay.
 
 ## 🎮 Get in
 
-**1. Install it.** Drop this folder into your Gen1Recomp `mods/` folder (or
-import the release archive from the launcher's **MODS** tab).
+**1. Install it.** Grab `rby_mmo-<version>.zip` from
+[Releases](https://github.com/alamops/RBYMMOMod/releases), then in the game:
+**MODS → Import mod .zip**. That's the whole install — the archive carries
+`manifest.json` at its root, which is the shape the importer expects, so it
+also unzips into your `mods/` folder by hand if you'd rather.
+
+Every release ships a `sha256sums.txt` beside the zip if you want to check
+what you downloaded.
 
 **2. Turn it on.** Launch the game, press **F10**, enable **RBY MMO**, and
 let it restart when it asks. It ships flagged `experimental`, so it stays off
@@ -46,6 +52,11 @@ read it out.
 **4. Everyone else joins.** `START → MMO → JOIN GAME`, make their own
 trainer, type the address, done. (**SELECT** flips the keyboard to digits —
 the vanilla one has none.)
+
+**Staying current.** The manifest points at this repo, so the launcher's
+mod list checks Releases for you and offers the newer build under **Other
+versions** — you don't have to come back here to find out something shipped.
+It only ever asks; nothing updates itself behind you.
 
 Everyone on the same Wi-Fi or LAN can join straight away, no configuration.
 Across the internet the host has to forward port **7788** — or nobody
@@ -270,6 +281,38 @@ pass count.
 
 > Two windows open and drive themselves. Don't click into them — you'll
 > steal the input the drivers are queueing.
+
+---
+
+## 📦 Cutting a release
+
+Pushing to `main` builds the installable zip and publishes it. There is no
+manual step and no local build — the artifact players download is always one
+GitHub Actions run away from a commit, so it can't quietly drift from the
+source.
+
+**To ship a version:** bump `version` in `manifest.json`, add the matching
+`CHANGELOG.md` heading, push. The workflow takes the manifest's version when
+it's ahead of every existing tag, which makes bumping the manifest the normal
+way to cut a release. Failing that it falls back, in order, to a
+`workflow_dispatch` input, a `[release X.Y.Z]` tag in the commit message, or
+a patch bump on the newest `vX.Y.Z`. Whichever wins is written into the
+manifest *inside the archive*, so an installed copy never reports a version
+the release it came from doesn't have. An existing tag or release is refused
+rather than overwritten.
+
+Each run publishes `rby_mmo-<version>.zip` plus `sha256sums.txt`. The
+filename matters: the launcher's update check looks for `<id>-<version>.zip`
+first, and `manifest.json` sits at the archive root because that is one of
+the two layouts **Import mod .zip** accepts.
+
+**What the archive contains** is decided by `.modkitignore` — the release job
+reads that same file rather than keeping a second list that could disagree
+with it, so what a release hands a player is what `modkit pack` produces.
+Tests, drivers, dev tooling and `docs/` stay out. `docs/` in particular holds
+screenshots of a running game, which are composited from tiles, sprites and
+font glyphs decoded out of the player's own ROM — fine on a page nobody
+installs, not something to put in an archive that gets handed around.
 
 ---
 

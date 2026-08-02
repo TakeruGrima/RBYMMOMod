@@ -58,6 +58,29 @@ were visible to the headless suites.
   silently fell back to the default sprite.
 - **A modal "Connected." box** sat over the world for the whole session. Routine
   status is a log line now; only things worth interrupting for get a box.
+- **Wrapped chat lines had a ragged left edge.** The wrapper took its indent
+  as the seed for the first line, so the opening row joined indent and first
+  word with a space and sat one column right of every row beneath it. Only
+  messages long enough to wrap showed it, which is why it took rendering the
+  screen at size to notice.
+
+### Distribution
+
+- **Releases are built by CI, not by hand.** A push to `main` resolves the
+  version, packs `rby_mmo-<version>.zip` with `manifest.json` at the archive
+  root, and publishes it with `sha256sums.txt`. The version that wins is
+  written into the packed manifest, so an installed copy cannot report a
+  version its release does not have; an existing tag is refused rather than
+  overwritten.
+- **`manifest.github` points at this repo**, which is what turns on the
+  launcher's update check — absent, it never looks. The archive is named
+  `<id>-<version>.zip` because that is the name the check prefers.
+- **The archive's contents come from `.modkitignore`**, read by the release
+  job rather than duplicated in it, so a published release and `modkit pack`
+  hand over the same files. Tests, drivers, dev tooling and `docs/` are
+  excluded — `docs/` holds screenshots composited from ROM-decoded tiles,
+  sprites and glyphs, which this project does not put in an archive it
+  distributes.
 
 ### Proven end to end
 

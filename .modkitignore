@@ -27,3 +27,23 @@ tools/env.sh
 tools/play.sh
 .env
 .env.example
+
+# Repo furniture, not mod content: the release pipeline and its notes.
+.github/workflows/release.yml
+docs/plans/in-game-hosting.md
+
+# Screenshots of a running game are composited from tiles, sprites and font
+# glyphs decoded from the player's own ROM. They illustrate a GitHub page
+# nobody installs; they are not bytes this project puts in an archive it
+# hands out. modkit lint does not catch them -- MK302 compares a mod's PNGs
+# against individual cache images, and a whole composited frame matches none
+# of them -- so keeping them out is this file's job, not the linter's.
+docs/screenshots/character-creation.png
+docs/screenshots/character-picker.png
+docs/screenshots/room-size.png
+docs/screenshots/mmo-menu.png
+docs/screenshots/overworld-presence.png
+docs/screenshots/chat-log.png
+docs/screenshots/interact-menu.png
+docs/screenshots/link-battle.png
+docs/screenshots/trainer-card.png
