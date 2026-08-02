@@ -20,3 +20,10 @@ CLAUDE.md
 
 # server/ is deliberately NOT ignored: hub.js is plain node with no engine
 # imports, and someone who installs the package should be able to host.
+
+# tools/play.sh and tools/env.sh assume the engine checkout layout, and
+# .env is machine-specific -- neither belongs in a distributed archive.
+tools/env.sh
+tools/play.sh
+.env
+.env.example

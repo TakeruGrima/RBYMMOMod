@@ -11,3 +11,6 @@
 
 # end-to-end driver output
 /shots/
+
+# machine-specific test config (ROM path, addresses) -- see .env.example
+.env

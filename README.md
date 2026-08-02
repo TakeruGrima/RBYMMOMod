@@ -9,9 +9,23 @@ in it. **No server to install** — one of you hosts from inside the game.
 
 ## Try it
 
-From a Gen1Recomp checkout, with this folder linked in as `mods/rby_mmo`,
-start the game (`love .`) and turn the mod on in the mod manager (`F10`) —
-it ships disabled.
+From a Gen1Recomp checkout with this folder linked in as `mods/rby_mmo`,
+copy `.env.example` to `.env`, set `ROM_PATH` to your own ROM, then:
+
+```sh
+bash mods/rby_mmo/tools/play.sh          # boots straight in, mod enabled
+bash mods/rby_mmo/tools/play.sh guest    # a second instance, separate save
+```
+
+That skips two manual steps a plain `love .` cannot. The launcher's ROM
+screen always appears for an interactive launch — the engine only bypasses
+it for a scripted run — so `play.sh` passes `POKEPORT_IMPORT_ROM`, the
+engine's own supported route, and the game imports and boots. It also
+enables the mod, which ships `experimental` and would otherwise need a trip
+through the mod manager on every new save.
+
+Two instances is how you try multiplayer on one machine: host in the first,
+join `127.0.0.1:7788` from the second.
 
 Then **START > MMO**:
 

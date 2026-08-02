@@ -21,6 +21,17 @@ set -uo pipefail
 cd "$(dirname "$0")/../../../.." || exit 1
 
 MOD_DIR="mods/rby_mmo"
+
+# ---------------------------------------------------------------- .env
+#
+# Everything machine-specific lives in mods/rby_mmo/.env (gitignored; see
+# .env.example): the ROM to import, the address to dial, which other mods to
+# pin on or off. Loaded through the shared helper so this and tools/play.sh
+# cannot drift apart on how the file is read.
+ENV_FILE="$MOD_DIR/.env"
+# shellcheck source=/dev/null
+. "$MOD_DIR/tools/env.sh"
+load_env "$ENV_FILE"
 DRIVERS="$MOD_DIR/tests/drivers"
 ADDR_FILE="${MMO_ADDR_FILE:-/tmp/rby_mmo_addr.txt}"
 SHOT_DIR="${SHOT_DIR:-/tmp/rby_mmo_shots}"
@@ -38,10 +49,33 @@ fail() { echo "  !! $*" >&2; exit 2; }
 command -v love >/dev/null 2>&1 || fail "love is not on PATH (brew install --cask love)"
 [ -f main.lua ] || fail "run this from the Gen1Recomp checkout root"
 [ -d "$MOD_DIR" ] || fail "$MOD_DIR is missing -- symlink the mod into mods/"
-[ -d data/generated ] || fail "no data/generated -- import a ROM first:
-     scripts/setup.sh --rom \"/path/to/Poke Red.gb\""
+if [ ! -d data/generated ]; then
+  # No cache yet. With a ROM configured this is recoverable without anyone
+  # touching the game: import it and carry on. The extractor is called
+  # directly rather than through scripts/setup.sh, which never passes
+  # --version and so always checks the ROM against Red's hash.
+  if [ -n "${ROM_PATH:-}" ] && [ -f "$ROM_PATH" ]; then
+    echo "  no game data yet; importing $(basename "$ROM_PATH") as ${ROM_VERSION:-red}"
+    PY=.venv/bin/python3
+    [ -x "$PY" ] || PY=python3
+    if ! "$PY" tools/build_data.py --rom "$ROM_PATH" \
+        --version "${ROM_VERSION:-red}" --clean; then
+      fail "importing $ROM_PATH failed -- check ROM_VERSION matches the ROM"
+    fi
+  else
+    fail "no data/generated, and no usable ROM_PATH.
+     Set ROM_PATH (and ROM_VERSION) in $MOD_DIR/.env -- see .env.example --
+     or import once with: scripts/setup.sh --rom \"/path/to/rom.gb\""
+  fi
+fi
 
 SYNC_DIR="${MMO_SYNC_DIR:-/tmp/rby_mmo_sync}"
+# Check the ROM config before anything long-running rather than at the moment
+# it is needed: a path left at the example value looks configured and is not,
+# and a ROM_VERSION that disagrees with the file fails a SHA-1 check partway
+# through an import.
+check_rom_config || exit 2
+
 rm -f "$ADDR_FILE" "$HOST_LOG" "$GUEST_LOG"
 # stale phase markers would let a rerun skip straight past every barrier
 rm -rf "$SYNC_DIR"
@@ -103,8 +137,11 @@ enable_mod_for() {
   dir="$(save_dir_for "$1")"
   [ -n "$dir" ] || fail "could not determine LOVE's save directory for $1"
   mkdir -p "$dir"
-  printf 'return { mods = { rby_mmo = true%s } }\n' "$EXTRA_MODS" \
-    > "$dir/options.lua"
+  # modOptions is the same bucket the mod manager writes, so the joining
+  # instance reads its address through the mod's ordinary option rather than
+  # anything test-only
+  printf 'return { mods = { rby_mmo = true%s }, modOptions = { rby_mmo = { hub = "%s" } } }\n' \
+    "$EXTRA_MODS" "${MMO_JOIN_ADDRESS:-127.0.0.1:7788}" > "$dir/options.lua"
   echo "$dir"
 }
 HOST_SAVE="$(enable_mod_for "$HOST_ID")"
@@ -122,6 +159,22 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------- run
+
+# Each instance runs under its own throwaway save identity, and readiness is
+# decided per identity -- so a fresh one can land on the importer and sit
+# there forever, silent, which reads as "the host never started listening".
+# Handing it the ROM is what makes a scripted run import and boot instead of
+# waiting for a human to pick a file.
+# Exported rather than built into a string: an expanded "VAR=x love ." is
+# not treated as an assignment by the shell -- the first word becomes the
+# command name -- and a ROM path with spaces would word-split anyway.
+if [ -n "${ROM_PATH:-}" ] && [ -f "$ROM_PATH" ]; then
+  export POKEPORT_IMPORT_ROM="$ROM_PATH"
+  export POKEPORT_VERSION="${ROM_VERSION:-red}"
+else
+  echo "  note: no usable ROM_PATH; a fresh save identity may stall on the"
+  echo "        importer. Set ROM_PATH in $ENV_FILE to make this reliable."
+fi
 
 echo "  host limit: $LIMIT   shots: $SHOT_DIR"
 echo "  starting host..."
