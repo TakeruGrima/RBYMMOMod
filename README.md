@@ -52,14 +52,24 @@ standalone hub instead ([server/README.md](server/README.md)).
 
 ---
 
-## ⚡ What you actually get
+## ⚡ Features
 
-**👥 They're really there.** Every other player on your map is a genuine
-overworld NPC — right sprite, right depth sorting, right palette, walking
-tile to tile on the engine's own step clock. Not a floating overlay. If a
-renderer mod redraws the world, it redraws them too.
+```
+╔════════════════════════════════════════════════════════════╗
+║  SHARED KANTO      up to 64 trainers, one live overworld   ║
+║  ZERO SETUP        one of you hosts from inside the game   ║
+║  FULL LINK SUITE   trade + battle, anywhere on the map     ║
+╚════════════════════════════════════════════════════════════╝
+```
 
-**💬 Chat, on a Game Boy keyboard.** Three scopes:
+### 👥 THEY'RE REALLY THERE
+Every other player on your map is a **genuine overworld NPC** — right sprite,
+right depth sorting, right palette — walking tile to tile on the engine's own
+16-frame step clock. Not a sprite bolted on top. Nameplates ride over their
+heads; chat bubbles pop when they talk.
+
+### 💬 TALK TRASH ON A GAME BOY KEYBOARD
+Three scopes, composed on the vanilla naming grid:
 
 | Scope | Who hears it | Floats over your head |
 | --- | --- | --- |
@@ -67,10 +77,38 @@ renderer mod redraws the world, it redraws them too.
 | `NEARBY` | same map, 12 tiles | ✅ |
 | `WHISPER` | one player | ❌ — it's a whisper |
 
-**🔁 Trade. ⚔️ Battle.** Walk up, press A, pick from the menu. Both run the
-engine's *own* link code, untouched — so a trade still evolves your Kadabra
-and stamps the mon as traded, and a battle is the same lockstep simulation a
-real link cable runs. This mod carries the bytes; Gen 1 does the rest.
+Unread messages flag the menu with `CHAT*`. And because the vanilla grid has
+**no digits at all**, this mod adds a number page to its own screens —
+**SELECT** flips `ABC` ⇄ `123`.
+
+### 🔁 TRADE — ANYWHERE
+No Cable Club. No Pokémon Center. Walk up, press **A**, pick `TRADE`. It runs
+the engine's *own* `TradeSession`, untouched — so your Kadabra still evolves,
+and the mon still gets stamped as traded with the original OT.
+
+### ⚔️ BATTLE — ANYWHERE
+Same deal, on the grass where you're standing. The real lockstep simulation a
+link cable runs, carried over the wire. **Zero desyncs** across the full
+end-to-end suite.
+
+### 🏠 YOU ARE THE SERVER
+`HOST GAME`, pick a room size (**2–64**), done. You're a normal player who
+happens to be the relay — you walk, chat, trade and fight like everyone else.
+Want a box that stays up 24/7 instead? There's a standalone hub, same
+protocol, and joiners can't tell the difference.
+
+### 🚪 DROP OUT, KEEP PLAYING
+`LEAVE` disconnects and hands you straight back to single-player. Save,
+world, party — untouched. No "returning to title screen".
+
+### 🎭 PICK YOUR LOOK
+RED, BLUE, YOUNGSTER, LASS or COOLTRAINER — that's who everyone else sees
+walking around.
+
+### 🧩 STACKS WITH OTHER MODS
+Spawning real NPCs means whoever owns the world pass draws your friends too.
+Run it with a voxel renderer and they show up **as voxel characters**, no
+work required.
 
 ---
 
@@ -109,9 +147,8 @@ JOIN GAME lets you type an address, and those in-game choices stick with your
 save. (Mods can read their options but not write them, so the in-game values
 live in the save file instead of overwriting the rows above.)
 
-**Typing an address on a Game Boy?** The vanilla naming grid has no digits at
-all — so this mod adds a number page to *its own* text screens. **SELECT**
-flips `ABC` ⇄ `123`. Every other naming screen in the game is left alone.
+Typing an address uses the number page described above — **SELECT** flips
+`ABC` ⇄ `123`. Every other naming screen in the game is left untouched.
 
 ---
 
