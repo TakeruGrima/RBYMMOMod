@@ -57,14 +57,27 @@ mkdir -p "$SHOT_DIR" "$SYNC_DIR"
 # ~/.local/share/love/<identity> on Linux, and guessing it wrong fails in
 # the most confusing way available: the game boots fine, the mod is simply
 # absent, and every later assertion blames the wrong thing.
-# Other mods to enable alongside, as a comma-free list of ids:
-#   MMO_WITH_MODS="DRAMATIC_SHAPE" bash .../run-mmo-e2e.sh
-# Coexistence is worth running for real, not just asserting at load time.
+# Pin which other mods are on for this run, as space-separated ids:
+#
+#   MMO_WITH_MODS="DRAMATIC_SHAPE"     bash .../run-mmo-e2e.sh
+#   MMO_WITHOUT_MODS="DRAMATIC_SHAPE"  bash .../run-mmo-e2e.sh
+#
+# Both are needed, and for different reasons. An *experimental* mod is off
+# unless something enables it, so coexistence needs MMO_WITH_MODS. An
+# ordinary one is on merely by being in mods/ -- a missing options entry
+# means enabled -- so proving this mod still works on the vanilla renderer
+# needs MMO_WITHOUT_MODS. Relying on what happens to be installed is how a
+# run that was supposed to be "without" quietly became "with": every
+# earlier voxel run had the pipeline on, including the ones meant to be
+# the control.
 EXTRA_MODS=""
 for id in ${MMO_WITH_MODS:-}; do
   EXTRA_MODS="$EXTRA_MODS, $id = true"
 done
-[ -n "$EXTRA_MODS" ] && echo "  also enabling:${MMO_WITH_MODS}"
+for id in ${MMO_WITHOUT_MODS:-}; do
+  EXTRA_MODS="$EXTRA_MODS, $id = false"
+done
+echo "  other mods: on=[${MMO_WITH_MODS:-none}] off=[${MMO_WITHOUT_MODS:-none}]"
 
 PROBE="$(mktemp -d)"
 cat > "$PROBE/conf.lua" <<'PROBE_CONF'

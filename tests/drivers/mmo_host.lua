@@ -177,6 +177,16 @@ return function(game)
     end
     check(followed, "the avatar caught up to where the network says it is")
     check(sawWalking, "and was seen mid-step -- the walk actually animates")
+
+    -- Say which way the overlay drew, so a run states the rendering path it
+    -- exercised instead of leaving it to whatever happened to be installed.
+    -- "labels" is the flat 2D projection; "roster" is the corner list used
+    -- when another mod owns the world pass.
+    local ov = exports.overlayState and exports.overlayState() or {}
+    log(("overlay path: %s (derived-letterbox=%s)"):format(
+      tostring(ov.reached), tostring(ov.derived or false)))
+    check(ov.reached == "labels" or ov.reached == "roster",
+          "the overlay drew something for the player on screen")
     U.shot(game, SHOT_DIR .. "/host-guest-moved.png")
 
     -- ------- 1b. coexistence with a mod that owns the world pass

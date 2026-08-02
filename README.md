@@ -142,7 +142,14 @@ queueing.
 Tested against
 [DramaticShapeVoxelMod](https://github.com/DramaticShape/DramaticShapeVoxelMod)
 — both load together cleanly and the whole feature set (presence, chat,
-trade, battle) works with the voxel diorama on.
+trade, battle) works with the voxel diorama on. It is entirely optional:
+the end-to-end suite runs both ways and pins which, so "works without it"
+is a checked claim rather than an assumption.
+
+```sh
+MMO_WITHOUT_MODS="DRAMATIC_SHAPE" bash mods/rby_mmo/tests/drivers/run-mmo-e2e.sh
+MMO_WITH_MODS="DRAMATIC_SHAPE"    bash mods/rby_mmo/tests/drivers/run-mmo-e2e.sh
+```
 
 Remote players appear as **voxel characters**, because this mod spawns real
 overworld NPCs rather than drawing avatars itself — whoever owns the world
