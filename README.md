@@ -14,41 +14,40 @@ A multiplayer mod for [Gen1Recomp](https://github.com/bryanthaboi/gen1recomp).
 ![Experimental](https://img.shields.io/badge/status-experimental-d9822b?style=for-the-badge)
 ![MIT](https://img.shields.io/badge/licence-MIT-666?style=for-the-badge)
 
-**No server to rent. No launcher. No account.** One of you hosts from inside
+**No server to rent. No accounts. No signup.** One of you hosts from inside
 the game — you're a player, your copy is just also the relay.
 
 ---
 
 ## 🎮 Get in
 
-Copy `.env.example` to `.env`, point `ROM_PATH` at your own ROM, then:
+**1. Install it.** Drop this folder into your Gen1Recomp `mods/` folder (or
+import the release archive from the launcher's **MODS** tab).
 
-```sh
-bash mods/rby_mmo/tools/play.sh          # boots straight in, mod already on
-bash mods/rby_mmo/tools/play.sh guest    # a second window, separate save
+**2. Turn it on.** Launch the game, press **F10**, enable **RBY MMO**, and
+let it restart when it asks. It ships flagged `experimental`, so it stays off
+until you say otherwise — installing it is never what opens a socket.
+
+**3. One of you hosts.**
+
 ```
-
-Then hit **START → MMO**:
-
-```
+   START → MMO
         ┌──────────────┐
-        │▶ HOST GAME   │   pick 2–64 players. done. you're live.
-        │  JOIN GAME   │   type their address. you're in.
+        │▶ HOST GAME   │   pick 2–64 players. that's it. you're live.
+        │  JOIN GAME   │
         └──────────────┘
 ```
 
-Running both commands gives you two windows on one machine — host in the
-first, join `127.0.0.1:7788` from the second. That's the fastest way to see
-it work.
+Pick a room size and you're hosting. The menu's **ADDRESS** row shows
+something like `192.168.1.125:7788` — read it out.
 
-Same house? Same Wi-Fi? Your friends just join. Across the internet, the host
-forwards port **7788** — or nobody forwards anything and you all point at a
-standalone hub instead ([server/README.md](server/README.md)).
+**4. Everyone else joins.** `START → MMO → JOIN GAME`, type that address,
+done. (**SELECT** flips the keyboard to digits — the vanilla one has none.)
 
-> **Why `play.sh` and not `love .`?** A normal launch always stops at the
-> ROM screen — the engine only skips it for scripted runs. `play.sh` hands
-> the engine your ROM through its own supported route and flips the mod on,
-> so you go straight to the overworld.
+Everyone on the same Wi-Fi or LAN can join straight away, no configuration.
+Across the internet the host has to forward port **7788** — or nobody
+forwards anything and you all join a standalone hub on a box that already has
+a public address instead ([server/README.md](server/README.md)).
 
 ---
 
@@ -179,6 +178,24 @@ MMO_WITH_MODS="DRAMATIC_SHAPE"    bash mods/rby_mmo/tests/drivers/run-mmo-e2e.sh
 ---
 
 ## 🔬 Prove it
+
+> Everything below is for working *on* the mod, not for playing it. Players
+> need none of it — install, enable, host. The scripts here assume a
+> Gen1Recomp source checkout with this folder linked in at `mods/rby_mmo`.
+
+**Running it from source.** Copy `.env.example` to `.env`, point `ROM_PATH`
+at your own ROM, and:
+
+```sh
+bash mods/rby_mmo/tools/play.sh          # boots past the ROM screen, mod on
+bash mods/rby_mmo/tools/play.sh guest    # a second window, separate save
+```
+
+Two windows on one machine is the quickest way to exercise host↔join while
+developing — host in the first, join `127.0.0.1:7788` from the second. It is
+not how anyone should actually play; that's the LAN flow above.
+
+**The suites.**
 
 ```sh
 luajit mods/rby_mmo/tests/rby_mmo_test.lua   # from the engine root
