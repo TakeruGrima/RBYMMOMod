@@ -161,9 +161,10 @@ end
 -- plainly rather than rendering zeros as though they were real.
 function M.profile(raw)
   if type(raw) ~= "table" then return nil end
+  -- money is deliberately absent: the card never shows it, so a peer that
+  -- sends one is simply ignored rather than having it stored and forwarded
   return {
     idNo = M.int(raw.idNo, 0, 65535),
-    money = M.int(raw.money, 0, 999999),
     badges = M.int(raw.badges, 0, 99),
     seen = M.int(raw.seen, 0, 9999),
     owned = M.int(raw.owned, 0, 9999),

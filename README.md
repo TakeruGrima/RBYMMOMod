@@ -28,21 +28,24 @@ import the release archive from the launcher's **MODS** tab).
 let it restart when it asks. It ships flagged `experimental`, so it stays off
 until you say otherwise — installing it is never what opens a socket.
 
-**3. One of you hosts.**
+**3. One of you hosts.** `START → MMO → HOST GAME`.
 
 ```
-   START → MMO
-        ┌──────────────┐
-        │▶ HOST GAME   │   pick 2–64 players. that's it. you're live.
-        │  JOIN GAME   │
+   START → MMO                    TRAINER
+        ┌──────────────┐         ▶NAME              ASH
+        │▶ HOST GAME   │  ───▶    LOOK             LANCE
+        │  JOIN GAME   │          HOST
         └──────────────┘
 ```
 
-Pick a room size and you're hosting. The menu's **ADDRESS** row shows
-something like `192.168.1.125:7788` — read it out.
+Character creation comes first: pick a **NAME** (your save file keeps its
+own) and a **LOOK** from the 36 walking characters in the game. Confirm, pick
+a room size, and you're live. The menu's **ADDRESS** row then shows something
+like `192.168.1.125:7788` — read it out.
 
-**4. Everyone else joins.** `START → MMO → JOIN GAME`, type that address,
-done. (**SELECT** flips the keyboard to digits — the vanilla one has none.)
+**4. Everyone else joins.** `START → MMO → JOIN GAME`, make their own
+trainer, type the address, done. (**SELECT** flips the keyboard to digits —
+the vanilla one has none.)
 
 Everyone on the same Wi-Fi or LAN can join straight away, no configuration.
 Across the internet the host has to forward port **7788** — or nobody
@@ -111,9 +114,24 @@ If someone picks a character your ROM doesn't have, they show up as RED on
 your screen rather than not at all.
 
 ### 🪪 CHECK THEIR CARD
-Walk up, press A, and **PROFILE** sits at the top of the menu: their trainer
-card, the same one you'd see for yourself — name, ID No., money, play time,
-badges, and how much of the dex they've seen and caught.
+Walk up, press **A**, and **PROFILE** sits at the top of the menu — their
+trainer card, laid out like your own:
+
+```
+        ╔══════════════════════╗
+        ║     TRAINER CARD     ║
+        ║  NAME/HOSTY          ║
+        ║  LOOK/OAK            ║
+        ║  IDNo/45799          ║
+        ║  TIME/   3:21        ║
+        ║  BADGES/5            ║
+        ║  SEEN/87  OWN/41     ║
+        ╚══════════════════════╝
+```
+
+Who they are, who they're dressed as, their trainer ID, hours played, badges
+earned, and how much of the dex they've seen and caught. Not their money —
+that's nobody else's business, so it isn't shown and isn't sent.
 
 ### 🧩 STACKS WITH OTHER MODS
 Spawning real NPCs means whoever owns the world pass draws your friends too.
@@ -138,6 +156,9 @@ behind it.
 
 Leaving isn't quitting. Your save, your world, your party: untouched. The
 game just carries on without the other people in it.
+
+Pressing **A** at another trainer opens a second, smaller box —
+`PROFILE` / `TRADE` / `BATTLE` / `WHISPER` — about that player.
 
 ---
 

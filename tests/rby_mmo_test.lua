@@ -884,6 +884,7 @@ eq(Chars.resolve("SPRITE_BOULDER"), Config.DEFAULT_SPRITE,
 
 local card = Wire.profile({ idNo = 12345, money = 3000, badges = 3,
                             seen = 60, owned = 30, playtime = 7265 })
+eq(card.money, nil, "money is never carried -- the card does not show it")
 check(card ~= nil, "a full card sanitises")
 eq(card.badges, 3, "badge count survives")
 eq(card.playtime, 7265, "so does playtime")
@@ -891,16 +892,15 @@ eq(Wire.profile(nil), nil, "no card is not a card")
 eq(Wire.profile("nope"), nil, "and neither is a string")
 
 local hostile = Wire.profile({ idNo = "9" .. string.rep("9", 12),
-                               money = -5, badges = 1e9, seen = 0 / 0 })
+                               badges = 1e9, seen = 0 / 0 })
 check(hostile ~= nil, "a hostile card still sanitises to a table")
 eq(hostile.idNo, nil, "an out-of-range id is dropped")
-eq(hostile.money, nil, "negative money is dropped")
 eq(hostile.badges, nil, "an absurd badge count is dropped")
 eq(hostile.seen, nil, "and NaN is dropped")
 
 -- presence carries it through, since the card is shown from the roster
 local withCard = Wire.presence({ id = "p9", name = "ASH",
-                                 profile = { badges = 8, money = 100 } })
+                                 profile = { badges = 8 } })
 eq(withCard.profile.badges, 8, "presence carries the card")
 eq(Wire.presence({ id = "p9", name = "ASH" }).profile, nil,
    "and a player who sent none simply has none")

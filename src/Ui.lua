@@ -123,15 +123,15 @@ function Card:draw()
     return
   end
 
+  -- No money row. Somebody else's wallet is not information this card is
+  -- for, and it is not sent either -- transmitting a value nothing displays
+  -- would be exposure for nothing.
   Font.draw(("IDNo/%05d"):format(card.idNo or 0), 16, 56)
-  -- the literal glyph, as the engine's own card uses; a Latin-1 escape drew
-  -- nothing at all here
-  Font.draw(("MONEY/¥%d"):format(card.money or 0), 16, 72)
   Font.draw(("TIME/%3d:%02d"):format(
     math.floor((card.playtime or 0) / 3600),
-    math.floor(((card.playtime or 0) % 3600) / 60)), 16, 88)
-  Font.draw(("BADGES/%d"):format(card.badges or 0), 16, 104)
-  Font.draw(("SEEN/%d OWN/%d"):format(card.seen or 0, card.owned or 0), 16, 120)
+    math.floor(((card.playtime or 0) % 3600) / 60)), 16, 72)
+  Font.draw(("BADGES/%d"):format(card.badges or 0), 16, 88)
+  Font.draw(("SEEN/%d OWN/%d"):format(card.seen or 0, card.owned or 0), 16, 104)
 end
 
 function M.new(ctx)

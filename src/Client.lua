@@ -171,9 +171,10 @@ function M.profile(game)
   end)
   if not ok then badges = 0 end
 
+  -- Deliberately no money: the card does not show another player's wallet,
+  -- so there is no reason to put it on the wire.
   return {
     idNo = tonumber(save.player and save.player.id) or 0,
-    money = tonumber(save.money) or 0,
     badges = badges,
     seen = seen,
     owned = owned,
