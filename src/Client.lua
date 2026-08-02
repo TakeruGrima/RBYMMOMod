@@ -19,6 +19,7 @@ local Overlay = need("Overlay")
 local Sessions = need("Sessions")
 local World = need("World")
 local HostServer = need("HostServer")
+local Chars = need("Chars")
 
 local M = {}
 
@@ -109,17 +110,119 @@ function M.setJoinAddress(a, b)
   return address
 end
 
+-- The name other players see.
+--
+-- Separate from the save's trainer name on purpose: character creation lets
+-- someone be "ASH" online without renaming their single-player file. It
+-- falls back to the save name, so a player who never opens the creator is
+-- still recognisable.
 function M.playerName(game)
+  local chosen = mod.save:get("name")
+  if type(chosen) == "string" and chosen ~= "" then
+    return Wire.name(chosen) or "PLAYER"
+  end
+  game = game or ctx.game
   local name = game and game.save and game.save.player and game.save.player.name
   return Wire.name(name) or "PLAYER"
 end
 
+function M.setPlayerName(a, b)
+  local name = Wire.name(arg1(a, b))
+  if not name then return nil end
+  mod.save:set("name", name)
+  return name
+end
+
+-- The character other players see you as. Resolved against this game's own
+-- catalog, so a value carried over from a save made against a different ROM
+-- degrades to RED instead of failing to draw.
 function M.spriteChoice()
-  local chosen = mod.options:get("sprite")
-  for _, row in ipairs(Config.SPRITES) do
-    if row[2] == chosen then return chosen end
+  local chosen = mod.save:get("sprite")
+  if type(chosen) ~= "string" or chosen == "" then
+    chosen = mod.options:get("sprite")
   end
-  return Config.DEFAULT_SPRITE
+  return Chars.resolve(chosen)
+end
+
+function M.setSpriteChoice(a, b)
+  local id = arg1(a, b)
+  if not Chars.available(id) then return nil end
+  mod.save:set("sprite", id)
+  return id
+end
+
+-- The trainer-card fields this player shows to others. Read from the save
+-- at hello time, so it is a snapshot of who you were when you joined.
+function M.profile(game)
+  game = game or ctx.game
+  local save = game and game.save
+  if not save then return nil end
+  local dex = save.pokedex or {}
+  local seen, owned = 0, 0
+  for _ in pairs(dex.seen or {}) do seen = seen + 1 end
+  for _ in pairs(dex.owned or {}) do owned = owned + 1 end
+
+  -- Badges are counted through the engine's own list rather than assumed to
+  -- be the eight Kanto ones, so a mod that adds a badge is counted too.
+  local badges = 0
+  local ok = pcall(function()
+    local Badges = require("src.inventory.Badges")
+    badges = Badges.count(game.data, save) or 0
+  end)
+  if not ok then badges = 0 end
+
+  return {
+    idNo = tonumber(save.player and save.player.id) or 0,
+    money = tonumber(save.money) or 0,
+    badges = badges,
+    seen = seen,
+    owned = owned,
+    playtime = math.floor(tonumber(save.playtime) or 0),
+  }
+end
+
+-- ------- your own look, in your own game
+--
+-- Choosing a character has to change what *you* see too, not just what
+-- everyone else sees, or the creator reads as broken.
+--
+-- The overworld player takes its sheet from field.playerSprites at
+-- Player.new time (src/world/Player.lua), so there is no option to flip
+-- once the player exists -- the renderer has to be swapped on the live
+-- object. The original is kept so leaving a game puts your own trainer
+-- back, rather than leaving you dressed as a Rocket grunt in single-player.
+local originalLook = nil
+
+local function playerEntity()
+  local world = mod.world
+  local ow = world and world:overworld()
+  return ow and ow.player or nil
+end
+
+function M.applyLook(game)
+  local player = playerEntity()
+  if not player then return false end
+  local id = M.spriteChoice()
+  local record = mod.content.sprites and mod.content.sprites:get(id)
+  if not record then return false end
+
+  local ok, renderer = pcall(function()
+    local SpriteRenderer = require("src.render.SpriteRenderer")
+    return SpriteRenderer.new(record, "player")
+  end)
+  if not (ok and renderer) then
+    mod.log:warn("could not wear %s; staying as you are", tostring(id))
+    return false
+  end
+  if originalLook == nil then originalLook = player.sprite end
+  player.sprite = renderer
+  return true
+end
+
+function M.restoreLook()
+  local player = playerEntity()
+  if player and originalLook ~= nil then player.sprite = originalLook end
+  originalLook = nil
 end
 
 -- ------- connect / disconnect
@@ -139,6 +242,7 @@ function M.connect(a, b)
   end
 
   M.sendHello(game)
+  M.applyLook(game)
   return true
 end
 
@@ -173,6 +277,7 @@ function M.host(a, b)
 
   transport:attach(net)
   M.sendHello(game)
+  M.applyLook(game)
   return true
 end
 
@@ -193,6 +298,7 @@ function M.sendHello(game)
     proto = Config.PROTOCOL,
     name = M.playerName(game),
     sprite = M.spriteChoice(),
+    profile = M.profile(game),
     map = current and current.mapId,
     x = current and current.x,
     y = current and current.y,
@@ -201,6 +307,7 @@ function M.sendHello(game)
 end
 
 function M.disconnect()
+  M.restoreLook()
   sessions:endSession(nil)
   ctx.avatars:clear()
   ctx.roster:reset()
@@ -456,7 +563,15 @@ function M.install()
   -- describe, so it is announced the moment it lands instead of waiting for
   -- the next interval.
   mod.events:on("player.warped", function() pushPresence(true) end)
-  mod.events:on("map.entered", function() pushPresence(true) end)
+  mod.events:on("map.entered", function()
+    pushPresence(true)
+    -- entering a map can rebuild the player, taking the chosen look with
+    -- it; re-wearing it here is cheaper than watching for that
+    if transport:isReady() then
+      originalLook = nil
+      M.applyLook(ctx.game)
+    end
+  end)
 
   -- Facing a remote player and pressing A opens the same menu the roster
   -- does.  The engine's talkTo has already run by this point and found
@@ -492,6 +607,9 @@ function M.install()
   -- roster alone -- the end-to-end driver reads this to tell the two apart.
   mod.exports.traceAvatars = function(on) Avatars.TRACE = on and true or false end
   mod.exports.overlayState = function() return overlay:state() end
+  -- what this player looks like in their own game, for tests and for a mod
+  -- that wants to know
+  mod.exports.myLook = function() return M.spriteChoice() end
   mod.exports.avatarState = function()
     local out = {}
     for _, player in ipairs(ctx.roster:sorted()) do

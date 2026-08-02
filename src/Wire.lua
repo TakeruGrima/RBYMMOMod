@@ -152,6 +152,25 @@ function M.payloadOk(value, maxDepth, maxNodes)
   return true
 end
 
+-- The trainer-card fields a player shows other players.
+--
+-- Every one is re-derived like anything else off the wire: these are drawn
+-- straight onto a card, so a hostile client could otherwise put arbitrary
+-- text or a wild number in front of somebody. Missing is fine -- a peer on
+-- an older build simply has no card to show, which the profile screen says
+-- plainly rather than rendering zeros as though they were real.
+function M.profile(raw)
+  if type(raw) ~= "table" then return nil end
+  return {
+    idNo = M.int(raw.idNo, 0, 65535),
+    money = M.int(raw.money, 0, 999999),
+    badges = M.int(raw.badges, 0, 99),
+    seen = M.int(raw.seen, 0, 9999),
+    owned = M.int(raw.owned, 0, 9999),
+    playtime = M.int(raw.playtime, 0, 999 * 3600),
+  }
+end
+
 -- Presence as it appears in a welcome roster, a join, or a move.  Position
 -- is optional so a player sitting in a menu or a battle can still be listed
 -- without claiming a cell in the world.
@@ -169,6 +188,7 @@ function M.presence(raw)
     y = M.int(raw.y, 0, 4096),
     facing = M.facing(raw.facing) or "down",
     busy = raw.busy and true or false,
+    profile = M.profile(raw.profile),
   }
   if not (out.map and out.x and out.y) then
     out.map, out.x, out.y = nil, nil, nil

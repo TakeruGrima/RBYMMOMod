@@ -155,6 +155,7 @@ run.release()
 -- ------------------------------------------------------------------
 
 local stubSave, stubOptions, stubPipelines = {}, {}, {}
+local stubSprites = {}
 
 local stubMod = {
   id = "rby_mmo",
@@ -180,6 +181,17 @@ local stubMod = {
   },
   -- only what Overlay's pipeline query touches
   content = {
+    sprites = {
+      each = function()
+        local id = nil
+        return function()
+          id = next(stubSprites, id)
+          if id == nil then return nil end
+          return id, stubSprites[id]
+        end
+      end,
+      get = function(_, id) return stubSprites[id] end,
+    },
     render_pipelines = {
       each = function(self)
         local id = nil
@@ -813,7 +825,90 @@ eq(x, 5, "landing on the target x")
 eq(y, 8, "and the target y")
 
 -- ------------------------------------------------------------------
--- 6. Playing nicely with a mod that owns the world pass
+-- 6. Characters you can wear
+-- ------------------------------------------------------------------
+--
+-- The catalog carries boulders and Poke Balls next to the people. Wearing a
+-- boulder is not just odd-looking: an object sheet has no walk frames, so
+-- the avatar would animate wrongly on every other screen.
+
+local Chars = need("Chars")
+
+eq(Chars.label("SPRITE_COOLTRAINER_M"), "COOLTRAINER M", "labels are readable")
+eq(Chars.label("SPRITE_RED"), "RED", "and short ones stay short")
+
+eq(Chars.excluded("SPRITE_BOULDER"), true, "a boulder is not a character")
+eq(Chars.excluded("SPRITE_POKE_BALL"), true, "nor is an item")
+eq(Chars.excluded("SPRITE_UNUSED_GUARD"), true, "unused entries are skipped")
+eq(Chars.excluded("SPRITE_GAMBLER_ASLEEP"), true,
+   "and a pose with no walk cycle is skipped")
+eq(Chars.excluded("SPRITE_YOUNGSTER"), false, "a person is a character")
+
+-- Shaped like the real records: `walker` is what the catalog actually
+-- carries, and it is the flag that decides whether a sprite can be worn.
+-- SPRITE_NURSE is here as the case that catches a naive "is it a person"
+-- filter -- a person, but drawn from a sheet with no walking frames.
+stubSprites = {
+  SPRITE_RED = { walker = true },
+  SPRITE_YOUNGSTER = { walker = true },
+  SPRITE_AGATHA = { walker = true },
+  SPRITE_NURSE = { walker = false },
+  SPRITE_BOULDER = { walker = false },
+  SPRITE_POKE_BALL = { walker = false },
+  SPRITE_UNUSED_GUARD = { walker = true },
+}
+local wearable = Chars.list()
+eq(wearable[1], "SPRITE_RED", "RED leads the list -- it is the guaranteed one")
+local names = {}
+for _, id in ipairs(wearable) do names[id] = true end
+check(names.SPRITE_AGATHA and names.SPRITE_YOUNGSTER, "people are offered")
+check(not names.SPRITE_BOULDER and not names.SPRITE_POKE_BALL,
+      "objects are not")
+check(not names.SPRITE_UNUSED_GUARD, "and neither are unused entries")
+check(not names.SPRITE_NURSE,
+      "nor a person with no walk cycle -- she would break mid-step")
+
+-- The fallback the goal asks for: a character this game does not carry --
+-- a different ROM, a mod the other player has and you do not -- becomes RED
+-- rather than failing to draw.
+eq(Chars.available("SPRITE_AGATHA"), true, "a character we have is available")
+eq(Chars.available("SPRITE_MISSINGNO"), false, "one we do not have is not")
+eq(Chars.resolve("SPRITE_AGATHA"), "SPRITE_AGATHA", "so it resolves to itself")
+eq(Chars.resolve("SPRITE_MISSINGNO"), Config.DEFAULT_SPRITE,
+   "and an unknown character falls back to RED")
+eq(Chars.resolve(nil), Config.DEFAULT_SPRITE, "as does nothing at all")
+eq(Chars.resolve("SPRITE_BOULDER"), Config.DEFAULT_SPRITE,
+   "and so does a real sprite that is not a character")
+
+-- ------- the trainer card on the wire
+
+local card = Wire.profile({ idNo = 12345, money = 3000, badges = 3,
+                            seen = 60, owned = 30, playtime = 7265 })
+check(card ~= nil, "a full card sanitises")
+eq(card.badges, 3, "badge count survives")
+eq(card.playtime, 7265, "so does playtime")
+eq(Wire.profile(nil), nil, "no card is not a card")
+eq(Wire.profile("nope"), nil, "and neither is a string")
+
+local hostile = Wire.profile({ idNo = "9" .. string.rep("9", 12),
+                               money = -5, badges = 1e9, seen = 0 / 0 })
+check(hostile ~= nil, "a hostile card still sanitises to a table")
+eq(hostile.idNo, nil, "an out-of-range id is dropped")
+eq(hostile.money, nil, "negative money is dropped")
+eq(hostile.badges, nil, "an absurd badge count is dropped")
+eq(hostile.seen, nil, "and NaN is dropped")
+
+-- presence carries it through, since the card is shown from the roster
+local withCard = Wire.presence({ id = "p9", name = "ASH",
+                                 profile = { badges = 8, money = 100 } })
+eq(withCard.profile.badges, 8, "presence carries the card")
+eq(Wire.presence({ id = "p9", name = "ASH" }).profile, nil,
+   "and a player who sent none simply has none")
+
+stubSprites = {}
+
+-- ------------------------------------------------------------------
+-- 7. Playing nicely with a mod that owns the world pass
 -- ------------------------------------------------------------------
 --
 -- DramaticShapeVoxelMod registers a "voxel" render pipeline whose drawWorld

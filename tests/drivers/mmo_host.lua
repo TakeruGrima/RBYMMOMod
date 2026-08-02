@@ -74,6 +74,13 @@ return function(game)
     return
   end
 
+  -- Character creation now sits between the menu and hosting: who you are
+  -- online is asked once, before the room exists.
+  U.wait(20)
+  check(H.classify(H.top(game)) == "menu", "character creation opened")
+  U.shot(game, SHOT_DIR .. "/host-charsetup.png")
+  check(H.selectLabel(game, "HOST"), "confirmed the trainer and moved on")
+
   -- the size picker is a named list now, so the run picks its row by name
   U.wait(20)
   check(H.classify(H.top(game)) == "menu", "the limit picker opened")
@@ -101,6 +108,24 @@ return function(game)
   local joinedSelf = H.waitFor(game, function() return exports.isConnected() end,
                                240, "the host to join its own game")
   check(joinedSelf, "the host joined its own game over loopback")
+
+  -- The chosen character has to change your own game too, not just what
+  -- everyone else sees. Compare the live player's sheet against the one the
+  -- catalog holds for the chosen id -- a look that only travelled over the
+  -- wire would pass every roster assertion and still look wrong to you.
+  local mine = exports.myLook and exports.myLook() or nil
+  log("my look:", tostring(mine))
+  local ow
+  for i = #game.stack.states, 1, -1 do
+    if game.stack.states[i].isOverworld then ow = game.stack.states[i] break end
+  end
+  local record = game.data.sprites[mine or ""]
+  local worn = ow and ow.player and ow.player.sprite
+  local wornImage = worn and (worn.def and worn.def.image or worn.image)
+  log("wearing:", tostring(wornImage), "expected", tostring(record and record.image))
+  check(record ~= nil and wornImage ~= nil
+        and tostring(wornImage):find(tostring(record.image), 1, true) ~= nil,
+        "the local player wears the chosen character")
 
   -- close the menus so the overworld is on top when the guest arrives
   H.closeToOverworld(game)

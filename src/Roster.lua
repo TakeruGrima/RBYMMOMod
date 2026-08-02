@@ -35,8 +35,8 @@ function M:put(presence)
 end
 
 -- A move carries only the fields that moved, so it merges rather than
--- replaces: a player who walks must not lose the name and sprite that
--- arrived with their join.
+-- replaces: a player who walks must not lose the name, sprite or trainer
+-- card that arrived with their join.
 function M:move(id, map, x, y, facing)
   local player = self.players[id]
   if not player then return nil end

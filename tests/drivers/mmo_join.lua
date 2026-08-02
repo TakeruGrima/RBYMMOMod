@@ -85,6 +85,10 @@ return function(game)
     return
   end
 
+  U.wait(20)
+  check(H.classify(H.top(game)) == "menu", "character creation opened")
+  check(H.selectLabel(game, "JOIN"), "confirmed the trainer and moved on")
+
   -- The naming screen opens prefilled with the saved address, so START
   -- confirms it as-is. That the field is prefilled at all is the point:
   -- the vanilla grid has no digits, so a default that already reads
@@ -242,7 +246,29 @@ return function(game)
     check(#labels > 0, "pressing A on another player opens a menu")
     check(has("TRADE"), "the menu offers TRADE")
     check(has("BATTLE"), "the menu offers BATTLE")
+    check(has("PROFILE"), "and PROFILE, on top")
     U.shot(game, SHOT_DIR .. "/join-interact-menu.png")
+
+    -- The card: their name and their trainer stats, sent when they joined.
+    if H.selectLabel(game, "PROFILE") then
+      U.wait(40)
+      local card = H.top(game)
+      check(card ~= nil and card.player ~= nil, "the profile card opened")
+      if card and card.player then
+        log("card for", tostring(card.player.name),
+            "look", tostring(card.player.sprite),
+            "badges", tostring(card.player.profile and card.player.profile.badges))
+        check(card.player.name == "HOSTY", "showing the right trainer")
+        check(card.player.profile ~= nil,
+              "with the trainer card they sent on joining")
+      end
+      U.shot(game, SHOT_DIR .. "/join-profile-card.png")
+      U.tap(game, "b")     -- back to the interact menu
+      U.wait(30)
+      check(H.classify(H.top(game)) == "menu", "and B returns to the menu")
+    else
+      check(false, "could not open PROFILE")
+    end
 
     -- ------- 5. take the menu up on it: a real trade, end to end
     --

@@ -71,6 +71,7 @@ local function presenceOf(client)
     y = client.y,
     facing = client.facing,
     busy = client.sessionId ~= nil,
+    profile = client.profile,
   }
 end
 
@@ -213,6 +214,7 @@ handlers[Wire.HELLO] = function(self, client, msg)
 
   client.name = name
   client.sprite = Wire.spriteId(msg.sprite) or Config.DEFAULT_SPRITE
+  client.profile = Wire.profile(msg.profile)
   client.map = Wire.mapId(msg.map)
   client.x = Wire.int(msg.x, 0, 4096)
   client.y = Wire.int(msg.y, 0, 4096)

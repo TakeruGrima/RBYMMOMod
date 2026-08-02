@@ -15,6 +15,7 @@ local need, mod = ...
 local Config = need("Config")
 local Chat = need("Chat")
 local World = need("World")
+local Chars = need("Chars")
 
 local M = {}
 M.__index = M
@@ -33,6 +34,9 @@ local SCREEN = {
   HOSTSET  = "RbyMmoHostSetup",
   HOSTINFO = "RbyMmoHostInfo",
   JOINADDR = "RbyMmoJoinAddress",
+  CHARSET  = "RbyMmoCharSetup",
+  CHARPICK = "RbyMmoCharPick",
+  PROFILE  = "RbyMmoProfile",
 }
 M.SCREEN = SCREEN
 
@@ -73,6 +77,61 @@ local cursor = {}
 local function ownTitle(title)
   ownedTitles[title] = true
   return title
+end
+
+-- A trainer card for somebody else.
+--
+-- The engine's own TrainerCard reads the local save, so it cannot be
+-- pointed at a remote player; this draws the same fields from what they
+-- sent when they joined. It is a plain state rather than a widget because
+-- there is no widget for "a page of text with a border".
+local Card = {}
+Card.__index = Card
+Card.isOpaque = true
+
+function Card.new(game, player, onCancel)
+  return setmetatable({ game = game, player = player, onCancel = onCancel }, Card)
+end
+
+function Card:update()
+  local input = self.game.input
+  if input:wasPressed("b") or input:wasPressed("a") then
+    self.game.stack:pop()
+    if self.onCancel then self.onCancel() end
+  end
+end
+
+function Card:draw()
+  local Font = mod.ui.Font
+  if not (Font and Font.draw) then return end
+  local p = self.player
+  -- Full-height box, rows on a 16px grid from y=24. At 17 tiles the last
+  -- row landed on the border and the dex line was cut in half.
+  Font.drawBox(0, 0, 20, 18)
+  Font.draw("TRAINER CARD", 24, 8)
+
+  Font.draw(("NAME/%s"):format(tostring(p.name or "?")), 16, 24)
+  Font.draw(("LOOK/%s"):format(Chars.label(p.sprite or "")), 16, 40)
+
+  local card = p.profile
+  if not card then
+    -- An older build sends no card. Say so, rather than draw zeros that
+    -- read as "this trainer has nothing".
+    Font.draw("NO CARD SENT.", 16, 64)
+    Font.draw("THEIR BUILD IS", 16, 80)
+    Font.draw("OLDER THAN YOURS.", 16, 96)
+    return
+  end
+
+  Font.draw(("IDNo/%05d"):format(card.idNo or 0), 16, 56)
+  -- the literal glyph, as the engine's own card uses; a Latin-1 escape drew
+  -- nothing at all here
+  Font.draw(("MONEY/¥%d"):format(card.money or 0), 16, 72)
+  Font.draw(("TIME/%3d:%02d"):format(
+    math.floor((card.playtime or 0) / 3600),
+    math.floor(((card.playtime or 0) % 3600) / 60)), 16, 88)
+  Font.draw(("BADGES/%d"):format(card.badges or 0), 16, 104)
+  Font.draw(("SEEN/%d OWN/%d"):format(card.seen or 0, card.owned or 0), 16, 120)
 end
 
 function M.new(ctx)
@@ -215,11 +274,21 @@ function M:install()
     else
       items[#items + 1] = {
         label = "HOST GAME",
-        onSelect = function() mod.ui.push(game, SCREEN.HOSTSET) end,
+        onSelect = function()
+          mod.ui.push(game, SCREEN.CHARSET, {
+            verb = "HOST",
+            onReady = function() mod.ui.push(game, SCREEN.HOSTSET) end,
+          })
+        end,
       }
       items[#items + 1] = {
         label = "JOIN GAME",
-        onSelect = function() mod.ui.push(game, SCREEN.JOINADDR) end,
+        onSelect = function()
+          mod.ui.push(game, SCREEN.CHARSET, {
+            verb = "JOIN",
+            onReady = function() mod.ui.push(game, SCREEN.JOINADDR) end,
+          })
+        end,
       }
     end
 
@@ -242,6 +311,71 @@ function M:install()
   end })
 
   -- ------- hosting: pick the limit, then start
+
+  -- ------- character creation
+  --
+  -- Who you are online, asked once before you host or join, rather than
+  -- inheriting the save's trainer name and a sprite nobody chose. The name
+  -- is separate from the save file's, so somebody can be ASH online without
+  -- renaming their single-player game.
+
+  screens:register(SCREEN.CHARSET, { new = function(game, opts)
+    opts = opts or {}
+    local client = ctx.client
+    local items = {
+      { label = "NAME", right = client:playerName(game), key = "name" },
+      { label = "LOOK", right = Chars.label(client:spriteChoice()), key = "look" },
+      { label = opts.verb or "READY", key = "go" },
+    }
+    return mod.ui.ListMenu.new(game, "TRAINER", items, {
+      onChoose = function(item, menu)
+        menu:close()
+        if item.key == "name" then
+          mod.ui.push(game, SCREEN.COMPOSE,
+            { scope = "name", back = SCREEN.CHARSET, backOpts = opts })
+        elseif item.key == "look" then
+          mod.ui.push(game, SCREEN.CHARPICK, { back = opts })
+        elseif opts.onReady then
+          opts.onReady()
+        end
+      end,
+      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
+    })
+  end })
+
+  screens:register(SCREEN.CHARPICK, { new = function(game, opts)
+    opts = opts or {}
+    local client = ctx.client
+    local current = client:spriteChoice()
+    local items, start = {}, 1
+    for i, id in ipairs(Chars.list()) do
+      if id == current then start = i end
+      items[#items + 1] = { label = Chars.label(id), value = id }
+    end
+    local menu = mod.ui.ListMenu.new(game, "CHARACTER", items, {
+      pageJump = true,
+      onChoose = function(item, m)
+        m:close()
+        client:setSpriteChoice(item.value)
+        mod.ui.push(game, SCREEN.CHARSET, opts.back or {})
+      end,
+      onCancel = function()
+        mod.ui.push(game, SCREEN.CHARSET, opts.back or {})
+      end,
+    })
+    menu.index = start
+    return menu
+  end })
+
+  -- ------- somebody else's trainer card
+
+  screens:register(SCREEN.PROFILE, { new = function(game, opts)
+    local player = ctx.roster:get(opts and opts.playerId)
+    if not player then
+      return mod.ui.TextBox.new(game, "They just went\noffline.")
+    end
+    return Card.new(game, player, opts and opts.onCancel)
+  end })
 
   -- How many players, as a menu of sizes rather than a bare number box.
   --
@@ -367,16 +501,26 @@ function M:install()
     -- way the original asks CUT/SURF or a party submenu. Sized to the
     -- widest label by Menu itself and nudged on-screen, so it stays right
     -- however long a trainer's name is.
+    -- PROFILE first: knowing who you are looking at should come before
+    -- deciding to trade with them
     local items = {
+      { label = "PROFILE", profile = true },
       { label = "TRADE", kind = "trade" },
       { label = "BATTLE", kind = "battle" },
       { label = "WHISPER" },
     }
 
+    local reopen = function()
+      mod.ui.push(game, SCREEN.ACTIONS,
+        { playerId = player.id, onCancel = opts and opts.onCancel })
+    end
     for _, item in ipairs(items) do
-      local kind = item.kind
+      local kind, wantsProfile = item.kind, item.profile
       item.onSelect = function()
-        if kind then
+        if wantsProfile then
+          mod.ui.push(game, SCREEN.PROFILE,
+            { playerId = player.id, onCancel = reopen })
+        elseif kind then
           ctx.sessions:request(player, kind)
         else
           mod.ui.push(game, SCREEN.COMPOSE,
@@ -473,6 +617,22 @@ function M:install()
 
   screens:register(SCREEN.COMPOSE, { new = function(game, opts)
     opts = opts or {}
+
+    -- the same grid serves chat and the trainer name; only the title, the
+    -- length and what happens on confirm differ
+    if opts.scope == "name" then
+      local client = ctx.client
+      return mod.ui.NamingScreen.new(game, {
+        title = ownTitle("YOUR NAME"),
+        maxLen = Config.NAME_MAX,
+        default = client:playerName(game),
+        onDone = function(name)
+          client:setPlayerName(name)
+          mod.ui.push(game, opts.back or SCREEN.CHARSET, opts.backOpts or {})
+        end,
+      })
+    end
+
     local title = opts.scope == "private"
       and ("TO " .. tostring(opts.toName or "?"))
       or (opts.scope == "local" and "SAY NEARBY" or "SAY TO ALL")

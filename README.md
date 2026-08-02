@@ -100,9 +100,20 @@ protocol, and joiners can't tell the difference.
 `LEAVE` disconnects and hands you straight back to single-player. Save,
 world, party — untouched. No "returning to title screen".
 
-### 🎭 PICK YOUR LOOK
-RED, BLUE, YOUNGSTER, LASS or COOLTRAINER — that's who everyone else sees
-walking around.
+### 🎭 BE SOMEBODY ELSE
+Before you host or join, character creation asks who you are: a name of your
+own (your save file keeps its own), and **any walking character in the
+game** — 36 of them. Be Lance. Be Giovanni. Be a Rocket grunt, a Biker, a
+Swimmer, Oak. You see it too, not just everyone else — and it's put back the
+moment you leave.
+
+If someone picks a character your ROM doesn't have, they show up as RED on
+your screen rather than not at all.
+
+### 🪪 CHECK THEIR CARD
+Walk up, press A, and **PROFILE** sits at the top of the menu: their trainer
+card, the same one you'd see for yourself — name, ID No., money, play time,
+badges, and how much of the dex they've seen and caught.
 
 ### 🧩 STACKS WITH OTHER MODS
 Spawning real NPCs means whoever owns the world pass draws your friends too.
