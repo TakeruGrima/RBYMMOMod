@@ -132,20 +132,26 @@ save_dir_for() {
     | sed -n 's/^SAVEDIR=//p' | head -1
 }
 
+# $2 is the avatar sprite this side picks, written through modOptions -- the
+# same bucket the mod manager writes, so the run exercises the real option
+# rather than anything test-only. Giving the two sides different sprites is
+# what makes "pick your look" checkable: the host asserts the guest arrives
+# wearing the one the guest chose, not the default.
 enable_mod_for() {
   local dir
   dir="$(save_dir_for "$1")"
   [ -n "$dir" ] || fail "could not determine LOVE's save directory for $1"
   mkdir -p "$dir"
-  # modOptions is the same bucket the mod manager writes, so the joining
-  # instance reads its address through the mod's ordinary option rather than
-  # anything test-only
-  printf 'return { mods = { rby_mmo = true%s }, modOptions = { rby_mmo = { hub = "%s" } } }\n' \
-    "$EXTRA_MODS" "${MMO_JOIN_ADDRESS:-127.0.0.1:7788}" > "$dir/options.lua"
+  printf 'return { mods = { rby_mmo = true%s }, modOptions = { rby_mmo = { hub = "%s", sprite = "%s" } } }\n' \
+    "$EXTRA_MODS" "${MMO_JOIN_ADDRESS:-127.0.0.1:7788}" "$2" > "$dir/options.lua"
   echo "$dir"
 }
-HOST_SAVE="$(enable_mod_for "$HOST_ID")"
-GUEST_SAVE="$(enable_mod_for "$GUEST_ID")"
+HOST_SPRITE="${MMO_HOST_SPRITE:-SPRITE_RED}"
+GUEST_SPRITE="${MMO_GUEST_SPRITE:-SPRITE_COOLTRAINER_M}"
+HOST_SAVE="$(enable_mod_for "$HOST_ID" "$HOST_SPRITE")"
+GUEST_SAVE="$(enable_mod_for "$GUEST_ID" "$GUEST_SPRITE")"
+echo "  sprites: host=$HOST_SPRITE guest=$GUEST_SPRITE"
+export MMO_EXPECT_GUEST_SPRITE="$GUEST_SPRITE"
 rm -rf "$PROBE"
 echo "  enabled the mod in $(dirname "$HOST_SAVE")/{$HOST_ID,$GUEST_ID}"
 

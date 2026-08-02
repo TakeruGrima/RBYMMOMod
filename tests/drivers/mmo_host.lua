@@ -126,6 +126,21 @@ return function(game)
     log("guest is", tostring(guest.name), "on", tostring(guest.map))
     check(type(guest.name) == "string" and guest.name ~= "",
           "the guest has a name on the roster")
+
+    -- "Pick your look": the guest chose a sprite through the mod's option,
+    -- and it has to survive the wire and reach the avatar. Asserting the
+    -- roster value alone would not prove much -- an id that the catalog
+    -- rejects falls back to the default, silently -- so the spawn is
+    -- checked too.
+    local wantSprite = os.getenv("MMO_EXPECT_GUEST_SPRITE")
+    if wantSprite and wantSprite ~= "" then
+      log("guest sprite:", tostring(guest.sprite), "expected", wantSprite)
+      check(guest.sprite == wantSprite,
+            "the guest's chosen sprite crossed the wire intact")
+      local row = H.avatarRow(exports)
+      check(row ~= nil and row.spawned,
+            "and the avatar spawned with it (the catalog accepted the id)")
+    end
     U.wait(120)
     U.shot(game, SHOT_DIR .. "/host-sees-guest.png")
 
