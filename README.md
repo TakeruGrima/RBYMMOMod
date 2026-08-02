@@ -120,18 +120,19 @@ trainer card, laid out like your own:
 ```
         ╔══════════════════════╗
         ║     TRAINER CARD     ║
-        ║  NAME/HOSTY          ║
-        ║  LOOK/OAK            ║
-        ║  IDNo/45799          ║
+        ║  NAME/HOSTY     ,d8b,║
+        ║  LOOK/LANCE     8( )8║
+        ║  IDNo/45799     `Y8Y'║
         ║  TIME/   3:21        ║
         ║  BADGES/5            ║
         ║  SEEN/87  OWN/41     ║
         ╚══════════════════════╝
 ```
 
-Who they are, who they're dressed as, their trainer ID, hours played, badges
-earned, and how much of the dex they've seen and caught. Not their money —
-that's nobody else's business, so it isn't shown and isn't sent.
+Their portrait, who they are, who they're dressed as, trainer ID, hours
+played, badges earned, and how much of the dex they've seen and caught. Not
+their money — that's nobody else's business, so it isn't shown and isn't
+sent.
 
 ### 🧩 STACKS WITH OTHER MODS
 Spawning real NPCs means whoever owns the world pass draws your friends too.

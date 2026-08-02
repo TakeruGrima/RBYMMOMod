@@ -278,6 +278,11 @@ return function(game)
     -- itself is this mod's code.
 
     H.signal("guest_interact_done")
+    -- likewise: never ask somebody who is mid-session
+    H.waitFor(game, function()
+      local row = H.avatarRow(exports)
+      return row ~= nil and not row.busy
+    end, 60 * 20, "the host to be free")
     if H.selectLabel(game, "TRADE") then
       log("asked to trade")
       H.signal("guest_trade_requested")
@@ -297,6 +302,21 @@ return function(game)
       -- also proves the traded party is what actually fights.
 
       H.closeToOverworld(game)
+
+      -- Wait for the other side to be free before asking again.
+      --
+      -- Sessions:onRequest answers immediately with a decline when the
+      -- target is already in one -- correct behaviour, since a prompt that
+      -- surfaced minutes later over whatever they were doing is worse. But
+      -- it means a battle asked for while the trade is still tearing down
+      -- is refused, and the run then waits for a battle that was never
+      -- going to start. The roster carries their busy flag, so wait on it
+      -- rather than on a guessed interval.
+      local free = H.waitFor(game, function()
+        local row = H.avatarRow(exports)
+        return row ~= nil and not row.busy
+      end, 60 * 30, "the host to finish the trade")
+      if not free then log("WARN host still busy; asking anyway") end
       U.wait(30)
       local reopened = false
       if H.top(game) == nil or H.top(game).isOverworld

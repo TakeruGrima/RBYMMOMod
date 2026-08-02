@@ -194,7 +194,15 @@ end
 
 M.classify = classify
 
+-- Returns whether `done` came true, and the sequence of prompt kinds it
+-- answered on the way. A trade or battle that stalls is otherwise a bare
+-- "did not happen": the sequence says whether the prompt never arrived, or
+-- arrived and was answered and still went nowhere.
 function M.drivePrompts(game, done, frames, onStep)
+  local seen = {}
+  local function note(kind)
+    if kind and seen[#seen] ~= kind then seen[#seen + 1] = kind end
+  end
   for _ = 1, frames or 60 * 60 do
     if done and done() then return true end
     local top = M.top(game)
@@ -233,10 +241,11 @@ function M.drivePrompts(game, done, frames, onStep)
     else
       U.wait(4)
     end
+    note(kind)
     if onStep then onStep(kind) end
     ::continue::
   end
-  return done and done() or false
+  return (done and done() or false), table.concat(seen, ">")
 end
 
 -- Put the hardest-hitting move in slot 1.

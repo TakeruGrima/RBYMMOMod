@@ -336,10 +336,13 @@ return function(game)
 
     H.await(game, "guest_trade_requested")
     local wanted = "PIKACHU"
-    local traded = H.drivePrompts(game, function()
+    local traded, trail = H.drivePrompts(game, function()
       return H.partySpecies(game)[1] == wanted
     end, 60 * 90)
     log("host party now:", table.concat(H.partySpecies(game), ","))
+    if not traded then
+      log("trade stalled -- prompts answered:", trail == "" and "(none)" or trail)
+    end
     check(traded, "the host received the guest's " .. wanted)
     U.shot(game, SHOT_DIR .. "/host-after-trade.png")
     H.signal("host_trade_done")
@@ -353,9 +356,13 @@ return function(game)
     -- disagreeing mid-battle is exactly what lockstep exists to prevent.
 
     H.await(game, "guest_battle_requested", 60 * 90)
-    local started = H.drivePrompts(game, function()
+    local started, btrail = H.drivePrompts(game, function()
       return events["battle.started"] > 0
     end, 60 * 60)
+    if not started then
+      log("battle never started -- prompts answered:",
+          btrail == "" and "(none)" or btrail)
+    end
     check(started, "a link battle started on the host")
 
     -- What does a link battle actually show? The chosen character is an
