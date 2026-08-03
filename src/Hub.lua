@@ -35,19 +35,193 @@ local Sha256 = need("Sha256")
 local M = {}
 M.__index = M
 
--- The least predictable values this process can reach without a permission
--- it does not have.  None of them is a random source; newNonce says so.
-local function entropy()
+-- ------- the entropy pool
+--
+-- Both credentials this mod mints are drawn from here: the challenge nonces
+-- below, and the join code src/Client.lua offers on the HOST screen.  One
+-- pool, because they are one process's worth of unpredictability and
+-- splitting it would halve both.  It lives in this file rather than one of
+-- its own because Client already reaches Hub (through HostServer) while Hub
+-- must never reach Client -- this is the only side of that edge a shared
+-- pool can sit on without a cycle.
+--
+-- **What it is.** A 256-bit SHA-256 state that varying material is folded
+-- into over the whole session -- frame durations, os.clock() and its
+-- deltas, live heap size, love.math.random() where it exists, the timing of
+-- the player's own button presses -- plus a short burst of os.clock()
+-- scheduling jitter taken at the moment of a draw.  Every draw hashes the
+-- state with a counter and then ratchets the state forward, so no two draws
+-- repeat and a leaked draw does not give up the state that made it.
+--
+-- **What it is not: a CSPRNG.** There is no such source reachable from a
+-- mod that declares only `network` -- LOVE ships no randomBytes,
+-- love.math.random is a seeded xorshift, and /dev/urandom would mean a
+-- filesystem permission this mod does not have.  Honest numbers, since the
+-- format of a join code implies 80 bits and this does not deliver them:
+--
+--   * Drawn cold, before anything has been stirred in, the pool holds only
+--     an instantaneous sample -- heap size, a fresh table's address, the
+--     wall clock to the second, the CPU clock.  That is roughly 35-45 bits
+--     against someone who knows the machine and roughly when it started.
+--   * Drawn from a game that has been playing for even a few seconds, the
+--     pool has absorbed hundreds of frame-timing and clock samples whose
+--     low microseconds are genuine scheduling noise.  The input entropy
+--     there runs well past 80 bits; what we are willing to *claim* is 64,
+--     because the per-sample jitter is an estimate rather than a
+--     measurement and nothing here health-tests the pool.
+--
+-- So: substantially better than one os.time() sample, and still not what a
+-- hub facing the open internet should rely on -- that one is the dedicated
+-- server in server/, whose nonces come from crypto.randomBytes.
+
+local Entropy = {}
+Entropy.__index = Entropy
+
+-- Samples are parked in a table that is allocated once and written in place
+-- for the life of the process: stirring happens on the game's fixed step,
+-- and a hot path that allocates every frame is exactly what the engine's
+-- rules forbid.  Four numbers a stir, 96 slots, so the fold -- which does
+-- allocate, and hashes -- runs once every 24 stirs rather than every frame.
+local POOL_SLOTS = 96
+local STIR_WIDTH = 4
+-- %.17g, not tostring: tostring rounds a double to 14 significant digits
+-- and the low digits of a clock sample are the whole point of taking it.
+local FOLD_FORMAT = string.rep("%.17g|", POOL_SLOTS)
+local unpack = unpack or table.unpack
+
+-- How far the draw-time burst goes: stop after this many observed clock
+-- ticks, and never spin longer than the cap regardless.  On a platform
+-- whose os.clock() has microsecond resolution this is tens of
+-- microseconds; on one with a 10ms tick it falls out at the cap having
+-- learnt nothing, which is a shrug, not a hang.
+local BURST_TICKS = 32
+local BURST_SPINS = 20000
+
+-- The instantaneous sample a pool starts from, and all a cold draw has.
+local function coldSample()
   local parts = {
     tostring(collectgarbage("count")),   -- live heap, in KB with a fraction
     tostring({}),                        -- where a fresh table landed
   }
   if os then
-    parts[#parts + 1] = tostring(os.time())
-    parts[#parts + 1] = tostring(os.clock())
+    if os.time then parts[#parts + 1] = tostring(os.time()) end
+    if os.clock then parts[#parts + 1] = string.format("%.17g", os.clock()) end
   end
   return table.concat(parts, "|")
 end
+
+-- Both arguments are for the suite, and the game passes neither: `seed`
+-- starts two pools in the same state, and `clock` drives the draw-time
+-- burst off something repeatable.  Together they make a pool a pure
+-- function of what is stirred into it, which is what lets the suite prove
+-- the stirred material is what makes two pools' draws differ -- the exact
+-- property the one-instantaneous-sample code this replaced did not have.
+function Entropy.new(seed, clock)
+  local self = setmetatable({
+    state = nil,
+    samples = {},
+    cursor = 0,
+    stirs = 0,
+    draws = 0,
+    clockFn = type(clock) == "function" and clock or (os and os.clock),
+  }, Entropy)
+  for i = 1, POOL_SLOTS do self.samples[i] = 0 end
+  self.state = Sha256.bytes("rby_mmo/entropy/1|"
+    .. (type(seed) == "string" and seed or coldSample()))
+  return self
+end
+
+-- Fold the parked samples into the state.  Slots untouched since the last
+-- fold simply go round again; re-hashing a value cannot subtract from what
+-- the state already knows.
+function Entropy:fold()
+  if type(self.state) ~= "string" then return end
+  local mixed = Sha256.bytes(self.state
+    .. string.format(FOLD_FORMAT, unpack(self.samples, 1, POOL_SLOTS)))
+  if type(mixed) == "string" then self.state = mixed end
+  self.cursor = 0
+end
+
+-- Four numbers, written in place.  Callers pass whatever varies cheaply
+-- where they stand; nil counts as zero rather than being an error, because
+-- a caller on a platform missing one of its sources should keep stirring
+-- the others rather than stop.
+function Entropy:stir(a, b, c, d)
+  local samples, n = self.samples, self.cursor
+  samples[n + 1] = tonumber(a) or 0
+  samples[n + 2] = tonumber(b) or 0
+  samples[n + 3] = tonumber(c) or 0
+  samples[n + 4] = tonumber(d) or 0
+  n = n + STIR_WIDTH
+  self.stirs = self.stirs + 1
+  if n >= POOL_SLOTS then self:fold() else self.cursor = n end
+end
+
+-- Spin on os.clock() until it moves, a bounded number of times, stirring in
+-- how long each move took to arrive.  The gap between two clock ticks is
+-- scheduler noise, which is the one genuinely unpredictable thing a process
+-- with no random device can still observe about the machine it is on.
+function Entropy:burst()
+  local clock = self.clockFn
+  if not clock then return end
+  local previous, ticks, spins = clock(), 0, 0
+  while ticks < BURST_TICKS and spins < BURST_SPINS do
+    spins = spins + 1
+    local now = clock()
+    if now ~= previous then
+      ticks = ticks + 1
+      self:stir(now, spins, ticks, now - previous)
+      previous = now
+    end
+  end
+end
+
+-- `count` raw bytes off the pool, or nil plus a reason -- never a raise, so
+-- a caller inside a mod callback can log it and name a remediation.  32 is
+-- the ceiling because one draw is one SHA-256 output; nothing here wants
+-- more, and stretching would be inventing a KDF nobody asked for.
+function Entropy:bytes(count)
+  local n = tonumber(count)
+  if not n or n < 1 or n > 32 or n ~= math.floor(n) then
+    return nil, "entropy: 1..32 bytes, asked for " .. tostring(count)
+  end
+  self.draws = self.draws + 1
+  self:burst()
+  self:fold()
+  if type(self.state) ~= "string" then
+    return nil, "entropy: the pool has no state to draw from"
+  end
+  local out = Sha256.bytes(self.state .. "|draw|" .. self.draws)
+  -- Ratchet: the state that produced `out` is destroyed in the same breath,
+  -- so recovering one draw says nothing about the next.
+  local moved = Sha256.bytes(self.state .. "|step|" .. self.draws)
+  if type(out) ~= "string" or type(moved) ~= "string" then
+    return nil, "entropy: the pool could not be hashed"
+  end
+  self.state = moved
+  return out:sub(1, n)
+end
+
+-- A join code in normalised form (no dashes -- Wire.formatCode puts those
+-- in for display).  256 is exactly 8 * 32, so folding a byte into the
+-- alphabet is even and no character is likelier than another.
+function Entropy:code()
+  local raw, why = self:bytes(Config.CODE_LEN)
+  if not raw then return nil, why end
+  local alphabet, out = Config.CODE_ALPHABET, {}
+  for i = 1, Config.CODE_LEN do
+    local index = raw:byte(i) % #alphabet
+    out[i] = alphabet:sub(index + 1, index + 1)
+  end
+  return table.concat(out)
+end
+
+-- One pool per process, which is the point of a pool.  Client stirs this
+-- one on every fixed step and draws join codes from it; every hub that is
+-- not handed its own draws its nonces from it.
+Entropy.shared = Entropy.new()
+
+M.Entropy = Entropy
 
 function M.new(opts)
   opts = opts or {}
@@ -66,7 +240,10 @@ function M.new(opts)
     nextId = 1,
     nextSession = 1,
     nextNonce = 0,
-    seed = entropy(),
+    -- The process-wide pool unless a caller hands over its own; only the
+    -- suite does, so that two hubs can be started from identical pools and
+    -- fed different material.
+    entropy = opts.entropy or Entropy.shared,
     clock = 0,
   }, M)
 end
@@ -90,29 +267,20 @@ end
 -- A fresh challenge nonce, 16 bytes as lowercase hex -- the same shape
 -- server/lib/auth.js emits, so both hosting paths challenge identically.
 --
--- **This is not a cryptographic random source and does not pretend to be
--- one.** There is none reachable from here: LOVE ships no randomBytes,
--- love.math.random is a seeded xorshift, Lua's math.random is a PRNG seeded
--- off the clock, and /dev/urandom would mean a filesystem permission this
--- mod does not declare. What this does instead is hash a per-hub seed
--- (heap size, a table's address, wall and CPU clock at start-up) together
--- with a counter, the host's uptime and the same values sampled again now.
---
--- What that buys: nonces never repeat within a run -- the counter alone
--- guarantees it -- and they are not derivable from anything on the wire, so
--- a captured response cannot be replayed against a later connection. What
--- it does not buy: an attacker who could pin down when the host started and
--- what its heap looked like could narrow the pool down. Replay is harder,
--- not impossible. A hub exposed to the open internet should be the
--- dedicated one in server/, whose nonces come from crypto.randomBytes.
+-- The bytes come off the session's entropy pool (see its header for what
+-- that is worth, and what it is not: it is not crypto.randomBytes, and the
+-- comment above does not pretend otherwise).  The counter and the host's
+-- uptime go in on top of the draw so that two nonces in one run cannot
+-- collide even in the hypothetical where the pool repeats itself -- a
+-- repeated nonce is the one failure that would reopen the replay window
+-- this whole exchange exists to close.
 function M:newNonce()
   self.nextNonce = self.nextNonce + 1
-  local digest = Sha256.hex(table.concat({
-    self.seed, tostring(self.nextNonce), tostring(self.clock), entropy(),
-  }, "|"))
-  -- Sha256 returns nil plus a reason rather than raising; every argument
-  -- above is a string, so this is a guard against a future edit, not a
-  -- path a peer can reach.
+  local raw = self.entropy and self.entropy:bytes(Config.NONCE_HEX / 2)
+  -- Both calls answer nil plus a reason rather than raising; the caller
+  -- turns a nil nonce into a refusal the player can read.
+  if type(raw) ~= "string" then return nil end
+  local digest = Sha256.hex(raw .. "|" .. self.nextNonce .. "|" .. self.clock)
   if type(digest) ~= "string" then return nil end
   return digest:sub(1, Config.NONCE_HEX)
 end
@@ -147,6 +315,13 @@ function M:broadcast(msgType, payload, exceptId)
   for id, client in pairs(self.clients) do
     if id ~= exceptId and client.ready then send(client, msgType, payload) end
   end
+end
+
+-- One sentence, one place.  Both the courtesy refusal at hello and the
+-- authoritative one in admit say it, and a player must not be able to tell
+-- which of the two turned them away.
+function M:fullMessage()
+  return ("This hub is full (%d players)."):format(self.limit)
 end
 
 function M:refuse(peer, message)
@@ -209,7 +384,22 @@ end
 -- mmo.auth on one with a code.  It is the only way onto the roster, which
 -- is the point: a peer that still owes an answer must not be visible to,
 -- or addressable by, the players already in the game.
+--
+-- **The cap is charged here, so it is checked here.** Checking it only at
+-- hello held on a hub with no code, where hello admits in the same breath,
+-- and failed on one with a code: every peer that greeted while there was
+-- room passed a check nobody repeated, then all of them answered and all of
+-- them were seated -- six players on a hub built for two.  The hello check
+-- stays as a courtesy, so a peer arriving at an already-full hub hears so
+-- at once instead of after a challenge round trip, but this is the gate.
+-- server/lib/relay.js puts its check in the same place for the same reason.
+--
+-- Returns true when the client was seated.
 function M:admit(client)
+  if self:isFull() then
+    self:refuseClient(client, self:fullMessage())
+    return false
+  end
   local hello = client.hello or {}
   client.name = hello.name
   client.sprite = hello.sprite or Config.DEFAULT_SPRITE
@@ -228,6 +418,7 @@ function M:admit(client)
   end
   send(client, Wire.WELCOME, { id = client.id, players = players })
   self:broadcast(Wire.JOIN, { player = presenceOf(client) }, client.id)
+  return true
 end
 
 function M:drop(client)
@@ -309,10 +500,11 @@ handlers[Wire.HELLO] = function(self, client, msg)
   if not name then
     return self:refuseClient(client, "That trainer name can't be used here.")
   end
-  -- the seat is claimed here, by someone who has identified themselves
+  -- A courtesy, not the gate: admit() re-checks, because on a coded hub the
+  -- seat is not charged until the challenge is answered and everything that
+  -- greeted in between would otherwise sail past this.
   if self:isFull() then
-    return self:refuseClient(client,
-      ("This hub is full (%d players)."):format(self.limit))
+    return self:refuseClient(client, self:fullMessage())
   end
 
   -- Held rather than applied: on a hub with a code this peer is not a
@@ -478,19 +670,20 @@ end
 function M:update(dt)
   self.clock = self.clock + (dt or 0)
 
-  -- Reap connections that never introduced themselves. Without this a peer
-  -- can hold a slot indefinitely simply by saying nothing.
+  -- Reap connections that never finished introducing themselves. Without
+  -- this a peer can hold a slot indefinitely simply by saying nothing.
   --
-  -- A peer that was challenged gets AUTH_TIMEOUT on top to answer, and it is
-  -- still measured from when it arrived: anchoring the deadline at accept
-  -- means re-sending hello for a fresh nonce cannot renew it, so an
-  -- unanswered challenge is as reapable as an unspoken hello.
+  -- **One budget for the whole handshake** (Config.HANDSHAKE_TIMEOUT, ten
+  -- seconds), anchored at accept and never extended: being challenged buys
+  -- a peer no extra time, so an unanswered challenge is exactly as reapable
+  -- as an unspoken hello and re-sending hello for a fresh nonce cannot renew
+  -- anything.  server/lib/limits.js measures the same ten seconds from the
+  -- same moment, which is the point -- one client dialling the two hosting
+  -- paths must not meet two different deadlines.
   local stale
   for _, client in pairs(self.clients) do
-    local deadline = Config.HELLO_TIMEOUT
-    if client.nonce then deadline = deadline + Config.AUTH_TIMEOUT end
     if not client.ready
-       and (self.clock - (client.since or 0)) > deadline then
+       and (self.clock - (client.since or 0)) > Config.HANDSHAKE_TIMEOUT then
       stale = stale or {}
       stale[#stale + 1] = client
     end

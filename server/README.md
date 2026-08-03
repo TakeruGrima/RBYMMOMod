@@ -17,20 +17,33 @@ Node 22+, no dependencies. Everything below is Node core.
 ## Quick start
 
 Two paths to the same thing: a hub that is running, requires a join code, and
-has printed that code once.
+has put that code somewhere exactly one person can read it.
 
 ### Docker
 
 ```sh
 cd server/
 docker compose up -d
-docker compose logs hub        # your join code is in here, printed once
+docker compose exec hub rby-mmo-hub invite list --reveal   # your join code
 ```
 
 The first `up` on an empty volume runs `rby-mmo-hub init --yes` for you, so
 the hub comes up *requiring* a join code — you cannot publish an open world by
 forgetting a step. Every later start re-uses the same config and the same
 code.
+
+The code is **not** in `docker compose logs`. Container stdout is the log, and
+the log is a file on the host's disk plus a copy in whatever an orchestrator
+collects — durable, replicated storage for a credential, outside the 0600 file
+that exists to hold it. So the first run redirects `init`'s output to
+`/data/join-code.txt` (mode 0600, on the same volume as `config.json`) and
+leaves one line in the log saying where to look. Either of these reads it
+back:
+
+```sh
+docker compose exec hub rby-mmo-hub invite list --reveal
+docker compose exec hub cat /data/join-code.txt
+```
 
 ### Bare Node
 
@@ -106,21 +119,25 @@ container, where it is on `PATH`.
 | Command | What it does | Its own options |
 | --- | --- | --- |
 | `init` | first-run wizard: writes `config.json` at mode 0600 and prints a join code once. Refuses to overwrite an existing file. | `--yes` (ask nothing, take flags and defaults), `--force` (replace an existing config), `--no-auth` (do not require a join code), plus any config flag below |
-| `start` | loads the config, prints who can reach this machine, runs the hub until stopped | any config flag; `--limits.maxPending 12` works as well as `--max 8` |
+| `start` | loads the config, prints who can reach this machine, runs the hub until stopped. **Refuses to run on a group- or world-readable config**, printing the `chmod 600` that fixes it. | any config flag; `--limits.maxPending 12` works as well as `--max 8`; `--insecure-config` (run on a loose config anyway, printing what is being accepted) |
 | `status` | every effective setting, its value, and where that value came from (`flag` / `env` / `file` / `default`). Codes masked. | — |
 | `config list` | every setting, its current value, and its clamp range | — |
 | `config get <path>` | one setting, e.g. `limits.maxPending` | — |
 | `config set <path> <value>` | change one setting: clamped, reported, then saved | — |
-| `invite` | mint a join code and print it once | `--label TEXT`, `--expires 30m\|24h\|7d`, `--uses N` |
+| `invite` † | mint a join code and print it once | `--label TEXT`, `--expires 30m\|24h\|7d`, `--uses N` |
 | `invite list` | every code: id, label, created, expires, uses, status. Masked by default. | `--reveal` (print them in full) |
-| `revoke <id>` | revoke one code. Ids come from `invite list`; a unique prefix is enough. | — |
-| `ban <ip>` | refuse an address. Normalised first, so `::ffff:203.0.113.7` and `203.0.113.7` are one ban. | `--reason TEXT` (printed, **not** stored — the ban list holds addresses only) |
-| `unban <ip>` | stop refusing an address | — |
-| `allow [<ip>]` | with no argument, print the allowlist; with one, add to it. **An allowlist with entries is exclusive**: only those addresses may connect. | `--clear` (empty it) |
+| `revoke <id>` † | revoke one code. Ids come from `invite list`; a unique prefix is enough. | — |
+| `ban <ip>` † | refuse an address. Normalised first, so every spelling of one address is one ban — see [Addresses](#addresses-what-one-address-means). | `--reason TEXT` (printed, **not** stored — the ban list holds addresses only) |
+| `unban <ip>` † | stop refusing an address | — |
+| `allow [<ip>]` † | with no argument, print the allowlist; with one, add to it. **An allowlist with entries is exclusive**: only those addresses may connect. | `--clear` (empty it) |
 | `doctor` | configuration sanity plus a reachability report | — |
 | `upnp enable\|disable\|status` | ask the router to forward the port. Off by default; `enable` prints the full risk note before it sends a packet. | — |
 | `help [command]` | this table, or one command's own text | — |
 | `version` / `--version` | print the version | — |
+
+† **These edit `config.json`; a hub that is already running does not notice
+until you tell it to look.** See
+[Changing things while the hub is running](#changing-things-while-the-hub-is-running).
 
 Global options, valid on every command:
 
@@ -144,7 +161,9 @@ warnings.
 Join codes are printed by exactly three things — `init`, `invite`, and
 `invite list --reveal`. They never go through the logger, and never appear in
 `status`, `doctor` or an error message, so any of those is safe to
-screen-share or paste into a forum thread.
+screen-share or paste into a forum thread. In the container the same rule is
+why `init`'s output is redirected to a 0600 file rather than left on stdout:
+stdout there *is* the log.
 
 ---
 
@@ -207,6 +226,68 @@ inside it.
 Nothing else needs the file opened by hand. If you do open it, that should be
 curiosity rather than necessity.
 
+### Changing things while the hub is running
+
+`invite`, `revoke`, `ban`, `unban`, `allow` and `config set` all edit
+`config.json`. **A hub that is already running holds its own copy**, so none of
+them changes anything for the friends currently connected until the running
+process is told to look again. That is one signal:
+
+```sh
+kill -HUP $(pgrep -f 'rby-mmo-hub.js start')   # bare node
+docker compose kill -s SIGHUP hub              # docker
+```
+
+The hub logs `SIGHUP: re-reading the config`, then a line counting what it
+found:
+
+```
+INFO SIGHUP: re-reading the config
+INFO reloaded "/data/config.json": 2 join code(s), 2 usable; 1 ban(s); 0 allowlist entr(y/ies)
+```
+
+**Exactly three things are re-applied:** `auth.credentials`, `bans`,
+`allowlist` — the decisions about *who may be here*. Everything else in the
+file is a bind-time parameter and needs a restart:
+
+| Change | Reload is enough | Needs a restart |
+| --- | --- | --- |
+| `invite` / `revoke` | ✓ the next handshake is judged against the new list | |
+| `ban` / `unban` / `allow` | ✓ the next connection is admitted or refused by the new list | |
+| `listen.port`, `listen.host` | | ✓ cannot change under a live listener |
+| `maxPlayers` | | ✓ |
+| `auth.required` (code demanded at all) | | ✓ the relay is handed a challenge port, or not, once at bind |
+| `limits.*`, `log.level`, `network.upnp.*` | | ✓ |
+
+For the four a host is most likely to have edited by mistake — `listen.host`,
+`listen.port`, `maxPlayers` and `auth.required` — a reload that finds them
+changed **says so** rather than pretending, so "why is it still on the old
+port" is answered on screen rather than inferred:
+
+```
+WARN reload: listen.host, listen.port and maxPlayers were not re-applied -- they
+     cannot change under a live listener. This hub is still 0.0.0.0:7788 for 4
+     players until it is restarted.
+```
+
+The rest of the file — `limits.*`, `log.level`, `network.upnp.*` — is not
+re-applied and not remarked on either. Restart for those.
+
+Two things a reload does **not** do, both worth knowing before you rely on it:
+
+- **It does not disconnect anybody.** Bans and the allowlist are checked when a
+  connection is *admitted*. Someone already in the world stays there; a
+  revoked code does not eject the player who already answered a challenge with
+  it. To remove someone who is currently connected you still restart the hub —
+  after which the new list keeps them out.
+- **A file it cannot read changes nothing.** Config files get edited in place,
+  so half a file is a normal thing to meet at an arbitrary instant. Bad JSON
+  is logged and the credentials, bans and allowlist already in force are kept;
+  it does not empty its own ban list because someone was mid-save.
+
+A hub started without a config file — `node hub.js`, or an embedding caller —
+has nothing to re-read, and says so.
+
 ---
 
 ## Security posture
@@ -218,7 +299,32 @@ Be clear-eyed about this before you expose a port.
 The hub sends a fresh random nonce; the client answers
 `HMAC-SHA256(joinCode, nonce)`. **The join code itself never crosses the
 wire.** Codes are sixteen characters from a 32-symbol alphabet with `I L O U`
-removed — 80 bits, and nothing that can be misread off a screenshot.
+removed — an 80-bit *shape*, and nothing that can be misread off a screenshot.
+
+**Whether it is 80 bits of secret depends on which host minted it**, and the
+difference is not small:
+
+| Minted by | Source | Honest strength |
+| --- | --- | --- |
+| `rby-mmo-hub init` / `invite` (this server) | `crypto.randomBytes`, rejection-sampled so the alphabet stays uniform | the full **80 bits** |
+| the in-game host (`START > MMO > HOST GAME`, `src/Client.lua`) | a Lua entropy pool — frame timings, `os.clock()` deltas, heap size, button-press timing, a burst of scheduling jitter at draw time, ratcheted through SHA-256 | **64 bits claimed** in practice — any game that has reached that screen has been stirring the pool for thousands of frames. The pool's input runs past 80 by then, but nothing health-tests it, so 64 is the number the code stands behind. A draw before a single frame has run would be **~35–45 bits**. |
+
+The in-game path is not a CSPRNG and does not pretend to be: a mod that
+declares only `network` can reach nothing better — LÖVE ships no `randomBytes`,
+`love.math.random` is a seeded xorshift, and `/dev/urandom` would mean a
+filesystem permission this mod does not have. The same pool feeds `src/Hub.lua`'s
+challenge nonces.
+
+**Why that gap matters more than it looks.** None of the hub's rate limits
+apply to guessing a code this way. One captured handshake — a nonce and the
+64-hex answer to it — is enough to attack the code **offline**, at whatever
+rate the attacker's hardware manages, with nothing to notice or refuse. A
+40-bit secret does not survive that; 80 bits does.
+
+**So: a hub exposed to the open internet should be this one**, with codes from
+`invite`. The in-game host is right for a LAN, a VPN, or people in the same
+room. A player who wants better than 64 bits out of it can type their own code
+on the `HOST GAME > JOIN CODE` screen — including one this server minted.
 
 - A passive eavesdropper cannot recover the code (HMAC is one-way) and cannot
   replay a captured answer: the nonce is per-connection and single-use, spent
@@ -231,10 +337,18 @@ removed — 80 bits, and nothing that can be misread off a screenshot.
   accepted."*
 - Credentials are a list. Each can carry an expiry (`--expires`), a use budget
   (`--uses`) and a revocation, so withdrawing one friend's invite does not
-  rotate everybody's code.
-- `config.json` holds the codes in plaintext, at mode 0600. A group- or
-  world-readable file is warned about on every load and is a `[fail]` in
-  `doctor`.
+  rotate everybody's code. **A running hub re-reads that list on `SIGHUP`**,
+  and only then; a revoke that is never followed by a reload or a restart has
+  changed a file and nothing else. It also does not eject the friend who is
+  connected right now — see
+  [Changing things while the hub is running](#changing-things-while-the-hub-is-running).
+- `config.json` holds the codes in plaintext, at mode 0600. **`start` refuses
+  to run on a group- or world-readable file**, prints the `chmod 600` that
+  fixes it, and exits `1`; `doctor` calls the same thing a `[fail]`. Warning
+  and starting anyway would have left the exposure in place for exactly as
+  long as the hub was running, which is the whole time it matters.
+  `--insecure-config` starts on one anyway, for a host with a genuinely
+  unusual setup, and prints what is being accepted.
 
 ### What that buys, and what it does not
 
@@ -262,7 +376,9 @@ All of it is on by default under `rby-mmo-hub`, and all of it is tunable.
 - **Per-address connection cap** (`limits.perIpConnections`, 4) and a
   **token-bucket connect-rate limit** (`limits.connectBurst` 10,
   `limits.connectPerMinute` 60). A rejected attempt still spends a token, so
-  being over the cap does not buy a flooder free retries.
+  being over the cap does not buy a flooder free retries. Both count per
+  address for IPv4 and **per `/64` for IPv6** — see
+  [Addresses](#addresses-what-one-address-means).
 - **A handshake budget separate from the idle timeout**, which the old single
   `socket.setTimeout(45000)` conflated.
 - **Slowloris sweep**: a peer that starts a line and never finishes one is
@@ -271,12 +387,54 @@ All of it is on by default under `rby-mmo-hub`, and all of it is tunable.
 - **Write backpressure**: a peer whose queued bytes pass
   `limits.maxWriteBufferBytes` is dropped. A client that connects and never
   reads used to grow the hub's memory without bound while looking healthy.
-- **Bans and an allowlist.** Addresses are normalised first, so a dual-stack
-  client cannot slip past a ban written in the other spelling. An allowlist
-  with entries is exclusive.
+- **Bans and an allowlist.** Both match an **exact** address, normalised first
+  so a dual-stack client cannot slip past a ban written in the other spelling
+  and an IPv6 host cannot slip past one by respelling itself. An allowlist with
+  entries is exclusive. Neither takes effect on a running hub until it is
+  reloaded or restarted.
 - A rejection that is a flood signal (banned, rate-limited) costs the sender
   nothing but the SYN; one an honest player could plausibly hit gets a
   sentence, because the game renders it.
+
+### Addresses: what one address means
+
+Two different questions, deliberately answered with two different keys.
+
+**Bans and the allowlist match an exact address.** Everything is normalised
+first, so the many legal spellings of one host are one entry: brackets and
+`%zone` suffixes are stripped, hex is lowercased, IPv4-mapped and
+IPv4-compatible forms fold to the dotted quad, and every IPv6 address is
+re-emitted in canonical RFC 5952 form — leading zeros dropped, the longest run
+of zero groups compressed to `::` (leftmost wins a tie, a single zero group is
+never compressed).
+
+```
+2001:0db8:0000:0000:0000:0000:0000:0001  ->  2001:db8::1
+2001:DB8::1                              ->  2001:db8::1
+[2001:db8::1]                            ->  2001:db8::1
+fe80::1%en0                              ->  fe80::1
+::ffff:203.0.113.7                       ->  203.0.113.7
+::ffff:cb00:7107                         ->  203.0.113.7
+```
+
+That is a fix, not decoration: a host bans the address they read out of a log,
+and a ban stored in a spelling the kernel never emits reports success and then
+never fires. Anything that does not parse as an address is stored exactly as it
+arrived — nothing on the accept path throws.
+
+**The connection cap and the connect-rate bucket count per `/64` for IPv6**,
+and per exact address for IPv4. `limits.perIpConnections` exists to bound one
+household, and a household is a `/64` — the smallest block a residential IPv6
+assignment hands out. Keyed by the full address it would not be a cap at all: a
+client with a normal `/64` has 2^64 source addresses to open one connection
+from each. The key is visible wherever the counts are — the running hub's
+`stats().perIp` names it in full, so an IPv6 household appears there as
+`2001:db8::/64` rather than as one of its addresses.
+
+Not the other way round, in either direction: a `/64` **ban** would ban a
+friend's whole ISP-assigned block on the strength of one address, and a `/64`
+allowlist entry would admit every address in a block the host meant to name one
+member of. Exact for policy, per-block for counting.
 
 ### Everything else that is still true
 
@@ -298,12 +456,15 @@ All of it is on by default under `rby-mmo-hub`, and all of it is tunable.
 ### The in-game host is not the hardened one
 
 `src/Hub.lua` can ask for a join code too, and the exchange is byte-compatible
-with this one — though the `HOST GAME` screen does not currently set one, so a
-game hosted from inside the game admits anyone who reaches the port. And when
-it does ask, its nonce is derived from what pure Lua can reach — heap size, a
-table's address, `os.time`, `os.clock` — hashed with SHA-256. That is not a
-cryptographic random source and the code says so. It is fine for a LAN game
-among people in the same room.
+with this one. What differs is where the randomness comes from: both its
+challenge nonces and the code the `HOST GAME` screen offers are drawn from the
+Lua entropy pool described above, not from a CSPRNG — roughly 35–45 bits cold,
+64 bits claimed once the game has been running a few seconds, against this
+server's 80. It also has none of the connection hardening below: no per-address
+cap, no connect-rate bucket, no ban list, no allowlist.
+
+That is fine for a LAN game among people in the same room, and it is the normal
+way to play.
 
 **A hub exposed to the open internet should be this one.**
 
@@ -366,6 +527,16 @@ on the local link. Some routers refuse leases and only accept permanent
 mappings; when that happens it is said out loud, and `upnp disable` is the way
 back.
 
+The removal on shutdown is **awaited before the process exits**, which is what
+makes it real rather than a promise: removing a mapping needs an SSDP discovery
+*and* a SOAP POST, and firing that from a signal handler alongside an immediate
+`process.exit` used to tear it down mid-flight, leaving the port forwarded on
+the router after every Ctrl-C and every `docker stop`. It is now a shutdown
+hook the hub waits on, run at most once, and bounded — two seconds, after which
+the hub says the router did not answer and stops anyway. A router that has gone
+quiet must not be able to wedge Ctrl-C; when that happens a leased mapping
+still expires on its own, and `upnp disable` removes a permanent one.
+
 With UPnP on, `doctor` also asks the router for its own external address —
 still local, still no third party.
 
@@ -376,15 +547,19 @@ still local, still no third party.
 ```sh
 cd server/
 docker compose up -d                              # build and start
-docker compose logs hub                           # the join code, once
+docker compose exec hub rby-mmo-hub invite list --reveal   # the join code
 docker compose exec hub rby-mmo-hub invite        # another code, for a friend
 docker compose exec hub rby-mmo-hub doctor        # what can reach you
 docker compose exec hub rby-mmo-hub config set maxPlayers 8
+docker compose kill -s SIGHUP hub                 # apply codes/bans/allowlist
 docker compose down                               # stop; volume and code remain
 ```
 
 `docker compose exec` bypasses the entrypoint, which is why every other verb
-is reachable that way — `rby-mmo-hub` is on `PATH` in the image.
+is reachable that way — `rby-mmo-hub` is on `PATH` in the image. The verbs that
+edit `config.json` change a file, not the running process; `kill -s SIGHUP` is
+what makes the running hub re-read it (see
+[Changing things while the hub is running](#changing-things-while-the-hub-is-running)).
 
 What compose sets up:
 
@@ -394,6 +569,14 @@ What compose sets up:
   the audience.
 - **A named volume at `/data`**, holding `config.json` — the join code, the
   bans, the allowlist. Losing the volume loses the code your friends saved.
+- **A first run that keeps the code out of the log.** When `config.json` is
+  absent the entrypoint runs `init --yes` with its output redirected into
+  `/data/join-code.txt`, created under `umask 077` so it is 0600 before a byte
+  of it exists, inside a 0700 `/data`. The log gets one line naming the file
+  and the `invite list --reveal` command. If `init` fails, *that* output is
+  printed — to stderr — and the file is removed, so a first run that cannot
+  write its config still says why. Anything that copies this volume off the
+  machine is copying a credential.
 - **`read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`,
   `tmpfs: [/tmp]`.** The hub binds 7788, above 1024, so it needs no capability
   at all.

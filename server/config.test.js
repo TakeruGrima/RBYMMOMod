@@ -7,9 +7,10 @@
  * Covers the precedence chain (flag > env > file > default), the legacy
  * RBY_MMO_* env vars hub.js has always read, clamping driven mechanically
  * from BOUNDS, the nesting of config.js's BOUNDS inside limits.js's BOUNDS,
- * the load()-never-throws contract, atomic/mode-0600 save(), permission
- * checking, redaction, migration and the manifest/package version-parity
- * guard.
+ * the load()-never-throws contract, atomic/mode-0600 save() and its refusal
+ * to write through anything planted at its temporary path, permission
+ * checking, redaction that keeps no part of a join code, migration and the
+ * manifest/package version-parity guard.
  *
  * Same bespoke idiom as server/hub.test.js and server/auth.test.js: a
  * throwing ok(cond, label) helper, plain scenario functions, a final
@@ -26,6 +27,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('node:crypto');
 const config = require('./lib/config.js');
 const limits = require('./lib/limits.js');
 
@@ -44,6 +46,51 @@ function writeConfig(file, object, mode) {
 
 function cloneDefaults() {
   return JSON.parse(JSON.stringify(config.DEFAULTS));
+}
+
+// A validated config carrying one known join code, so a scenario can go
+// looking for that exact string on disk afterwards.
+const SECRET = 'TVWX-2345-6789-JKMN';
+
+function configWithSecret() {
+  const validated = config.validate(config.DEFAULTS).config;
+  validated.auth.credentials = [{
+    id: 'known', label: 'Known', secret: SECRET, createdAt: null,
+    expiresAt: null, maxUses: null, uses: 0, revoked: false,
+  }];
+  return validated;
+}
+
+/*
+ * save()'s temp path carries six random bytes, which is exactly what makes it
+ * unguessable -- and unpredictable for a test. Pinning crypto.randomBytes for
+ * the duration of one scenario is the only way to plant something at the path
+ * save() is about to try, which is the attack under test. config.js holds a
+ * reference to the module object, not to the function, so replacing the
+ * property is enough; it is restored in a finally.
+ */
+function withPinnedTempSuffix(fn) {
+  const real = crypto.randomBytes;
+  crypto.randomBytes = (size) => Buffer.alloc(size, 0);
+  const suffix = `.${process.pid}.${Buffer.alloc(6, 0).toString('hex')}.tmp`;
+  try {
+    return fn(suffix);
+  } finally {
+    crypto.randomBytes = real;
+  }
+}
+
+/** Every file directly inside `dir`, read as text. */
+function contentsOf(dir) {
+  return fs.readdirSync(dir).map((name) => {
+    const full = path.join(dir, name);
+    if (!fs.lstatSync(full).isFile()) return '';
+    try {
+      return fs.readFileSync(full, 'utf8');
+    } catch (err) {
+      return '';
+    }
+  });
 }
 
 // --------------------------------------------------------------- precedence
@@ -188,6 +235,10 @@ function testSaveAndRoundTrip(tmp) {
   ok(fs.existsSync(path.dirname(file)), 'save() creates a missing parent directory');
   ok(fs.existsSync(file), 'save() writes the file');
   ok(!fs.existsSync(file + '.tmp'), 'save() leaves no .tmp file behind on success');
+  // The temp name is no longer fixed, so the line above can no longer see a
+  // stray one; scan the directory for any sibling ending in .tmp instead.
+  ok(fs.readdirSync(path.dirname(file)).every((name) => !name.endsWith('.tmp')),
+    'save() leaves no temporary sibling of any name behind on success');
 
   if (process.platform !== 'win32') {
     const mode = fs.statSync(file).mode & 0o777;
@@ -197,6 +248,177 @@ function testSaveAndRoundTrip(tmp) {
   const reloaded = config.load({ path: file, env: {}, flags: {} });
   ok(JSON.stringify(reloaded.config) === JSON.stringify(validated),
     'a saved config reloads identically (round-trip)');
+}
+
+// ------------------------------------------------------- save: hostile tmp path
+
+/*
+ * The join codes are the hub's only door, and save() writes them in plaintext.
+ * A fixed `<file>.tmp` made that write follow anything a local attacker cared
+ * to put at that name -- a symlink pointed at a file of their own, or a stale
+ * 0644 file whose mode writeFileSync would not tighten until after the
+ * plaintext had already landed. save() now creates the temp file exclusively
+ * and never through a link, so both are refused before a byte is written.
+ */
+
+function testSaveRefusesPlantedSymlink(tmp) {
+  if (process.platform === 'win32') {
+    console.log('  (skipped: symlink planting needs POSIX symlink semantics)');
+    return;
+  }
+  const dir = path.join(tmp, 'symlink-attack');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'config.json');
+  const stolen = path.join(dir, 'stolen.json');
+  const bait = 'not the join codes\n';
+  fs.writeFileSync(stolen, bait, { mode: 0o600 });
+
+  withPinnedTempSuffix((suffix) => {
+    const planted = file + suffix;
+    fs.symlinkSync(stolen, planted);
+
+    let threw = null;
+    try {
+      config.save(file, configWithSecret());
+    } catch (err) {
+      threw = err;
+    }
+
+    ok(threw !== null, 'save() throws rather than writing through a planted symlink');
+    ok(fs.readFileSync(stolen, 'utf8') === bait,
+      'the link target still holds its own content -- no join codes were written into it');
+    ok(!fs.existsSync(file), 'and no config file was produced by the failed save');
+    ok(fs.lstatSync(planted).isSymbolicLink(),
+      'save() leaves the planted link alone rather than unlinking a file it did not create');
+    ok(contentsOf(dir).every((text) => !text.includes(SECRET)),
+      'the join code appears in no file in the directory');
+  });
+}
+
+function testSaveRefusesStaleTempFile(tmp) {
+  const dir = path.join(tmp, 'stale-tmp');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'config.json');
+
+  // A good save first, so there is a real config to protect.
+  const first = configWithSecret();
+  config.save(file, first);
+  const before = fs.readFileSync(file, 'utf8');
+
+  withPinnedTempSuffix((suffix) => {
+    const planted = file + suffix;
+    fs.writeFileSync(planted, 'stale leftover\n');
+    if (process.platform !== 'win32') fs.chmodSync(planted, 0o644);
+
+    const second = configWithSecret();
+    second.maxPlayers = 8;
+    let threw = null;
+    try {
+      config.save(file, second);
+    } catch (err) {
+      threw = err;
+    }
+
+    ok(threw !== null, 'save() throws rather than reusing a stale file at its temp path');
+    ok(fs.readFileSync(planted, 'utf8') === 'stale leftover\n',
+      'the stale file is not written through');
+    ok(fs.readFileSync(file, 'utf8') === before,
+      'the existing config is left exactly as it was');
+    if (process.platform !== 'win32') {
+      ok((fs.statSync(file).mode & 0o777) === 0o600,
+        'the config is still at mode 0600 after the refused save');
+      ok((fs.statSync(planted).mode & 0o077) !== 0,
+        'the stale 0644 file never became the config (it is still the loose one)');
+    }
+  });
+
+  // With the leftover gone the next save succeeds, at 0600.
+  const third = configWithSecret();
+  third.maxPlayers = 8;
+  config.save(file, third);
+  ok(config.load({ path: file, env: {}, flags: {} }).config.maxPlayers === 8,
+    'the next save succeeds once the leftover is cleared');
+  if (process.platform !== 'win32') {
+    ok((fs.statSync(file).mode & 0o777) === 0o600,
+      'and lands at mode 0600, never looser');
+  }
+}
+
+function testSaveIgnoresTheOldFixedTempPath(tmp) {
+  if (process.platform === 'win32') {
+    console.log('  (skipped: symlink planting needs POSIX symlink semantics)');
+    return;
+  }
+  // The real-world version of the attack: the attacker knows `<file>.tmp`,
+  // because that is the name the old code used. It is now nobody's path.
+  const dir = path.join(tmp, 'legacy-tmp');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'config.json');
+  const stolen = path.join(dir, 'stolen.json');
+  fs.writeFileSync(stolen, 'bait\n', { mode: 0o600 });
+  fs.symlinkSync(stolen, file + '.tmp');
+
+  config.save(file, configWithSecret());
+
+  ok(fs.readFileSync(stolen, 'utf8') === 'bait\n',
+    'a symlink at the old fixed <file>.tmp receives nothing -- save() no longer uses that name');
+  ok(fs.readFileSync(file, 'utf8').includes(SECRET), 'the real config was written');
+  ok((fs.statSync(file).mode & 0o777) === 0o600, 'at mode 0600');
+}
+
+function testConcurrentSavesDoNotCollide(tmp) {
+  // Two writers on one config file are real now: server.js persists
+  // credential use-counts from the running hub while `rby-mmo-hub invite` may
+  // be saving the same file. Two things are asserted -- that no two saves
+  // ever pick the same temp path, and that a save landing in the middle of
+  // another one leaves both of them successful.
+  const dir = path.join(tmp, 'concurrent');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'config.json');
+
+  const realOpen = fs.openSync;
+  const seen = [];
+  fs.openSync = function (target, ...rest) {
+    if (typeof target === 'string' && target.endsWith('.tmp')) seen.push(target);
+    return realOpen.call(fs, target, ...rest);
+  };
+
+  const realRename = fs.renameSync;
+  let reentered = false;
+
+  try {
+    for (let i = 0; i < 16; i++) config.save(file, configWithSecret());
+    ok(seen.length === 16, 'each save opened exactly one temporary file');
+    ok(new Set(seen).size === seen.length, '16 saves of one file picked 16 distinct temp paths');
+    ok(seen.every((p) => p !== file + '.tmp'),
+      'and none of them is the old predictable <file>.tmp');
+    ok(seen.every((p) => path.dirname(p) === dir),
+      'every temp file is a sibling of the target, so the rename stays on one filesystem');
+
+    // A second "process" saves while the first is between write and rename.
+    const inner = configWithSecret();
+    inner.maxPlayers = 9;
+    const outer = configWithSecret();
+    outer.maxPlayers = 7;
+
+    fs.renameSync = function (from, to) {
+      if (!reentered) {
+        reentered = true;
+        config.save(file, inner); // the other process, mid-flight
+      }
+      return realRename.call(fs, from, to);
+    };
+
+    config.save(file, outer);
+    ok(reentered, 'the interleaved save really ran inside the outer one');
+    ok(config.load({ path: file, env: {}, flags: {} }).config.maxPlayers === 7,
+      'both saves completed without colliding; the later rename is the one that stands');
+    ok(fs.readdirSync(dir).every((name) => !name.endsWith('.tmp')),
+      'and neither left a temporary file behind');
+  } finally {
+    fs.openSync = realOpen;
+    fs.renameSync = realRename;
+  }
 }
 
 // ------------------------------------------------------------- checkPermissions
@@ -241,6 +463,49 @@ function testRedact() {
   }
 }
 
+/*
+ * The mask used to keep the first group -- ABCD-****-****-**** -- for the
+ * stated purpose of telling two credentials apart in a listing. That is 4 of
+ * 16 characters, 20 of 80 bits, printed into exactly the outputs the docs
+ * call safe to screen-share; and `credential.id` is in the same table and
+ * already does the disambiguating. Every group is hidden now, so the
+ * assertion is the strong one: no run of the secret survives at all.
+ */
+function testMaskKeepsNoPartOfTheSecret() {
+  const source = config.validate(config.DEFAULTS).config;
+  source.auth.credentials = [{
+    id: 'known', label: 'Known', secret: SECRET, createdAt: null,
+    expiresAt: null, maxUses: null, uses: 0, revoked: false,
+  }];
+
+  const masked = config.redact(source).auth.credentials[0].secret;
+  ok(masked === '****-****-****-****', 'every group of the join code is masked');
+
+  const bare = SECRET.replace(/-/g, '');
+  let windows = 0;
+  for (const form of [SECRET, bare]) {
+    for (let i = 0; i + 4 <= form.length; i++) {
+      const run = form.slice(i, i + 4);
+      ok(!masked.includes(run),
+        `the masked form contains no four-character run of the secret ("${run}")`);
+      windows++;
+    }
+  }
+  ok(windows > 0, 'the run check actually examined some windows of the secret');
+
+  // Two different codes mask identically: the mask carries no information
+  // about what it hides, which is the point of leaning on `id` instead.
+  const other = config.validate(config.DEFAULTS).config;
+  other.auth.credentials = [{
+    id: 'other', label: 'Other', secret: 'PQRS-6789-2345-TVWX', createdAt: null,
+    expiresAt: null, maxUses: null, uses: 0, revoked: false,
+  }];
+  ok(config.redact(other).auth.credentials[0].secret === masked,
+    'two different join codes mask to the same string');
+  ok(config.redact(other).auth.credentials[0].id === 'other',
+    'the id -- what a host actually disambiguates by, and what `revoke` takes -- is untouched');
+}
+
 // ------------------------------------------------------------------- migrate
 
 function testMigrate() {
@@ -280,8 +545,13 @@ function main() {
     testBoundsNesting();
     testLoadNeverThrows(tmp);
     testSaveAndRoundTrip(tmp);
+    testSaveRefusesPlantedSymlink(tmp);
+    testSaveRefusesStaleTempFile(tmp);
+    testSaveIgnoresTheOldFixedTempPath(tmp);
+    testConcurrentSavesDoNotCollide(tmp);
     testCheckPermissions(tmp);
     testRedact();
+    testMaskKeepsNoPartOfTheSecret();
     testMigrate();
     testVersionParity();
   } finally {

@@ -255,6 +255,43 @@ function testActiveCredentials() {
   const badExpiry = { secret: 'AAAA-AAAA-AAAA-AAAA', expiresAt: 'not-a-date' };
   ok(auth.isActive(badExpiry, now) === false, 'an unparseable expiresAt is treated as expired');
 
+  // The same rule, one field over: a use count the hub cannot read is a
+  // budget it cannot enforce, so it counts as spent. This is the last gate
+  // before admission and it must have no fail-open branch -- a credential
+  // whose `uses` was hand-edited to a string, or corrupted to an object, used
+  // to make the `uses >= maxUses` comparison unreachable and stay active for
+  // ever regardless of maxUses.
+  const unreadableUses = [
+    ['a string', 'lots'],
+    ['an object', {}],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ];
+  for (const [label, uses] of unreadableUses) {
+    const credential = { secret: 'AAAA-AAAA-AAAA-AAAA', maxUses: 3, uses };
+    ok(auth.isActive(credential, now) === false,
+      `${label} as the use count fails closed, not open`);
+  }
+
+  // ...but a *missing* count is genuinely zero uses, which is what every
+  // freshly-minted credential has before anyone has spent it.
+  ok(auth.isActive({ secret: 'AAAA-AAAA-AAAA-AAAA', maxUses: 3 }, now) === true,
+    'a credential with no uses recorded yet is still active');
+  ok(auth.isActive({ secret: 'AAAA-AAAA-AAAA-AAAA', maxUses: 3, uses: null }, now) === true,
+    'and so is one whose count is null');
+
+  // And the whole way through verify(), with the right underlying code: an
+  // unreadable count must look exactly like a spent one from outside.
+  {
+    const nonce = auth.newNonce();
+    const broken = { id: 'broken', secret: 'AAAA-AAAA-AAAA-AAAA', maxUses: 1, uses: 'one' };
+    const result = auth.verify(nonce, auth.sign('AAAA-AAAA-AAAA-AAAA', nonce), [broken], now);
+    ok(result.ok === false,
+      'verify refuses a credential whose use count cannot be read, even with the right code');
+    ok(result.reason === 'no_credentials',
+      'and it is filtered out before the comparison rather than failing it');
+  }
+
   const pool = [justBefore, exactlyAt, atMax, revoked, underMax];
   const active = auth.activeCredentials(pool, now);
   ok(active.length === 2, 'activeCredentials keeps only the active entries');

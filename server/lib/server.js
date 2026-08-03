@@ -21,10 +21,13 @@
  *    limits.handshakeTimeoutMs instead, so four silent sockets can no longer
  *    lock everyone out of a four-player hub the way hub.js:369 allowed. The
  *    one courtesy exception is spelled out at its call site.
- *  - **There is exactly one timer**, a ~1 s sweep, plus the one-second
- *    forced-close budget on shutdown. Per-socket timers were how the old
- *    hub conflated "has not finished its handshake" with "has said nothing
- *    for a while", which are different failures with different budgets.
+ *  - **Registered sockets carry no timers of their own**, only the ~1 s
+ *    sweep. Per-socket timers were how the old hub conflated "has not
+ *    finished its handshake" with "has said nothing for a while", which are
+ *    different failures with different budgets. The two exceptions are
+ *    sockets nobody is keeping -- the one-second forced-close budget on
+ *    shutdown, and the quarter-second a refusal gets to reach the wire --
+ *    where there is exactly one budget and nothing to conflate it with.
  *  - **A rejected connection is destroyed without a reply when the rejection
  *    is a flood signal**, and answered in one sentence when it is not. Bytes
  *    spent on a flooder are the attack; bytes spent on an honest friend
@@ -33,12 +36,17 @@
  * No dependencies: node:net plus this directory.
  */
 
+const fs = require('node:fs');
 const net = require('node:net');
 const process = require('node:process');
 
 const { Relay, parseLine } = require('./relay.js');
 const { Limits, normalizeIp } = require('./limits.js');
-const { save: saveConfig } = require('./config.js');
+const {
+  save: saveConfig,
+  validate: validateConfig,
+  migrate: migrateConfig,
+} = require('./config.js');
 const auth = require('./auth.js');
 const { createLog, safe } = require('./log.js');
 
@@ -68,6 +76,21 @@ const CONNECTION_SLACK = 8;
 // once costs one write; short enough that a kill -9 loses at most a second
 // of counting.
 const CREDENTIAL_SAVE_INTERVAL_MS = 1000;
+
+// How long a refused socket may sit between its goodbye and its destruction.
+// It is invisible to limits.js on purpose (charging a refusal would let a
+// flooder fill the table it was just refused by), but it is *not* invisible to
+// libuv: it counts against server.maxConnections until it is gone. Leaving
+// that to the 1 s sweep let a second's worth of refusals push the backstop
+// over, and the backstop cannot produce a sentence. A quarter second is far
+// longer than one short line needs and four times less residency.
+const FAREWELL_MS = 250;
+
+// How long close() waits on the caller's onShutdown hook before giving up on
+// it. The hook's job is to undo something outside this process -- a UPnP
+// mapping on a router that may simply not answer -- and a router that does not
+// answer must not be able to wedge Ctrl-C.
+const SHUTDOWN_HOOK_MS = 2000;
 
 // A rejection that is a flood signal costs the sender nothing but the
 // SYN. A rejection an honest player could plausibly hit gets a sentence,
@@ -111,17 +134,27 @@ function refusalFor(reason, limits) {
  * credential that has just spent its last use is already inactive by the time
  * the next peer answers a challenge, with no separate re-check to keep in
  * step. Persistence is somebody else's tick; see noteCredentialUse().
+ *
+ * **The credential list is read on every verify, never captured.** Whether
+ * auth is required at all is a bind-time fact -- the relay is handed a port or
+ * null once -- but *which codes open the door* is a security decision a host
+ * has to be able to change while friends are mid-session, so reload() (SIGHUP)
+ * replaces config.auth.credentials in place and the very next challenge is
+ * judged against the new list.
  */
 function authPort(config, onUse) {
   const settings = (config && config.auth) || {};
   if (!settings.required) return null;
-  const credentials = Array.isArray(settings.credentials)
-    ? settings.credentials : [];
+  const liveCredentials = () => {
+    const current = config && config.auth && config.auth.credentials;
+    return Array.isArray(current) ? current : [];
+  };
   return {
     newNonce() {
       return auth.newNonce();
     },
     verify(nonce, response) {
+      const credentials = liveCredentials();
       const verdict = auth.verify(nonce, response, credentials);
       if (!verdict || !verdict.ok) return verdict;
 
@@ -152,7 +185,7 @@ function logFor(config) {
 /**
  * Bind a hub to a port.
  *
- * Resolves to { port, host, close(), relay, limits, stats() } once the
+ * Resolves to { port, host, close(), reload(), relay, limits, stats() } once the
  * listener is up, and rejects if it never comes up -- so a caller can report
  * "address already in use" as the one thing that actually went wrong rather
  * than as a stack trace.
@@ -160,15 +193,63 @@ function logFor(config) {
  * `handleSignals` defaults to true, which is what a process whose whole job
  * is the hub wants. An embedded caller -- a suite starting three hubs in one
  * process -- passes false, so stopping one of them does not hijack SIGINT
- * for the rest.
+ * for the rest. It also arms SIGHUP, which re-reads the config file and
+ * re-applies the three things that are security decisions rather than
+ * bind-time parameters; see reload().
+ *
+ * `onShutdown` is an optional async function belonging to the caller --
+ * today, the CLI's UPnP unmap. close() **awaits it before resolving**,
+ * bounded by SHUTDOWN_HOOK_MS, and never lets it reject: the signal handler
+ * exits only once close() resolves, so a hook that hangs would otherwise be a
+ * hub that will not stop. It runs at most once per start().
+ *
+ * The config is put through config.validate() here rather than trusted.
+ * `hub.js` and the CLI both validate before calling, so for the shipped paths
+ * this changes nothing (validate is idempotent and never throws) -- but start()
+ * is this package's main, and an embedding caller must not be able to reach
+ * authPort's "no auth section means admit everyone" branch by passing a
+ * half-built object.
  */
 function start(options = {}) {
   const opts = options || {};
-  const config = opts.config || {};
+  const given = opts.config || {};
+
+  // Asked before validate() fills it in from the defaults. An absent auth
+  // section is not a decision, it is a gap, and the defaults resolve it the
+  // safe way (required) rather than the convenient one.
+  const authWasMissing = !given || typeof given.auth !== 'object' ||
+    given.auth === null || Array.isArray(given.auth);
+
+  /*
+   * Port 0 is not a config-file value, it is the programmatic "ask the OS for
+   * a free port" that every in-process suite binds on. config.js's range is
+   * 1..65535 and rightly so -- a host who types 0 into config.json meant
+   * something else -- so the ephemeral case is carried around validate()
+   * rather than clamped to port 1, which is what a caller passing 0 would
+   * otherwise get, complete with EACCES.
+   */
+  const ephemeralPort = Boolean(given.listen) && Number(given.listen.port) === 0;
+  const checked = validateConfig(ephemeralPort
+    ? Object.assign({}, given, {
+      listen: Object.assign({}, given.listen, { port: undefined }),
+    })
+    : given);
+  const config = checked.config;
+  if (ephemeralPort) config.listen.port = 0;
+
   const listen = config.listen || {};
   const log = opts.log || logFor(config);
   const configPath = opts.configPath || null;
   const handleSignals = opts.handleSignals !== false;
+  const onShutdown = typeof opts.onShutdown === 'function' ? opts.onShutdown : null;
+
+  for (const warning of checked.warnings) log.warn(`config: ${warning}`);
+  if (authWasMissing) {
+    log.warn('config: no auth section was given, so this hub is defaulting to ' +
+      `requiring a join code and has none -- nobody can join. Pass ` +
+      `auth: { required: false } for an open hub, or auth.credentials from ` +
+      '`rby-mmo-hub invite`.');
+  }
 
   const limits = new Limits(config.limits || {});
   limits.setBans(config.bans);
@@ -177,7 +258,10 @@ function start(options = {}) {
   const relay = new Relay({
     maxPlayers: config.maxPlayers,
     chatIntervalMs: config.limits && config.limits.chatIntervalMs,
-    protocol: config.protocol,
+    // Not a config.json setting: `protocol` is an embedding/test seam the
+    // schema deliberately does not know about, so it is read from the object
+    // as given rather than from the validated copy validate() pruned it out of.
+    protocol: given.protocol,
     auth: authPort(config, noteCredentialUse),
     log,
   });
@@ -187,13 +271,19 @@ function start(options = {}) {
   /*
    * Sockets refused before they were ever registered. They are invisible to
    * limits.js by design -- charging a refusal would let a flooder fill the
-   * table it was just refused by -- so they are parked here and destroyed on
-   * the next sweep. One second is long past enough to have flushed one short
-   * line, and it keeps this file to a single timer.
+   * table it was just refused by -- so they are parked here and destroyed
+   * FAREWELL_MS after their goodbye, whether or not the peer ever read it.
+   * Shutdown reaches them through this set too, and so does the sweep, which
+   * stays as the belt to the timer's braces.
    */
   const farewells = new Set();
 
   const startedAt = Date.now();
+  // What the listener actually got, which is not always what was asked for
+  // (port 0, or a host the OS spelled differently). Filled in on bind; read by
+  // reload() and stats(), both of which only run after that.
+  let boundHost = null;
+  let boundPort = null;
   let closePromise = null;
   let stopping = false;
   let creditTimer = null;
@@ -257,10 +347,40 @@ function start(options = {}) {
     // A peer can vanish between accept and this write; that is its problem,
     // not the hub's, and it must not reach the connection listener as a throw.
     socket.on('error', () => {});
-    socket.on('close', () => farewells.delete(socket));
+
+    /*
+     * A budget of its own, rather than the next sweep.
+     *
+     * A refused socket is invisible to limits.js but not to libuv: it counts
+     * against server.maxConnections until it is destroyed, and that ceiling is
+     * only maxPlayers + maxPending + slack. Leaving these to the 1 s sweep let
+     * a second's worth of refusals push the backstop over -- and the backstop
+     * destroys connections silently, ahead of every check that could produce a
+     * sentence. FAREWELL_MS is four times less residency for the same courtesy.
+     *
+     * Not the flush callback, deliberately: destroying the instant the write
+     * drains would land while the peer's own hello is still arriving unread,
+     * and a destroy with unread data queued is an RST -- which is exactly how
+     * a peer loses the sentence this whole path exists to deliver.
+     */
+    let timer = null;
+    socket.on('close', () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      farewells.delete(socket);
+    });
+
     try {
       socket.end(JSON.stringify({ type: 'mmo.error', message }) + '\n');
       farewells.add(socket);
+      timer = setTimeout(() => {
+        timer = null;
+        farewells.delete(socket);
+        socket.destroy();
+      }, FAREWELL_MS);
+      // Never a reason to keep the process alive: the goodbye is a courtesy,
+      // and a hub with nothing else left to do should still exit.
+      timer.unref();
     } catch (err) {
       socket.destroy();
     }
@@ -401,7 +521,130 @@ function start(options = {}) {
   // so the hub still exits the moment the listener and its sockets are gone.
   sweeper.unref();
 
+  // --------------------------------------------------------------- reload
+
+  /*
+   * SIGHUP: re-read the file and re-apply the decisions in it that are about
+   * *who may be here*, without touching the ones that are about *what is
+   * bound*.
+   *
+   * A host who revokes a leaked join code, bans someone mid-session or tightens
+   * an allowlist is doing it because something is happening right now. Until
+   * this existed, none of the three took effect until the hub was restarted --
+   * which means dropping everyone mid-battle to eject one person, so in
+   * practice it meant the change did not happen at all.
+   *
+   * Exactly three things are re-applied: auth.credentials, bans, allowlist.
+   *
+   * Not the port, the bind address or the player cap. Those cannot change
+   * under a live listener -- and a reload that silently ignored a host's edit
+   * to `listen.port` while claiming to have reloaded the file would be worse
+   * than not offering a reload at all. They are named in the log instead, so
+   * the answer to "why is it still on the old port" is on screen rather than
+   * inferred.
+   *
+   * A reload that cannot be completed changes nothing. Config files are edited
+   * in place and read at an arbitrary instant, so half a file is a normal
+   * thing to meet; a hub that reacted to one by emptying its ban list would
+   * hold its own door open because someone was mid-save.
+   */
+  function reload() {
+    if (!configPath) {
+      log.warn('reload: this hub was started without a config file, so there ' +
+        'is nothing to re-read. Start it through bin/rby-mmo-hub.js for a ' +
+        'hub whose credentials, bans and allowlist can be reloaded.');
+      return false;
+    }
+
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch (err) {
+      log.error(`reload: could not read ${safe(configPath)} ` +
+        `(${safe(err.message)}); keeping the credentials, bans and allowlist ` +
+        'already in force. Fix the file and send SIGHUP again.');
+      return false;
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      log.error(`reload: ${safe(configPath)} is not a JSON object; keeping the ` +
+        'credentials, bans and allowlist already in force.');
+      return false;
+    }
+
+    const migrated = migrateConfig(raw);
+    const fresh = validateConfig(migrated.raw);
+    for (const warning of migrated.warnings) log.warn(`reload: ${safe(warning)}`);
+    for (const warning of fresh.warnings) log.warn(`reload: ${safe(warning)}`);
+    const next = fresh.config;
+
+    // In place, not by rebinding `config`: authPort reads config.auth.credentials
+    // on every verify, and flushCredentials writes this same object back.
+    config.auth.credentials = next.auth.credentials;
+    config.bans = next.bans;
+    config.allowlist = next.allowlist;
+    limits.setBans(config.bans);
+    limits.setAllowlist(config.allowlist);
+
+    const total = config.auth.credentials.length;
+    const usable = auth.activeCredentials(config.auth.credentials).length;
+    log.info(`reloaded ${safe(configPath)}: ${total} join code(s), ${usable} ` +
+      `usable; ${config.bans.length} ban(s); ` +
+      `${config.allowlist.length} allowlist entr(y/ies)`);
+
+    if (Boolean(next.auth.required) !== Boolean(relay.auth)) {
+      log.warn(`reload: auth.required is now ${next.auth.required} but this hub ` +
+        `is running with it ${relay.auth ? 'on' : 'off'}; that one takes a restart.`);
+    }
+    const portMoved = !ephemeralPort && Number(next.listen.port) !== boundPort;
+    if (portMoved || next.listen.host !== host ||
+        Number(next.maxPlayers) !== relay.maxPlayers) {
+      log.warn('reload: listen.host, listen.port and maxPlayers were not ' +
+        're-applied -- they cannot change under a live listener. This hub is ' +
+        `still ${boundHost}:${boundPort} for ${relay.maxPlayers} players ` +
+        'until it is restarted.');
+    }
+    return true;
+  }
+
   // ------------------------------------------------------------- shutdown
+
+  /*
+   * The caller's own teardown -- today the CLI's UPnP unmap, which has to
+   * finish before the process goes or the port stays forwarded on the router
+   * after every Ctrl-C (plan §3.7). Awaited, at most once, and bounded: a
+   * router that does not answer must not be able to wedge shutdown.
+   */
+  function runShutdownHook() {
+    if (!onShutdown) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      // Not unref'd: this is the one timer whose whole job is to be waited on.
+      // An unref'd one would let the process exit out from under the hook,
+      // which is the bug this hook exists to fix.
+      const timer = setTimeout(() => {
+        log.warn(`shutdown hook did not finish within ${SHUTDOWN_HOOK_MS}ms; ` +
+          'stopping anyway.');
+        finish();
+      }, SHUTDOWN_HOOK_MS);
+
+      try {
+        Promise.resolve(onShutdown()).then(finish, (err) => {
+          log.error(`shutdown hook failed: ` +
+            `${safe(err && err.message ? err.message : err)}`);
+          finish();
+        });
+      } catch (err) {
+        log.error(`shutdown hook failed: ${safe(err && err.message ? err.message : err)}`);
+        finish();
+      }
+    });
+  }
 
   function close() {
     if (closePromise) return closePromise;
@@ -411,7 +654,13 @@ function start(options = {}) {
     // losing it on a clean shutdown would hand a spent invite back out.
     flushCredentials();
 
-    closePromise = new Promise((resolve) => {
+    // Started here rather than after the sockets are gone: undoing a port
+    // mapping and saying goodbye to the players are independent, and shutdown
+    // should cost max(the two budgets), not their sum. Nothing below depends
+    // on it, and it cannot reject.
+    const hookDone = runShutdownHook();
+
+    const socketsDone = new Promise((resolve) => {
       let forced = null;
       let settled = false;
       const finish = () => {
@@ -437,6 +686,8 @@ function start(options = {}) {
       }, FORCE_CLOSE_MS);
       forced.unref();
     });
+
+    closePromise = Promise.all([socketsDone, hookDone]).then(() => undefined);
     return closePromise;
   }
 
@@ -448,6 +699,19 @@ function start(options = {}) {
     log.info('shutting down');
     const exit = () => process.exit(0);
     close().then(exit, exit);
+  };
+
+  /*
+   * SIGHUP is the conventional "re-read your config" signal, and it is the
+   * only one a host can send while friends are connected without ending their
+   * session. Guarded by the same handleSignals opt-in as the rest: a suite
+   * running three hubs in one process must not have one of them answering for
+   * the others.
+   */
+  const onHangup = () => {
+    if (stopping) return;
+    log.info('SIGHUP: re-reading the config');
+    reload();
   };
 
   /*
@@ -470,6 +734,7 @@ function start(options = {}) {
     if (!handleSignals) return;
     process.on('SIGINT', onSignal);
     process.on('SIGTERM', onSignal);
+    process.on('SIGHUP', onHangup);
     process.on('uncaughtException', onUncaught);
     process.on('unhandledRejection', onUnhandled);
   }
@@ -478,6 +743,7 @@ function start(options = {}) {
     if (!handleSignals) return;
     process.removeListener('SIGINT', onSignal);
     process.removeListener('SIGTERM', onSignal);
+    process.removeListener('SIGHUP', onHangup);
     process.removeListener('uncaughtException', onUncaught);
     process.removeListener('unhandledRejection', onUnhandled);
   }
@@ -504,8 +770,8 @@ function start(options = {}) {
       server.on('error', (err) => log.error(`listener error: ${safe(err.message)}`));
 
       const address = server.address();
-      const boundHost = address && address.address ? address.address : host;
-      const boundPort = address && address.port ? address.port : port;
+      boundHost = address && address.address ? address.address : host;
+      boundPort = address && address.port ? address.port : port;
 
       attach();
       log.info(`RBY MMO hub listening on ${boundHost}:${boundPort} ` +
@@ -518,6 +784,9 @@ function start(options = {}) {
         relay,
         limits,
         close,
+        // The same thing SIGHUP does, for a caller that has no signal to send
+        // (an embedder, a suite). Returns whether the file was re-read.
+        reload,
         // The shape the CLI's `status` verb prints. Derived on every call so
         // it can never be a stale copy of the thing it is describing.
         stats() {

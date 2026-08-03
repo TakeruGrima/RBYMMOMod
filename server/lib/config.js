@@ -33,11 +33,15 @@
  * a config never pulls in crypto, and generating a credential is the CLI's
  * job, not the store's.
  *
- * No dependencies: node:fs and node:path only.
+ * No dependencies: node:fs, node:path and node:crypto only. node:crypto is
+ * here for one thing -- the unpredictable suffix on the temp file save()
+ * writes through -- not for anything cryptographic; minting and verifying
+ * join codes remains auth.js's job.
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const CONFIG_FILENAME = 'config.json';
 // The container mounts its named volume here (plan §3.4/§3.5). Used only when
@@ -662,23 +666,70 @@ function load(options = {}) {
  * crash mid-write then costs the tmp file and nothing else: the real config
  * is either the old one or the new one, never half of either, which matters
  * because the file holds the join codes that are the hub's only door.
+ *
+ * The tmp file is *created* rather than written to, and the difference is the
+ * whole point:
+ *
+ *  - A fixed `<file>.tmp` is a name an attacker can occupy first. Anyone able
+ *    to create a file in the config directory -- a shared /srv/hub, a
+ *    world-writable cwd, a second service account -- could point that name at
+ *    a file of their own and receive every join code, because writeFileSync
+ *    follows symlinks. O_NOFOLLOW refuses the link, O_EXCL refuses any
+ *    pre-existing file at all, and both refuse *before* a byte of plaintext
+ *    exists on disk. A leftover tmp is a hard error now, not a target.
+ *  - The mode is applied at creation. writeFileSync's `mode` option is
+ *    ignored when the file already exists, so the old code repaired the mode
+ *    with a chmod that ran only after the plaintext was already readable.
+ *  - The suffix carries the pid and six random bytes because two writers are
+ *    now real: server.js persists credential use-counts from the running hub
+ *    while a `rby-mmo-hub invite` process may be saving the same file. One
+ *    shared tmp name would have them clobber each other.
+ *
+ * Windows has no O_NOFOLLOW (fs.constants.O_NOFOLLOW is undefined there, and
+ * OR-ing it in would produce NaN flags), so on win32 the flag is dropped and
+ * the guarantee rests on O_EXCL plus the unpredictable name -- the same place
+ * checkPermissions() already stops, since POSIX mode bits do not describe a
+ * Windows ACL either.
  */
 function save(file, config) {
   const directory = path.dirname(file);
   fs.mkdirSync(directory, { recursive: true });
 
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   const text = `${JSON.stringify(config, null, 2)}\n`;
 
+  let flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL;
+  if (process.platform !== 'win32') flags |= fs.constants.O_NOFOLLOW;
+
+  let fd;
   try {
-    fs.writeFileSync(temporary, text, { mode: 0o600 });
-    // writeFileSync only applies `mode` when it creates the file, so a
-    // leftover tmp from a previous crash could carry a looser mode forward.
+    fd = fs.openSync(temporary, flags, 0o600);
+  } catch (err) {
+    // Nothing was created, so there is nothing to clean up -- and in
+    // particular nothing of somebody else's to unlink.
+    if (err && (err.code === 'EEXIST' || err.code === 'ELOOP')) {
+      err.message =
+        `${err.message} -- refused to write through the existing ${temporary}; ` +
+        'delete it if it is a leftover of yours';
+    }
+    throw err;
+  }
+
+  try {
+    try {
+      fs.writeFileSync(fd, text);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // The open mode is masked by the process umask, so a host running with
+    // umask 0200 would otherwise end up at 0400. Now that the file is
+    // provably ours and provably not a link, saying 0600 exactly is safe.
     if (process.platform !== 'win32') fs.chmodSync(temporary, 0o600);
+    // rename is an inode operation: the target inherits the mode the fd was
+    // created with, so no chmod on `file` is needed (and none should run
+    // against a path that is only ours after the rename lands).
     fs.renameSync(temporary, file);
-    // rename keeps the tmp file's mode, but an existing target replaced by it
-    // may have had its own; re-assert rather than assume.
-    if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
   } catch (err) {
     try {
       fs.unlinkSync(temporary);
@@ -721,10 +772,15 @@ function checkPermissions(file) {
 }
 
 /**
- * A copy safe to print. Join codes are masked to their first group, which is
- * enough for a host to tell two credentials apart in a `status` listing and
- * not enough for anyone reading over their shoulder -- or reading the
- * scrollback of a shared terminal, which is where these things actually leak.
+ * A copy safe to print. Join codes are masked whole -- every group, no
+ * prefix -- because the outputs this feeds (`status`, `config list`,
+ * `invite list` without --reveal) are the ones documented as safe to
+ * screen-share and safe to paste into a thread when asking for help.
+ *
+ * Telling two credentials apart is the `id` column's job. It is printed
+ * beside the masked code in the same table, is not a secret, and is what
+ * `revoke <id>` already takes -- so showing a quarter of the join code bought
+ * nothing that id does not, at the price of 20 of its 80 bits.
  *
  * The mask is spelled out locally rather than imported from auth.js on
  * purpose; see the header note on keeping that dependency one-directional.
@@ -747,15 +803,13 @@ function redact(config) {
   return copy;
 }
 
+// Deliberately independent of its argument: the printed shape is the same
+// ****-****-****-**** whether the secret is well formed, malformed or absent,
+// so the mask itself never becomes a side channel about what it hides.
 function maskSecret(secret) {
   const groups = 4;
   const groupLen = 4;
-  const hidden = new Array(groups - 1).fill('*'.repeat(groupLen));
-
-  if (typeof secret !== 'string') return ['*'.repeat(groupLen), ...hidden].join('-');
-  const bare = secret.toUpperCase().replace(/[^0-9A-Z]/g, '');
-  const head = bare.slice(0, groupLen) || '*'.repeat(groupLen);
-  return [head.padEnd(groupLen, '*'), ...hidden].join('-');
+  return new Array(groups).fill('*'.repeat(groupLen)).join('-');
 }
 
 module.exports = {

@@ -8,6 +8,13 @@
 # fatal.
 tests/rby_mmo_test.lua
 
+# Test-fixture data, not mod content: the shared HMAC vectors that pin the Lua
+# client's auth answer against the Node hub's. Only tests/rby_mmo_test.lua
+# loads it, and that file is ignored one line above -- shipping the vectors
+# without the suite that reads them puts a table nothing in the archive can
+# open in front of a player.
+tests/fixtures/hmac_vectors.lua
+
 # The end-to-end drivers reach engine test infrastructure
 # (tests/drivers/util.lua) and only mean anything inside a checkout.
 tests/drivers/mmo_util.lua
@@ -43,10 +50,13 @@ skills-lock.json
 # cannot be packed in the first place. The same is true of the .env and
 # .github entries below, which are kept only as documentation of intent.
 #
-# server/hub.test.js is likewise left shipping, unchanged from before: it is
-# self-contained node that drives the hub over real sockets, so it is a way a
-# host can check their own copy works. It requires nothing from the engine,
-# which is what earns `tests/rby_mmo_test.lua` its entry above and not this.
+# server/*.test.js is likewise left shipping, unchanged from before: hub.test.js
+# drives the hub over real sockets, and auth/cli/config/limits/server.test.js
+# cover the modules beside them. Every one of them requires only ./lib/* and
+# node core -- nothing from the engine, which is what earns
+# `tests/rby_mmo_test.lua` its entry above and not these. `npm test` is
+# `node --test`, which discovers all six, so shipping them is what makes
+# "check the copy you just unpacked" a command a host can actually run.
 
 # tools/play.sh and tools/env.sh assume the engine checkout layout, and
 # .env is machine-specific -- neither belongs in a distributed archive.

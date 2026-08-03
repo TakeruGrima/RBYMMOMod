@@ -21,6 +21,12 @@ local Sessions = need("Sessions")
 local World = need("World")
 local HostServer = need("HostServer")
 local Chars = need("Chars")
+-- Only for its entropy pool: this file mints join codes and Hub mints
+-- challenge nonces, and both have to come off one pool (see Hub.lua's
+-- "the entropy pool" header for why it lives there and what it is worth).
+-- Hub is already in this file's dependency graph through HostServer, so
+-- naming it costs nothing.
+local Hub = need("Hub")
 
 local M = {}
 
@@ -190,45 +196,32 @@ end
 -- A fresh code for the host to read out, so nobody has to invent one on a
 -- d-pad.
 --
--- **This is not a cryptographic random source**, and says so for the same
--- reason Hub:newNonce does: there is none reachable from a mod that declares
--- only `network`. LOVE ships no randomBytes, love.math.random is a seeded
--- xorshift, and /dev/urandom would mean a filesystem permission this mod
--- does not have. What this does instead is hash the least predictable sample
--- this process can take -- live heap, where a fresh table landed, wall and
--- CPU clock, and a per-call counter so two codes made in the same
--- millisecond still differ -- and fold the digest into the alphabet. 256 is
--- exactly 8 * 32, so the fold is even and no character is likelier than
--- another.
+-- The code *is* the credential, and the attack on a weak one is offline:
+-- anyone who captures a single mmo.challenge/mmo.auth pair can grind
+-- candidate codes locally against HMAC(code, nonce) at hardware speed, where
+-- none of the hub's connect-rate or per-IP limits apply. So the bytes come
+-- off the session entropy pool -- fed on every fixed step with frame
+-- timings, clock deltas, heap size and the player's own button presses --
+-- and not from one instantaneous sample the way they used to.
 --
--- What that buys: a code that is not derivable from anything on the wire and
--- never repeats within a run. What it does not buy: a full 80 bits against
--- someone who can pin down when this host started and what its heap looked
--- like. A host who wants more than that types their own.
-local codeSerial = 0
-
+-- **It is still not a CSPRNG**, and the honest number is in Hub.lua's pool
+-- header rather than here so there is one copy of it: about 35-45 bits if
+-- something contrives to draw before a single frame has run, and a claimed
+-- 64 -- not the 80 the ABCD-EFGH-JKMN-PQRS format implies -- from a game
+-- that has been playing for more than a moment, which is every game that has
+-- reached this screen. A host who wants better than that types their own.
 function M.newJoinCode()
-  codeSerial = codeSerial + 1
-  local digest = Sha256.bytes(table.concat({
-    tostring(collectgarbage("count")),
-    tostring({}),
-    tostring(os and os.time and os.time() or 0),
-    tostring(os and os.clock and os.clock() or 0),
-    tostring(codeSerial),
-  }, "|"))
-  -- Sha256 answers nil plus a reason rather than raising; the argument above
-  -- is a string, so this guards a future edit rather than a reachable path
-  if type(digest) ~= "string" or #digest < Config.CODE_LEN then
-    mod.log:warn("could not generate a join code -- type one instead from "
-      .. "START > MMO > HOST GAME > JOIN CODE")
+  local code, why = Hub.Entropy.shared:code()
+  -- The pool answers nil plus a reason rather than raising. `why` never
+  -- carries a drawn byte, and the code itself never reaches a log -- here or
+  -- anywhere else -- which is the whole reason this returns it instead of
+  -- reporting it.
+  if type(code) ~= "string" then
+    mod.log:warn("could not generate a join code (%s) -- type one instead "
+      .. "from START > MMO > HOST GAME > JOIN CODE", tostring(why))
     return nil
   end
-  local alphabet, out = Config.CODE_ALPHABET, {}
-  for i = 1, Config.CODE_LEN do
-    local index = digest:byte(i) % #alphabet
-    out[i] = alphabet:sub(index + 1, index + 1)
-  end
-  return table.concat(out)
+  return code
 end
 
 -- Put the player in front of the code screen.
@@ -559,10 +552,14 @@ handlers[Wire.CHALLENGE] = function(game, msg)
   local address = dialled
   local code = M.joinCode(address)
   if not code then
-    -- Nothing to answer with. Hang up first: the hub gives an answer ten
-    -- seconds (Config.AUTH_TIMEOUT) and typing sixteen characters on a d-pad
-    -- is not ten seconds, so holding the socket open only buys the player a
-    -- connection that dies behind the screen they are still typing on.
+    -- Nothing to answer with. Hang up first: a hub gives the whole handshake
+    -- ten seconds (Config.HANDSHAKE_TIMEOUT), measured from when the socket
+    -- landed and not extended for the challenge -- both hosting paths, the
+    -- one in src/Hub.lua and the one in server/lib/limits.js, hold to that
+    -- same budget. Some of it is already spent by the time this arrives, and
+    -- typing sixteen characters on a d-pad is not ten seconds anyway, so
+    -- holding the socket open only buys the player a connection that dies
+    -- behind the screen they are still typing on.
     M.disconnect()
     ui:say("This game needs a\njoin code.", function()
       M.askJoinCode(game, address, address ~= nil)
@@ -675,9 +672,50 @@ end
 
 -- ------- the tick
 
+-- Feeding the entropy pool.
+--
+-- The pool is only worth what goes into it, and the cheapest genuinely
+-- varying material this process can see is right here: how long the last
+-- step took, where the CPU clock stands and how far it moved, and how big
+-- the heap is -- plus love.math.random() in game, which is a seeded xorshift
+-- and worth little on its own but whose position in its own sequence is not
+-- something an outsider knows.
+--
+-- This runs on every fixed step whether or not the player is connected, so
+-- by the time anyone reaches the HOST screen the pool has absorbed thousands
+-- of samples. It therefore obeys the hot-path rule: four numbers written
+-- into a table the pool allocated once, no strings, no garbage. The hashing
+-- happens on the pool's own schedule (one fold per 24 stirs), not here.
+--
+-- Nothing below can raise: every source is looked up before it is called and
+-- a missing one is simply not stirred.
+local lastClock = 0
+local loveRandom = nil
+local loveChecked = false
+
+local function stirEntropy(dt)
+  if not loveChecked then
+    loveChecked = true
+    if type(love) == "table" and type(love.math) == "table"
+       and type(love.math.random) == "function" then
+      loveRandom = love.math.random
+    end
+  end
+  local clock = (os and os.clock) and os.clock() or 0
+  local delta = clock - lastClock
+  lastClock = clock
+  -- The fourth slot is love.math.random() where there is a LOVE to ask, and
+  -- the step-to-step clock delta where there is not (the headless suite):
+  -- the delta is derivable from consecutive clock samples the pool already
+  -- has, so nothing is lost by trading it for the one that is not.
+  Hub.Entropy.shared:stir(dt, clock, collectgarbage("count"),
+    loveRandom and loveRandom() or delta)
+end
+
 local function tick(game, dt)
   ctx.game = game
   dt = dt or 0
+  stirEntropy(dt)
 
   -- The server pumps first. Reading sockets and running the hub is what
   -- fills the host's own loopback inbox, so doing it after the client poll
@@ -794,6 +832,10 @@ function M.install()
   -- nothing to say (these NPCs carry no text), so this adds the interaction
   -- rather than replacing one.
   mod.events:on("world.interacted", function(payload)
+    -- An A-press is a human deciding to press A, which is the least
+    -- predictable timing this process ever sees; it goes into the pool
+    -- before anything else here can return early.
+    stirEntropy(0)
     if not (payload and payload.kind == "npc") then return end
     if not transport:isReady() then return end
     local player = ctx.roster:at(payload.mapId, payload.x, payload.y)

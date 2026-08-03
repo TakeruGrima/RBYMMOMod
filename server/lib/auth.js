@@ -134,8 +134,11 @@ function sign(code, nonce) {
 
 /**
  * A credential admits only while it is un-revoked, unexpired, and under its
- * use budget. An expiry that will not parse counts as expired: a lifetime the
- * hub cannot read is not one to admit on.
+ * use budget. An expiry that will not parse counts as expired, and a use count
+ * that will not read as a number counts as exhausted: a lifetime or a budget
+ * the hub cannot read is not one to admit on. This is the last gate before
+ * admission, so it has no fail-open branch -- every unreadable field resolves
+ * to "not active".
  */
 function isActive(credential, now = Date.now()) {
   if (!credential || typeof credential !== 'object') return false;
@@ -150,8 +153,13 @@ function isActive(credential, now = Date.now()) {
   if (credential.maxUses !== null && credential.maxUses !== undefined) {
     const max = Number(credential.maxUses);
     if (!Number.isFinite(max) || max <= 0) return false;
-    const uses = Number(credential.uses || 0);
-    if (Number.isFinite(uses) && uses >= max) return false;
+    // Absent is zero uses -- that is every credential nobody has spent yet.
+    // Anything else is read as a number and has to survive being one: `|| 0`
+    // on its own would quietly turn NaN back into a fresh, unused credential,
+    // which is the fail-open branch this gate must not have.
+    const uses = credential.uses === undefined || credential.uses === null
+      ? 0 : Number(credential.uses);
+    if (!Number.isFinite(uses) || uses >= max) return false;
   }
 
   return true;

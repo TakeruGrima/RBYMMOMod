@@ -136,21 +136,37 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 #  3. Run `init --yes` first when, and only when, the config is absent -- what
 #     this does. `init` honours RBY_MMO_* (lib/config.js:140-156), so a
 #     compose file's port and player cap end up in the file it writes; its
-#     default is auth.required = true, so it mints a join code and prints it
-#     once, to stdout, where `docker compose logs hub` will show it. The result
-#     is that `docker compose up` on an empty volume produces an authenticated
-#     hub and hands the host the code to give their friends -- and it is not
-#     possible for it to produce an open one by accident. If the host wants an
-#     open LAN hub they must ask for it (RBY_MMO_AUTH_REQUIRED=false), which is
-#     a choice they made rather than a default they inherited.
+#     default is auth.required = true, so it mints a join code. The result is
+#     that `docker compose up` on an empty volume produces an authenticated
+#     hub and hands the host a way to read the code they give their friends --
+#     and it is not possible for it to produce an open one by accident. If the
+#     host wants an open LAN hub they must ask for it
+#     (RBY_MMO_AUTH_REQUIRED=false), which is a choice they made rather than a
+#     default they inherited.
 #
 #     `init` refuses to overwrite an existing config without --force, so the
 #     guard is belt and braces: a restart re-uses the same file and the same
 #     join code.
 #
+# Where the code goes, and why not here.
+#
+# `init` prints the code to stdout, and stdout in a container is the log --
+# the json-file driver writes it to the host's disk, and an orchestrator ships
+# it onward to wherever it collects logs. That is durable, replicated storage
+# for a credential, sitting outside the 0600 config file that exists to hold
+# it, and it is exactly what lib/cli.js:29-34 refuses to do when it keeps join
+# codes away from the logger. So `init`'s output is redirected into
+# /data/join-code.txt (created under `umask 077`, so 0600 before a byte of it
+# exists, on the 0700 volume beside config.json), and the log gets one line
+# saying a code was made and how to read it back.
+#
+# On failure the captured output *is* printed, to stderr, and the file is
+# removed -- a first run that cannot write its config must say why, and the
+# thing it failed to write holds no secret.
+#
 # CMD stays overridable, so every other verb still works:
 #   docker compose exec hub rby-mmo-hub invite
 #   docker run --rm -v rby-mmo-data:/data rby-mmo-hub doctor
 # ---------------------------------------------------------------------------
-ENTRYPOINT ["/sbin/tini", "--", "/bin/sh", "-c", "if [ ! -f \"$RBY_MMO_CONFIG\" ]; then node /app/bin/rby-mmo-hub.js init --yes || exit 1; fi; exec node /app/bin/rby-mmo-hub.js \"$@\"", "rby-mmo-hub"]
+ENTRYPOINT ["/sbin/tini", "--", "/bin/sh", "-c", "if [ ! -f \"$RBY_MMO_CONFIG\" ]; then code=\"$(dirname \"$RBY_MMO_CONFIG\")/join-code.txt\"; (umask 077; : > \"$code\") || { echo \"cannot write $code -- is /data writable?\" >&2; exit 1; }; if node /app/bin/rby-mmo-hub.js init --yes > \"$code\" 2>&1; then chmod 0600 \"$code\"; echo \"first run: a join code was generated, and is deliberately not in this log.\"; echo \"  read it:  docker compose exec hub rby-mmo-hub invite list --reveal\"; echo \"  or:       docker compose exec hub cat $code\"; else cat \"$code\" >&2; rm -f \"$code\"; exit 1; fi; fi; exec node /app/bin/rby-mmo-hub.js \"$@\"", "rby-mmo-hub"]
 CMD ["start"]

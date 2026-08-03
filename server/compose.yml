@@ -2,7 +2,7 @@
 #
 #   cd server/
 #   docker compose up -d          # build, start, and mint a join code
-#   docker compose logs hub       # <- your join code is printed here, once
+#   docker compose exec hub rby-mmo-hub invite list --reveal   # <- your code
 #   docker compose exec hub rby-mmo-hub invite    # another code, for a friend
 #   docker compose exec hub rby-mmo-hub doctor    # what can reach you, and how
 #   docker compose down           # stop; the volume, and the join code, remain
@@ -12,6 +12,13 @@
 # *requiring a join code* -- it is not possible to publish an open world by
 # forgetting a step. Every later start re-uses the same config and the same
 # code.
+#
+# The code is **not** in `docker compose logs`, and that is deliberate: the log
+# is a file on this machine's disk and, under an orchestrator, a copy in
+# whatever collects logs. `init`'s output goes to /data/join-code.txt at mode
+# 0600 instead, beside config.json on the volume, and the log gets one line
+# pointing at it. Read it back with the `invite list --reveal` above, or with
+# `docker compose exec hub cat /data/join-code.txt`.
 
 services:
   hub:
@@ -57,8 +64,10 @@ services:
     # --- persistence -------------------------------------------------------
     volumes:
       # config.json -- the join code, the bans, the allowlist -- lives here and
-      # nowhere else. Losing this volume loses the join code your friends have
-      # already saved.
+      # nowhere else, together with the join-code.txt the first run writes
+      # beside it. Losing this volume loses the join code your friends have
+      # already saved. Both files are 0600 inside a 0700 directory; anything
+      # that copies this volume off the machine is copying a credential.
       - rby-mmo-data:/data
 
     # --- sandbox -----------------------------------------------------------

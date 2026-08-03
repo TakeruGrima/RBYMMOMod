@@ -58,8 +58,37 @@ const FALLBACK_VERSION = '0.0.0-dev';
 
 // Flags that are switches, so `--yes start` does not eat `start` as a value.
 const SWITCHES = new Set([
-  'yes', 'force', 'reveal', 'clear', 'help', 'version', 'quiet',
+  'yes', 'force', 'reveal', 'clear', 'help', 'version', 'quiet', 'insecureConfig',
 ]);
+
+/*
+ * How long `start` will wait for the router to acknowledge the removal of its
+ * port mapping before giving up and shutting down anyway. SSDP discovery plus
+ * a SOAP POST is a real network round trip, and a router that has gone away
+ * (or gone to sleep) must never be the reason a host cannot stop their hub:
+ * an unremoved mapping expires with its lease, a wedged shutdown does not
+ * expire at all.
+ *
+ * Deliberately *inside* server.js's own SHUTDOWN_HOOK_MS (2000). That one is
+ * the real ceiling on the Ctrl-C path -- close() abandons the hook when it
+ * elapses -- so a longer budget here would only mean the host never gets told
+ * why the mapping is still up.
+ */
+const UNMAP_TIMEOUT_MS = 1500;
+
+const TIMED_OUT = Symbol('timed out');
+
+function withDeadline(promise, ms) {
+  let timer = null;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+    // Never a reason for the process to stay up on its own account.
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise), deadline])
+    .then((value) => { if (timer) clearTimeout(timer); return value; },
+      (err) => { if (timer) clearTimeout(timer); throw err; });
+}
 
 // --------------------------------------------------------------- arguments
 
@@ -303,10 +332,19 @@ const HELP = {
   ],
   start: [
     `Usage: ${PROGRAM} start [--port N] [--host ADDR] [--max N] [...]`,
+    '                        [--insecure-config]',
     '',
     'Loads the configuration, prints who can reach this machine, and runs the',
     'hub until it is stopped. Any config path may be overridden for this run',
     'with a flag -- `--limits.maxPending 12` works as well as `--max 8`.',
+    '',
+    'The config file holds every join code in plaintext, so `start` refuses to',
+    'run when it is readable by the group or by everyone else on the machine.',
+    'The fix it prints is `chmod 600 <file>`.',
+    '',
+    '  --insecure-config   start anyway on a group- or world-readable config.',
+    '                      For a host who genuinely has an unusual setup; it',
+    '                      prints exactly what is being accepted.',
   ],
   status: [
     `Usage: ${PROGRAM} status`,
@@ -624,7 +662,44 @@ async function verbStart(ctx) {
   if (!loaded.exists) {
     ctx.warn(`No configuration at ${ctx.file}; running on defaults. \`${PROGRAM} init\` writes one.`);
   }
-  if (split.permission) ctx.warn(`warning: ${split.permission}`);
+  /*
+   * A group- or world-readable config file stops the hub, it does not merely
+   * annoy it.
+   *
+   * This file is the hub's entire door: every join code is in it, in plaintext,
+   * and anyone on this machine who can read it can walk in. Warning and
+   * starting anyway would leave the exposure in place for as long as the hub
+   * runs -- which is the whole time it matters. `doctor` already calls this a
+   * [fail], the plan (§3.5) says the CLI refuses, and server/Dockerfile leans on
+   * that promise as the reason /data may be 0700; all three now agree.
+   *
+   * The escape hatch is deliberately spelled for what it is rather than
+   * `--force`: a host who types it is not forcing a step through, they are
+   * accepting an insecure config file.
+   */
+  if (split.permission) {
+    if (ctx.flags.insecureConfig !== true) {
+      ctx.warn('');
+      ctx.warn(`Refusing to start: ${split.permission}`);
+      ctx.warn('');
+      ctx.warn(`      chmod 600 ${loaded.path}`);
+      ctx.warn('');
+      ctx.warn(`  then run \`${PROGRAM} start\` again. Until then, anyone else on this`);
+      ctx.warn('  machine can read a join code out of that file and walk in.');
+      ctx.warn('');
+      ctx.warn('  If this machine genuinely needs a looser mode, start with');
+      ctx.warn('  --insecure-config and the hub will run on it.');
+      ctx.warn('');
+      return ERROR;
+    }
+    ctx.warn('');
+    ctx.warn(`warning: --insecure-config. ${split.permission}`);
+    ctx.warn('         Starting anyway, on your say-so. What you are accepting: every');
+    ctx.warn('         join code in that file is readable by other users of this');
+    ctx.warn('         machine, and anyone who reads one can join this hub as a player.');
+    ctx.warn(`         \`chmod 600 ${loaded.path}\` ends that at any time.`);
+    ctx.warn('');
+  }
 
   const active = auth.activeCredentials(cfg.auth.credentials);
   if (cfg.auth.required && active.length === 0) {
@@ -673,19 +748,50 @@ async function verbStart(ctx) {
     ctx.say('');
   }
 
-  // Best effort, and never in the way of shutdown: the lease means a mapping
-  // this fails to remove closes itself anyway.
-  const dropMapping = () => {
-    if (!mapping) return;
+  /*
+   * Give the port back before the process goes.
+   *
+   * This used to be registered on SIGINT/SIGTERM here and fired
+   * fire-and-forget, which never actually worked: removeMapping needs an SSDP
+   * discovery *and* a SOAP POST, while server.js's own signal handler calls
+   * process.exit(0) the moment close() settles -- so the removal was torn down
+   * mid-flight, and process.exit does not fire 'beforeExit' either, so that
+   * fallback never ran. The port stayed forwarded on the router after every
+   * Ctrl-C and every `docker stop`, which is exactly the residual exposure the
+   * removal exists to bound (plan §3.7) and exactly what `upnp enable` promises
+   * does not happen.
+   *
+   * So it is handed to server.js's `onShutdown` hook instead: close() awaits it
+   * before resolving, and the signal handler exits only after close() resolves.
+   * One place, awaited, ahead of the exit.
+   *
+   * Bounded, and never fatal: an unreachable router costs a line of output and
+   * the mapping's own lease cleans up after it. A hub that will not stop would
+   * be the worse bug.
+   */
+  let unmapped = false;
+  const dropMapping = async () => {
+    if (unmapped || !mapping) return;
+    unmapped = true; // once, whichever path gets here first
     const { port, device } = mapping;
-    mapping = null; // once, even if both a signal and beforeExit fire
-    Promise.resolve(upnp.removeMapping({ port, device })).catch(() => {});
+    mapping = null;
+
+    ctx.say(`Removing the UPnP mapping for TCP ${port}...`);
+    try {
+      const result = await withDeadline(upnp.removeMapping({ port, device }), UNMAP_TIMEOUT_MS);
+      if (result === TIMED_OUT) {
+        ctx.warn(`  the router did not answer within ${UNMAP_TIMEOUT_MS}ms; stopping ` +
+          'anyway. A leased mapping expires on its own; `upnp disable` removes a permanent one.');
+      } else if (result && result.ok) {
+        ctx.say(result.alreadyGone ? '  there was no mapping left to remove' : '  removed');
+      } else {
+        ctx.warn(`  could not remove it: ${result && result.error ? result.error : 'unknown error'}`);
+        ctx.warn(`  \`${PROGRAM} upnp disable\` tries again; a leased mapping expires on its own.`);
+      }
+    } catch (err) {
+      ctx.warn(`  could not remove it: ${err && err.message ? err.message : err}`);
+    }
   };
-  if (mapping) {
-    process.once('SIGINT', dropMapping);
-    process.once('SIGTERM', dropMapping);
-    process.once('beforeExit', dropMapping);
-  }
 
   let server;
   try {
@@ -704,7 +810,15 @@ async function verbStart(ctx) {
 
   let handle;
   try {
-    handle = await server.start({ config: cfg, log: logger, configPath: ctx.file });
+    handle = await server.start({
+      config: cfg,
+      log: logger,
+      configPath: ctx.file,
+      // Awaited by close(), bounded by server.js's own shutdown budget on top
+      // of this one's. See dropMapping above for why it cannot live on a
+      // signal handler here.
+      onShutdown: dropMapping,
+    });
   } catch (err) {
     ctx.warn(`The hub failed to start: ${err && err.message ? err.message : err}`);
     return ERROR;
@@ -730,7 +844,9 @@ async function verbStart(ctx) {
     return ERROR;
   }
 
-  dropMapping();
+  // Belt and braces for the path that never goes through close() -- a hub that
+  // ended on its own. A no-op when onShutdown already ran.
+  await dropMapping();
   return OK;
 }
 

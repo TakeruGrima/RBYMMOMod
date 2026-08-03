@@ -71,13 +71,18 @@ M.TIMEOUT = 30
 -- connections lock everyone out of a 4-player game, so un-greeted peers get
 -- their own, larger allowance and a deadline to introduce themselves.
 M.MAX_PENDING = 8
-M.HELLO_TIMEOUT = 10
--- ...and the same deal for the challenge->answer leg: a peer that greeted
--- us but never answers the nonce is still holding a pending slot, so it
--- gets its own deadline.  Same 10s as HELLO_TIMEOUT -- the answer is one
--- HMAC over 32 bytes, so anything slower than saying hello was is a stall,
--- not a slow machine.
-M.AUTH_TIMEOUT = 10
+-- **Ten seconds for the whole handshake, measured from when the connection
+-- landed** -- hello, and on a coded hub the challenge and its answer too.
+-- Not ten for hello plus another ten for the answer: server/lib/limits.js
+-- anchors one 10s budget at register and never extends it for the challenge
+-- leg, and the same client dialling the two hosting paths must not get two
+-- different deadlines.  Ten is generous for the work involved -- a real
+-- client sends hello the instant its socket opens and answers a challenge
+-- with one HMAC over 32 bytes, which is milliseconds -- and a client that
+-- has to stop and ask its player to type a code hangs up first rather than
+-- holding the socket open (src/Client.lua's mmo.challenge handler), so
+-- nothing legitimate is racing this.
+M.HANDSHAKE_TIMEOUT = 10
 
 -- Join codes.  Kept in lockstep with server/lib/auth.js -- both ends derive
 -- the HMAC key from the same normalised bytes, so a drift here locks

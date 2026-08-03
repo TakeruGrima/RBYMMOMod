@@ -26,6 +26,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const Module = require('node:module');
 const { Readable } = require('node:stream');
 const { spawn } = require('node:child_process');
 
@@ -132,6 +133,54 @@ function countMatches(haystack, re) {
 
 function same(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// ------------------------------------------------- stubs for the start verb
+//
+// `start` is the one verb that binds a socket and talks to a router, and
+// neither belongs in this suite: server.js has its own, and a test that
+// contacted a real router would pass or fail on whose desk it ran. So both
+// are replaced at their seams -- lib/server.js through require.cache (cli.js
+// requires it lazily, inside the verb, so the swap is seen), and upnp.js by
+// overwriting the two functions cli.js calls on the module object it already
+// holds. Nothing here opens a port or sends a packet, and `upnp enable` is
+// never invoked.
+
+const SERVER_PATH = require.resolve('./lib/server.js');
+const upnpModule = require('./lib/upnp.js');
+
+function stubServer(exports) {
+  const previous = require.cache[SERVER_PATH];
+  const stub = new Module(SERVER_PATH, null);
+  stub.filename = SERVER_PATH;
+  stub.loaded = true;
+  stub.exports = exports;
+  require.cache[SERVER_PATH] = stub;
+  return () => {
+    if (previous) require.cache[SERVER_PATH] = previous;
+    else delete require.cache[SERVER_PATH];
+  };
+}
+
+function stubUpnp(patch) {
+  const previous = {};
+  for (const [key, value] of Object.entries(patch)) {
+    previous[key] = upnpModule[key];
+    upnpModule[key] = value;
+  }
+  return () => {
+    for (const [key, value] of Object.entries(previous)) upnpModule[key] = value;
+  };
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function waitFor(predicate, label, ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out after ${ms}ms waiting for: ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 function spawnCli(args, opts = {}) {
@@ -437,6 +486,195 @@ async function banAllowScenario() {
 }
 
 // =====================================================================
+// start: it refuses an exposed config file, and it hands the UPnP unmap
+// to server.js's shutdown hook rather than racing a signal handler
+// =====================================================================
+
+async function startRefusesExposedConfigScenario() {
+  if (process.platform === 'win32') {
+    console.log('  (skipped: file modes, and so this refusal, are a no-op on win32)');
+    return;
+  }
+
+  const dir = scratchDir('start-permissions');
+  const file = path.join(dir, 'config.json');
+  await runCli(['init', '--yes', '--config', file], { cwd: dir });
+
+  // A stub hub, so "did it start" is answerable without binding anything.
+  const starts = [];
+  const restoreServer = stubServer({
+    async start(options) {
+      starts.push(options);
+      return { closed: Promise.resolve() };
+    },
+  });
+
+  try {
+    // --- 0600: the refusal must not become a false positive that stops every
+    //     host from ever starting a hub
+    ok(fileMode(file) === 0o600, 'a freshly initialised config is 0600');
+    const healthy = await runCli(['start', '--config', file], { cwd: dir });
+    ok(healthy.code === cli.OK, 'start on a 0600 config runs the hub');
+    ok(starts.length === 1, 'and really reached server.start()');
+    ok(!/Refusing to start/.test(healthy.stderr), 'with no refusal in sight');
+
+    // --- 0644: refuses, and the message is actionable on its own
+    fs.chmodSync(file, 0o644);
+    const refused = await runCli(['start', '--config', file], { cwd: dir });
+    ok(refused.code === cli.ERROR,
+      'start on a group/world-readable config exits with the runtime error code');
+    ok(starts.length === 1, 'and never reaches server.start() -- it refuses, it does not warn');
+    ok(/Refusing to start/.test(refused.stderr), 'the refusal says so in as many words');
+    ok(refused.stderr.includes(file), 'the message names the config file');
+    ok(/\b644\b/.test(refused.stderr), 'and the mode it actually found');
+    ok(refused.stderr.includes(`chmod 600 ${file}`),
+      'and gives the exact command that fixes it');
+    ok(/--insecure-config/.test(refused.stderr), 'and names the escape hatch');
+
+    // --- the escape hatch: starts anyway, having said what is being accepted
+    const forced = await runCli(['start', '--config', file, '--insecure-config'], { cwd: dir });
+    ok(forced.code === cli.OK, '--insecure-config starts anyway');
+    ok(starts.length === 2, 'and really does reach server.start() that time');
+    ok(/--insecure-config/.test(forced.stderr), 'the run says which flag it is honouring');
+    ok(/accepting/i.test(forced.stderr) && /readable by/i.test(forced.stderr),
+      'and spells out what the host is accepting: other users can read the file');
+    ok(/join code/i.test(forced.stderr),
+      'naming the thing actually at risk -- the join codes in it');
+
+    fs.chmodSync(file, 0o600);
+  } finally {
+    restoreServer();
+  }
+}
+
+async function startUnmapsThroughOnShutdownScenario() {
+  const dir = scratchDir('start-upnp');
+  const file = path.join(dir, 'config.json');
+  await runCli(['init', '--yes', '--config', file], { cwd: dir });
+  // Written straight into the config, not through `upnp enable` -- enabling it
+  // for real would send SSDP to whatever is on this network.
+  const enabled = await runCli(
+    ['config', 'set', 'network.upnp.enabled', 'true', '--config', file], { cwd: dir });
+  ok(enabled.code === cli.OK, 'UPnP can be turned on in the config without touching a router');
+
+  const MAPPED_PORT = readConfigFile(file).listen.port;
+  const DEVICE = { router: 'http://192.0.2.1:5000/', stub: true };
+
+  let removeCalls = 0;
+  let removeArgs = null;
+  let releaseRemove;
+  const routerAnswered = new Promise((resolve) => { releaseRemove = resolve; });
+
+  const restoreUpnp = stubUpnp({
+    async addMapping({ port }) {
+      return {
+        ok: true,
+        port,
+        internalAddress: '192.0.2.55',
+        leaseSeconds: 3600,
+        permanent: false,
+        device: DEVICE,
+      };
+    },
+    async removeMapping(args) {
+      removeCalls += 1;
+      removeArgs = args;
+      await routerAnswered; // the SOAP round trip, held open on purpose
+      return { ok: true, port: args.port, alreadyGone: false, device: DEVICE };
+    },
+  });
+
+  let started = null;
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const restoreServer = stubServer({
+    async start(options) {
+      started = options;
+      return { closed };
+    },
+  });
+
+  try {
+    const running = runCli(['start', '--config', file], { cwd: dir });
+    await waitFor(() => started, 'the CLI to call server.start()');
+
+    ok(typeof started.onShutdown === 'function',
+      'the UPnP unmap is handed to server.start() as onShutdown, not hung off a signal');
+    ok(started.configPath === file, 'and the rest of the start options still go through');
+
+    // Drive the hook the way close() will, and prove it is awaitable: the
+    // whole point of the fix is that shutdown does not run ahead of the SOAP
+    // call the way a fire-and-forget signal handler did.
+    let hookSettled = false;
+    const hook = Promise.resolve(started.onShutdown()).then(() => { hookSettled = true; });
+
+    await tick();
+    ok(removeCalls === 1, 'calling the hook removes the mapping');
+    ok(removeArgs && removeArgs.port === MAPPED_PORT,
+      'for the port the hub actually forwarded');
+    ok(removeArgs && removeArgs.device === DEVICE,
+      'against the device discovered at start, so it is not rediscovered from scratch');
+
+    await tick();
+    await tick();
+    ok(hookSettled === false,
+      'and the hook is still pending while the router has not answered -- close() has ' +
+      'something real to await');
+
+    releaseRemove();
+    await withTimeout(hook, 5000, 'the onShutdown hook to settle');
+    ok(hookSettled === true, 'it resolves once the router has answered');
+
+    resolveClosed();
+    const result = await withTimeout(running, 5000, 'start to return after the hub closed');
+    ok(result.code === cli.OK, 'and the run finishes cleanly');
+    ok(removeCalls === 1,
+      'the mapping is removed exactly once, even though the run also drops it on the way out');
+    ok(/Removing the UPnP mapping/.test(result.stdout), 'the removal is reported to the host');
+  } finally {
+    restoreServer();
+    restoreUpnp();
+    releaseRemove();
+  }
+}
+
+async function startSurvivesAnUnreachableRouterScenario() {
+  const dir = scratchDir('start-upnp-dead-router');
+  const file = path.join(dir, 'config.json');
+  await runCli(['init', '--yes', '--config', file], { cwd: dir });
+  await runCli(['config', 'set', 'network.upnp.enabled', 'true', '--config', file], { cwd: dir });
+
+  const restoreUpnp = stubUpnp({
+    async addMapping({ port }) {
+      return { ok: true, port, internalAddress: '192.0.2.55', leaseSeconds: 3600, device: {} };
+    },
+    async removeMapping() {
+      return { ok: false, error: 'no router answered' };
+    },
+  });
+
+  let started = null;
+  const restoreServer = stubServer({
+    async start(options) {
+      started = options;
+      return { closed: Promise.resolve() };
+    },
+  });
+
+  try {
+    const result = await withTimeout(
+      runCli(['start', '--config', file], { cwd: dir }), 5000, 'start with a dead router');
+    ok(result.code === cli.OK, 'a router that refuses the removal does not fail the shutdown');
+    ok(!!started && typeof started.onShutdown === 'function',
+      'the hook is wired even when the router is unreachable');
+    ok(/could not remove it/.test(result.stderr), 'and the host is told the mapping is still up');
+  } finally {
+    restoreServer();
+    restoreUpnp();
+  }
+}
+
+// =====================================================================
 // doctor
 // =====================================================================
 
@@ -507,6 +745,9 @@ async function main() {
     await inviteScenario();
     await revokeScenario();
     await banAllowScenario();
+    await startRefusesExposedConfigScenario();
+    await startUnmapsThroughOnShutdownScenario();
+    await startSurvivesAnUnreachableRouterScenario();
     await doctorScenario();
     await exitCodesScenario();
     await spawnExitCodeScenario();

@@ -719,7 +719,7 @@ eq(idleHub.players, 2, "both became players")
 eq(idleHub:isFull(), true, "which is what fills the game")
 
 -- ...and the silent one is reaped once its welcome runs out
-idleHub:update(Config.HELLO_TIMEOUT + 1)
+idleHub:update(Config.HANDSHAKE_TIMEOUT + 1)
 check(idlePeer.closed, "the silent connection is dropped after the deadline")
 check(take(idlePeer, Wire.ERROR) ~= nil, "having been told why")
 eq(idleHub.clients[idle.id], nil, "and is gone from the table")
@@ -845,21 +845,37 @@ codedHub:receive(messyClient,
 check(take(messyPeer, Wire.WELCOME) ~= nil,
       "a code typed lowercase and messily still authenticates")
 
--- an unanswered challenge does not hold a slot forever: HELLO_TIMEOUT alone
--- is not enough once a challenge is outstanding, but HELLO_TIMEOUT plus
--- AUTH_TIMEOUT together reap it, same as the plain hello-timeout case above
+-- An unanswered challenge does not hold a slot forever, and it buys no
+-- extra time either: HANDSHAKE_TIMEOUT is one budget covering hello, the
+-- challenge and the answer, anchored at accept.  That is deliberately the
+-- same budget server/lib/limits.js measures from register, so one client
+-- meets one deadline whichever hosting path it dialled -- the Lua side used
+-- to hand a challenged peer HELLO_TIMEOUT + AUTH_TIMEOUT (twenty seconds)
+-- for the identical exchange.
 local ghostPeer = fakePeer()
 local ghostClient = codedHub:accept(ghostPeer)
 codedHub:receive(ghostClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "GHOST" })
 check(take(ghostPeer, Wire.CHALLENGE) ~= nil, "the ghost connection is challenged")
 
-codedHub:update(Config.HELLO_TIMEOUT + 1)
-check(not ghostPeer.closed, "HELLO_TIMEOUT alone is not enough once challenged")
+codedHub:update(Config.HANDSHAKE_TIMEOUT - 1)
+check(not ghostPeer.closed, "a challenged peer is not reaped inside the budget")
 
-codedHub:update(Config.AUTH_TIMEOUT + 1)
-check(ghostPeer.closed, "but HELLO_TIMEOUT + AUTH_TIMEOUT together reap an unanswered challenge")
+codedHub:update(2)
+check(ghostPeer.closed,
+      "but being challenged does not extend it past HANDSHAKE_TIMEOUT")
 check(take(ghostPeer, Wire.ERROR) ~= nil, "having been told why")
 eq(codedHub.clients[ghostClient.id], nil, "and the slot is freed, not held forever")
+
+-- the same deadline, to the second, on an uncoded hub: a peer that says
+-- nothing and a peer that says hello and stalls are given identical rope
+local budgetHub = Hub.new({ maxPlayers = 2 })
+local silentPeer = fakePeer()
+local silentClient = budgetHub:accept(silentPeer)
+budgetHub:update(Config.HANDSHAKE_TIMEOUT - 1)
+check(not silentPeer.closed, "an ungreeted peer is not reaped inside the budget either")
+budgetHub:update(2)
+check(silentPeer.closed, "and is reaped at the same deadline a challenged one is")
+eq(budgetHub.clients[silentClient.id], nil, "leaving no record behind")
 
 -- MAX_PENDING and greeted-only isFull() behave the same with a code
 -- configured: a challenged-but-unanswered peer is still just pending
@@ -877,6 +893,173 @@ for _ = 1, Config.MAX_PENDING + 6 do
 end
 eq(floodAccepted, Config.MAX_PENDING, "pending connections are capped the same with a code configured")
 eq(floodCodedHub.players, 0, "and none of them are players")
+
+-- ------- the cap holds on a hub that challenges
+--
+-- The regression this exists for: isFull() was checked at hello, but on a
+-- coded hub hello does not charge a seat -- answering the challenge does.
+-- So every peer that greeted while there was room passed a gate nobody
+-- repeated, and then every one of them was seated. A hub built for two
+-- admitted six, and the identical bug was reproduced in server/lib/relay.js
+-- before both were moved to check inside admit(), where the seat is
+-- actually charged.
+
+local CAP = 2
+local capHub = Hub.new({ maxPlayers = CAP, joinCode = JOIN_CODE })
+local rush = {}
+for i = 1, 6 do
+  local peer = fakePeer()
+  local client = capHub:accept(peer)
+  capHub:receive(client, { type = Wire.HELLO, proto = Config.PROTOCOL,
+    name = "RUSH" .. i, map = "PALLET", x = i, y = 1, facing = "down" })
+  local challenge = take(peer, Wire.CHALLENGE)
+  rush[i] = { peer = peer, client = client, nonce = challenge and challenge.nonce }
+end
+
+local challenged = 0
+for _, entry in ipairs(rush) do
+  if entry.nonce then challenged = challenged + 1 end
+end
+eq(challenged, 6, "six peers all greet, and all are challenged, while there is room")
+eq(capHub.players, 0, "none of them is a player on the strength of hello alone")
+
+-- ...and now every one of them answers correctly, before any of them has
+-- been admitted
+local welcomed, refused, saidFull, closed = 0, 0, 0, 0
+for _, entry in ipairs(rush) do
+  capHub:receive(entry.client,
+    { type = Wire.AUTH, response = answer(JOIN_CODE, entry.nonce) })
+  if take(entry.peer, Wire.WELCOME) then welcomed = welcomed + 1 end
+  local err = take(entry.peer, Wire.ERROR)
+  if err then
+    refused = refused + 1
+    if err.message:find("full") and err.message:find(tostring(CAP)) then
+      saidFull = saidFull + 1
+    end
+  end
+  if entry.peer.closed then closed = closed + 1 end
+end
+
+eq(welcomed, CAP, "only as many peers are welcomed as the host bought seats for")
+eq(capHub.players, CAP, "which is what the hub counts too")
+eq(capHub:isFull(), true, "and the hub is full, not oversubscribed")
+eq(refused, 6 - CAP, "the overflow is refused rather than seated")
+eq(saidFull, 6 - CAP, "each with the full-hub sentence, naming the cap")
+eq(closed, 6 - CAP, "and each connection closed")
+
+local lingering = 0
+for _, entry in ipairs(rush) do
+  local record = capHub.clients[entry.client.id]
+  if record and not record.ready then lingering = lingering + 1 end
+end
+eq(lingering, 0, "no refused connection is left holding a pending slot")
+eq(capHub.count, CAP, "so the hub is left holding exactly the connections it seated")
+
+-- ------- the entropy pool behind both credentials
+--
+-- Hub.Entropy backs the nonces above and the join code the HOST screen
+-- offers, and its own header is honest about what it is: material folded in
+-- over a session -- frame timings, clocks, heap size, button presses -- not
+-- a CSPRNG. What is worth pinning is not how it hashes, which is its
+-- business, but the property the one-instantaneous-sample code it replaced
+-- did not have: what is stirred in is what makes two draws differ. Its seed
+-- and clock arguments exist so that can be asserted rather than hoped for.
+
+local Entropy = Hub.Entropy
+
+-- a clock that advances a microsecond per reading, so the draw-time jitter
+-- burst is repeatable here even though it is not on a real machine
+local function steadyClock()
+  local t = 0
+  return function() t = t + 1e-6; return t end
+end
+
+-- what a few seconds of play looks like from the pool's side: one stir per
+-- fixed step, carrying the step's duration, the clock, the heap, and a
+-- fourth number that differs per "machine"
+local function played(pool, steps, flavour)
+  for i = 1, steps do
+    pool:stir(0.0166 + i * 1e-7, i * 1e-3, 900 + (i % 37), flavour + i)
+  end
+  return pool
+end
+
+local COLD = "an identical cold state"
+
+local twinA = played(Entropy.new(COLD, steadyClock()), 200, 1)
+local twinB = played(Entropy.new(COLD, steadyClock()), 200, 1)
+eq(twinA:code(), twinB:code(),
+   "a pool is worth exactly what is stirred into it: identical state plus "
+   .. "identical material draws an identical code, and nothing here pretends "
+   .. "otherwise")
+
+-- ...so two hubs off identically cold pools diverge only because the
+-- material they were fed diverged, which is the whole claim
+local hubA = Hub.new({ maxPlayers = 2, joinCode = JOIN_CODE,
+                       entropy = played(Entropy.new(COLD, steadyClock()), 200, 3) })
+local hubB = Hub.new({ maxPlayers = 2, joinCode = JOIN_CODE,
+                       entropy = played(Entropy.new(COLD, steadyClock()), 200, 8) })
+local collisions, repeats, malformed, nonceSeen = 0, 0, 0, {}
+for _ = 1, 32 do
+  local a, b = hubA:newNonce(), hubB:newNonce()
+  if a == b then collisions = collisions + 1 end
+  for _, nonce in ipairs({ a, b }) do
+    if type(nonce) ~= "string" or #nonce ~= Config.NONCE_HEX
+       or not nonce:match("^[0-9a-f]+$") then
+      malformed = malformed + 1
+    end
+    if nonceSeen[nonce] then repeats = repeats + 1 end
+    nonceSeen[nonce] = true
+  end
+end
+eq(collisions, 0,
+   "two hubs started identically cold and fed different material never "
+   .. "challenge with the same nonce")
+eq(repeats, 0, "and no nonce in 64 draws repeats at all")
+eq(malformed, 0, "every one of them 32 lowercase hex characters")
+
+-- codes drawn from a pool that has been played, on the real clock and the
+-- real jitter burst, are distinct and typeable
+local livePool = played(Entropy.new(), 400, 5)
+local SAMPLE = 256
+local codeSeen, repeatedCode, unusable = {}, 0, 0
+for _ = 1, SAMPLE do
+  local code = livePool:code()
+  -- Wire.code is what the hub will normalise the player's typing through,
+  -- so a drawn code that is not its own normal form is a code that cannot
+  -- be typed back in
+  if type(code) ~= "string" or Wire.code(code) ~= code then
+    unusable = unusable + 1
+  end
+  if codeSeen[code] then repeatedCode = repeatedCode + 1 end
+  codeSeen[code] = true
+end
+eq(unusable, 0, "every drawn code is already-normalised Wire.code input")
+eq(repeatedCode, 0, SAMPLE .. " codes drawn from one pool are all distinct")
+
+-- a code drawn before a single frame has been played is weaker -- the pool
+-- header says by how much -- but it is never malformed
+local coldCode = Entropy.new():code()
+eq(Wire.code(coldCode), coldCode,
+   "a code drawn cold, before anything has been stirred in, is still typeable")
+
+-- the pool answers rather than raising, which is what lets Client.newJoinCode
+-- log a remediation instead of breaking a mod callback
+local tooWide, why = Entropy.new():bytes(64)
+eq(tooWide, nil, "a draw wider than one digest is refused")
+check(type(why) == "string", "with a reason, not a raise")
+
+-- and a hub whose pool cannot answer refuses the peer instead of admitting
+-- it unchallenged
+local brokenHub = Hub.new({ maxPlayers = 2, joinCode = JOIN_CODE,
+                            entropy = { bytes = function() return nil, "no pool" end } })
+local brokenPeer = fakePeer()
+local brokenClient = brokenHub:accept(brokenPeer)
+brokenHub:receive(brokenClient,
+  { type = Wire.HELLO, proto = Config.PROTOCOL, name = "NONONCE" })
+eq(take(brokenPeer, Wire.CHALLENGE), nil, "a hub that cannot draw a nonce does not challenge")
+check(take(brokenPeer, Wire.ERROR) ~= nil, "it refuses, with something to read")
+eq(brokenHub.players, 0, "and never seats a peer it could not challenge")
 
 -- the host occupies a slot like anyone else, so a freed one reopens
 hub:drop(cal)

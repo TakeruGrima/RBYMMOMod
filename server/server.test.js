@@ -96,6 +96,18 @@ class Client {
     throw new Error(`timed out waiting for ${type}; saw ` +
       JSON.stringify(this.inbox.map((m) => m.type)));
   }
+  // For the questions whose answer is "one of these two, and which one is the
+  // point" -- welcome or error, admitted or refused.
+  async expectEither(a, b, timeoutMs = 1500) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const index = this.inbox.findIndex((m) => m.type === a || m.type === b);
+      if (index >= 0) return this.inbox.splice(index, 1)[0];
+      await sleep(10);
+    }
+    throw new Error(`timed out waiting for ${a} or ${b}; saw ` +
+      JSON.stringify(this.inbox.map((m) => m.type)));
+  }
   async expectSilence(type, windowMs = 300) {
     const deadline = Date.now() + windowMs;
     while (Date.now() < deadline) {
@@ -144,6 +156,23 @@ const REVOKED_KEY = 'GHJKMNPQRSTVWXYZ';
 // ------------------------------------------------------------- server helper
 
 const NULL_LOG = { debug() {}, info() {}, warn() {}, error() {} };
+
+// Same shape, but it keeps what it was told. Used where a test has to wait for
+// something the hub does on its own schedule (a SIGHUP arriving) rather than
+// on the test's -- polling the log is how that becomes observable without
+// sleeping on a guess.
+function recordingLog() {
+  const lines = [];
+  const record = (level) => (message) => lines.push(`${level}: ${message}`);
+  return {
+    lines,
+    saw(pattern) { return lines.some((line) => pattern.test(line)); },
+    debug: record('debug'),
+    info: record('info'),
+    warn: record('warn'),
+    error: record('error'),
+  };
+}
 
 function baseConfig(overrides = {}) {
   const cfg = {
@@ -400,6 +429,76 @@ async function capFilledByGreetedPlayersTest() {
   }
 }
 
+// ------- the cap holds on a hub that challenges, not just on an open one
+//
+// The regression this pins: the seat is charged in relay.admit(), but the
+// only cap check used to live in the mmo.hello handler. On an open hub those
+// are the same instant, so nothing showed. On a hub that requires a join
+// code they are not: hello only issues a challenge, and every socket that
+// greets while there is room passes the check -- then *all* of them become
+// players when they answer. With maxPlayers 2 and six sockets greeting before
+// any of them answered, six were welcomed and playerCount reached 6, bounded
+// only by limits.maxPending. The fix moves the check into admit(), which is
+// the one place every player passes through.
+
+async function capHoldsWhenEveryoneGreetsBeforeAnswering() {
+  const handle = await startServer({
+    maxPlayers: 2,
+    // Raised out of the way: this scenario is about the player cap, and six
+    // sockets from one loopback address would otherwise meet the per-IP cap
+    // (perIpCapTest) or the pending cap first.
+    limits: { perIpConnections: 20, maxPending: 16 },
+    auth: {
+      required: true,
+      credentials: [{
+        id: 'primary', label: 'Primary', secret: PRIMARY_CODE,
+        createdAt: new Date().toISOString(), expiresAt: null,
+        maxUses: null, uses: 0, revoked: false,
+      }],
+    },
+  });
+  const port = handle.port;
+  const clients = [];
+  try {
+    // Phase one: everybody greets. Nobody is a player yet, so every one of
+    // them is inside the cap at this instant.
+    const challenges = [];
+    for (let i = 0; i < 6; i++) {
+      const client = new Client(port);
+      await client.ready();
+      clients.push(client);
+      client.send('mmo.hello', { proto: 2, name: 'RUSH' + i });
+      challenges.push(await client.expect('mmo.challenge'));
+    }
+    ok(challenges.length === 6,
+      'six sockets can all be mid-handshake on a two-player hub');
+    ok(handle.relay.playerCount === 0,
+      'and none of them is a player while the challenge is outstanding');
+
+    // Phase two: everybody answers, correctly.
+    for (let i = 0; i < 6; i++) {
+      clients[i].send('mmo.auth', { response: hmacHex(PRIMARY_KEY, challenges[i].nonce) });
+    }
+
+    const verdicts = await Promise.all(clients.map(
+      (client) => client.expectEither('mmo.welcome', 'mmo.error', 2000)));
+
+    const welcomed = verdicts.filter((m) => m.type === 'mmo.welcome');
+    const refused = verdicts.filter((m) => m.type === 'mmo.error');
+
+    ok(welcomed.length === 2,
+      'exactly maxPlayers clients are welcomed, however many answered at once');
+    ok(handle.relay.playerCount === 2,
+      'and the hub counts exactly maxPlayers players');
+    ok(refused.length === 4, 'every client over the cap is answered, not ignored');
+    ok(refused.every((m) => /full/i.test(m.message) && /2/.test(m.message)),
+      'and each is told the hub is full, naming the limit');
+  } finally {
+    for (const client of clients) client.close();
+    await handle.close();
+  }
+}
+
 // ------- per-IP cap
 
 async function perIpCapTest() {
@@ -585,6 +684,193 @@ async function inviteUsesNoWriteWithoutConfigPathTest() {
   }
 }
 
+// ------- SIGHUP: revocations, bans and allowlists take effect without a restart
+//
+// Everything here is driven by a *real* signal against this process, which is
+// why it is the one in-process scenario started with handleSignals left on.
+// The point of the feature is that a host revoking a leaked code does not have
+// to drop everyone mid-battle to make it stick, so nothing below restarts the
+// hub or reconnects the player who is already on it.
+
+async function sighupReloadTest() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rby-mmo-reload-test-'));
+  const configPath = path.join(dir, 'config.json');
+
+  const invite = 'JKMN-PQRS-TVWX-YZ23';
+  const inviteKey = invite.replace(/-/g, '');
+  const minted = 'QRST-VWXY-Z234-5678';
+  const mintedKey = minted.replace(/-/g, '');
+
+  const credential = (id, secret, revoked) => ({
+    id, label: id, secret,
+    createdAt: new Date().toISOString(), expiresAt: null,
+    maxUses: null, uses: 0, revoked,
+  });
+
+  const write = (auth, bans) => fs.writeFileSync(configPath,
+    JSON.stringify(baseConfig({ auth, bans }), null, 2), { mode: 0o600 });
+
+  write({ required: true, credentials: [credential('invite', invite, false)] }, []);
+
+  const log = recordingLog();
+  const handle = await start({
+    config: baseConfig({
+      auth: { required: true, credentials: [credential('invite', invite, false)] },
+    }),
+    log,
+    configPath,
+    // The whole point: a real SIGHUP, delivered to this process.
+    handleSignals: true,
+  });
+  const port = handle.port;
+
+  const join = async (name, key) => {
+    const client = new Client(port);
+    await client.ready();
+    client.send('mmo.hello', { proto: 2, name });
+    const challenge = await client.expect('mmo.challenge');
+    client.send('mmo.auth', { response: hmacHex(key, challenge.nonce) });
+    const verdict = await client.expectEither('mmo.welcome', 'mmo.error');
+    return { client, verdict };
+  };
+
+  const hangup = async (label) => {
+    const before = log.lines.length;
+    process.kill(process.pid, 'SIGHUP');
+    const done = await waitFor(
+      () => log.lines.slice(before).some((line) => /reloaded /.test(line)), 2000);
+    ok(done, `SIGHUP is handled and logs what it reloaded (${label})`);
+  };
+
+  try {
+    const staying = await join('STAYING', inviteKey);
+    ok(staying.verdict.type === 'mmo.welcome',
+      'the invite code works before it is revoked');
+
+    // The hub is the writer of record for `uses` and flushes on a ~1s timer;
+    // waiting for that write means the edit below is not the loser of a race
+    // it has nothing to do with.
+    await sleep(1300);
+
+    // The host revokes the leaked code and mints a replacement -- the edit a
+    // `revoke` + `invite` pair leaves behind -- and hangs up.
+    write({
+      required: true,
+      credentials: [
+        credential('invite', invite, true),
+        credential('minted', minted, false),
+      ],
+    }, []);
+    await hangup('credentials');
+
+    const rejected = await join('REVOKED', inviteKey);
+    ok(rejected.verdict.type === 'mmo.error',
+      'the revoked code is refused after SIGHUP, with no restart');
+    ok(/not accepted/i.test(rejected.verdict.message),
+      'and refused in the ordinary sentence, not a new one');
+    rejected.client.close();
+
+    const admitted = await join('MINTED', mintedKey);
+    ok(admitted.verdict.type === 'mmo.welcome',
+      'a credential added by the same edit admits immediately');
+    admitted.client.close();
+
+    // The player who was already on the hub when the code was revoked is
+    // untouched: revoking a code is not kicking everyone.
+    staying.client.send('mmo.ping', {});
+    await staying.client.expect('mmo.pong');
+    ok(true, 'a player already connected is not disturbed by a reload');
+
+    // Bans are the second of the three, and take effect the same way.
+    await sleep(1300);
+    write({
+      required: true,
+      credentials: [credential('minted', minted, false)],
+    }, ['127.0.0.1']);
+    await hangup('bans');
+
+    const banned = new Client(port);
+    await banned.ready();
+    banned.send('mmo.hello', { proto: 2, name: 'BANNED' });
+    await banned.expectSilence('mmo.challenge', 500);
+    ok(true, 'a ban added to the file takes effect on the next connection');
+    banned.close();
+
+    // A file that cannot be read changes nothing. The hazard is a config
+    // edited in place and hung up on mid-save: a hub that emptied its ban
+    // list over half a file would hold its own door open at the worst moment.
+    fs.writeFileSync(configPath, '{ "bans": ["127.0.0', { mode: 0o600 });
+    const before = log.lines.length;
+    process.kill(process.pid, 'SIGHUP');
+    const complained = await waitFor(
+      () => log.lines.slice(before).some((line) => /reload: could not read/.test(line)),
+      2000);
+    ok(complained, 'a malformed config is reported rather than applied');
+
+    const stillBanned = new Client(port);
+    await stillBanned.ready();
+    stillBanned.send('mmo.hello', { proto: 2, name: 'STILLBANNED' });
+    await stillBanned.expectSilence('mmo.challenge', 500);
+    ok(true, 'and the ban list already in force survives the failed reload');
+    stillBanned.close();
+
+    staying.client.close();
+  } finally {
+    await handle.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ------- onShutdown: awaited, bounded, once
+//
+// The CLI's UPnP unmap rides on this hook. It used to be fire-and-forget on a
+// signal handler, where server.js's own process.exit(0) tore it down
+// mid-SOAP -- so the port stayed forwarded on the router after every Ctrl-C
+// (plan §3.7). The contract that fixes it is exactly this: close() does not
+// resolve until the hook has finished or run out of time.
+
+async function shutdownHookTest() {
+  {
+    let finished = false;
+    let calls = 0;
+    const handle = await startServer({}, {
+      onShutdown: async () => {
+        calls += 1;
+        await sleep(150);
+        finished = true;
+      },
+    });
+    await handle.close();
+    ok(finished, 'close() does not resolve until onShutdown has finished');
+    // A second close() is the same close(); the hook is not a shutdown step
+    // that can be run twice.
+    await handle.close();
+    ok(calls === 1, 'and onShutdown runs exactly once however often close() is called');
+  }
+
+  {
+    // A router that never answers must not be able to wedge Ctrl-C.
+    const handle = await startServer({}, { onShutdown: () => new Promise(() => {}) });
+    const startedAt = Date.now();
+    await handle.close();
+    const elapsedMs = Date.now() - startedAt;
+    ok(elapsedMs >= 1500,
+      'a hook that never settles is waited on rather than skipped');
+    ok(elapsedMs < 4000,
+      'but only up to its own budget, so shutdown always completes');
+  }
+
+  {
+    // A hook that throws is the caller's problem, never the hub's.
+    const handle = await startServer({}, {
+      onShutdown: () => Promise.reject(new Error('the router said no')),
+    });
+    let rejected = false;
+    await handle.close().catch(() => { rejected = true; });
+    ok(!rejected, 'a failing onShutdown does not make close() reject');
+  }
+}
+
 // ------- graceful shutdown: in-process close()
 
 async function gracefulShutdownInProcessTest() {
@@ -707,11 +993,14 @@ async function main() {
   await authOffTest();
   await silentSocketsDoNotLockOutTest();
   await capFilledByGreetedPlayersTest();
+  await capHoldsWhenEveryoneGreetsBeforeAnswering();
   await perIpCapTest();
   await banTest();
   await handshakeTimeoutTest();
   await inviteUsesPersistTest();
   await inviteUsesNoWriteWithoutConfigPathTest();
+  await sighupReloadTest();
+  await shutdownHookTest();
   await gracefulShutdownInProcessTest();
   await gracefulShutdownSigtermTest();
 

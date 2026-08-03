@@ -356,7 +356,20 @@ class Relay {
   // Mark ready, publish the presence captured at hello, and tell everyone.
   // Reached from hello directly when the hub is open, or from a passing
   // mmo.auth when it is not.
+  //
+  // **The seat is charged here, so the cap is checked here.** hello's own
+  // isFull() check is a courtesy -- it turns someone away before a nonce is
+  // spent on them -- but on a hub that challenges, an arbitrary number of
+  // peers can pass that check while there is still room and only become
+  // players later, when they answer. Every one of them arrives through this
+  // method, so this is the one gate that cannot be walked around, and a
+  // caller that has already checked simply never sees this branch.
   admit(client) {
+    if (this.isFull()) {
+      return this.refuse(client,
+        `This hub is full (${this.maxPlayers} players).`);
+    }
+
     const hello = client.hello || {};
     client.name = hello.name;
     client.sprite = hello.sprite || DEFAULT_SPRITE;

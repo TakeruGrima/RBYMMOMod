@@ -22,7 +22,9 @@
  */
 
 const assert = require('assert');
-const { Limits, normalizeIp, DEFAULTS, BOUNDS } = require('./lib/limits.js');
+const {
+  Limits, normalizeIp, ipCountKey, DEFAULTS, BOUNDS,
+} = require('./lib/limits.js');
 
 let passed = 0;
 const ok = (cond, label) => {
@@ -79,9 +81,14 @@ function testNormalizeIp() {
   // Case-insensitivity.
   ok(normalizeIp('FE80::1') === 'fe80::1', 'IPv6 is lowercased for comparison');
 
-  // Plain IPv6, unmapped, passes through lowercased.
+  // Plain IPv6, unmapped. Lowercased -- and canonicalised, which for an
+  // address already in RFC 5952 form is a no-op. (This assertion predates
+  // canonicalisation, where its label read "unchanged shape"; the value it
+  // pins is identical, but the reason it holds is now the round trip through
+  // the parser rather than the absence of one. testNormalizeIpv6Canonical
+  // below is where the shape is actually exercised.)
   ok(normalizeIp('2001:DB8::1') === '2001:db8::1',
-    'a non-mapped IPv6 address is handled (lowercased, unchanged shape)');
+    'a non-mapped IPv6 address is lowercased and left in its canonical shape');
 
   // Non-string / empty input.
   ok(normalizeIp(undefined) === '', 'a non-string input normalizes to empty');
@@ -107,6 +114,405 @@ function testNormalizeIp() {
   limits2.register('sock-b', '::ffff:203.0.113.7');
   ok(limits2.connectionsFrom('203.0.113.7') === 2,
     'and registrations under either spelling accumulate into one bucket');
+}
+
+// ------------------------------------------------- IPv6 canonicalisation
+//
+// One host, many legal spellings. Before canonicalisation these all came out
+// of normalizeIp as different strings, which meant a ban typed from an
+// expanded log line stored a key `socket.remoteAddress` never produces: the
+// CLI printed "Banned ..." and nothing was ever banned. Each RFC 5952 rule
+// is pinned separately below, and then the consequence is pinned directly.
+
+function testNormalizeIpv6Canonical() {
+  // ---- the exact spellings from the confirmed failure, folded to one key
+  const spellings = [
+    '2001:db8::1',
+    '2001:0db8:0000:0000:0000:0000:0000:0001',
+    '2001:DB8:0:0:0:0:0:1',
+    '2001:0DB8::0001',
+    '[2001:0db8:0000:0000:0000:0000:0000:0001]',
+    '2001:0db8::1%eth0',
+  ];
+  for (const spelling of spellings) {
+    ok(normalizeIp(spelling) === '2001:db8::1',
+      `"${spelling}" canonicalises to 2001:db8::1`);
+  }
+
+  const loopbacks = ['::1', '0:0:0:0:0:0:0:1', '0000:0000:0000:0000:0000:0000:0000:0001'];
+  for (const spelling of loopbacks) {
+    ok(normalizeIp(spelling) === '::1', `"${spelling}" canonicalises to ::1`);
+  }
+
+  // ---- rule: leading zeros in a group are dropped
+  ok(normalizeIp('2001:0db8:0001:0002:0003:0004:0005:0006') ===
+      '2001:db8:1:2:3:4:5:6',
+    'leading zeros are suppressed in every group');
+  ok(normalizeIp('0001:0002:0003:0004:0005:0006:0007:0008') ===
+      '1:2:3:4:5:6:7:8',
+    'a group of all zeros but one digit collapses to that digit, not to empty');
+
+  // ---- rule: hex is lowercase
+  ok(normalizeIp('2001:DB8:ABCD:EF01::FE') === '2001:db8:abcd:ef01::fe',
+    'hex digits are lowercased');
+
+  // ---- rule: the LONGEST run of zero groups is the one compressed
+  ok(normalizeIp('1:0:0:1:0:0:0:1') === '1:0:0:1::1',
+    'the longer zero run is compressed and the shorter one is written out');
+  ok(normalizeIp('1:0:0:0:1:0:0:1') === '1::1:0:0:1',
+    'and that holds when the longest run comes first');
+
+  // ---- rule: on a tie, the LEFTMOST run wins
+  ok(normalizeIp('2001:db8:0:0:1:0:0:1') === '2001:db8::1:0:0:1',
+    'two zero runs of equal length: the leftmost is the one compressed');
+  ok(normalizeIp('1:0:0:2:0:0:3:4') === '1::2:0:0:3:4',
+    'leftmost-on-tie again, with the runs in the middle of the address');
+
+  // ---- rule: a single zero group is NEVER compressed
+  ok(normalizeIp('2001:db8:0:1:1:1:1:1') === '2001:db8:0:1:1:1:1:1',
+    'a lone zero group is written as 0, not compressed to ::');
+  ok(normalizeIp('1:2:3:4:5:6:0:8') === '1:2:3:4:5:6:0:8',
+    'a lone trailing zero group is not compressed either');
+  ok(normalizeIp('1:2:3:0:0:6:7:8') === '1:2:3::6:7:8',
+    'but a run of two is: the "never compress one" rule stops at one');
+
+  // ---- the all-zeros address, and a run that reaches an edge
+  ok(normalizeIp('0:0:0:0:0:0:0:0') === '::',
+    'the unspecified address canonicalises to ::');
+  ok(normalizeIp('1:2:3:4:5:6:7:0') === '1:2:3:4:5:6:7:0',
+    'one trailing zero stays spelled out');
+  ok(normalizeIp('1:2:3:4:5:6:0:0') === '1:2:3:4:5:6::',
+    'a trailing run of two compresses to a trailing ::');
+  ok(normalizeIp('0:0:1:2:3:4:5:6') === '::1:2:3:4:5:6',
+    'a leading run compresses to a leading ::');
+
+  // ---- idempotence: canonical in, canonical out
+  for (const addr of ['2001:db8::1', '::1', '::', '1:0:0:1::1', 'fe80::1']) {
+    ok(normalizeIp(normalizeIp(addr)) === normalizeIp(addr),
+      `normalizing "${addr}" twice is the same as normalizing it once`);
+  }
+
+  // ---- expanded spellings of the IPv4-mapped forms fold too, now that the
+  // decision is made on the parsed groups rather than on a text prefix
+  ok(normalizeIp('0:0:0:0:0:ffff:cb00:7107') === '203.0.113.7',
+    'a fully expanded IPv4-mapped address still folds to the dotted quad');
+  ok(normalizeIp('0000:0000:0000:0000:0000:ffff:203.0.113.7') === '203.0.113.7',
+    'expanded, with a dotted tail, folds too');
+
+  // ---- ::1 must NOT be mistaken for the deprecated ::0.0.0.1
+  ok(normalizeIp('::1') === '::1',
+    'the IPv6 loopback stays IPv6 and is never folded to 0.0.0.1');
+  ok(normalizeIp('::') === '::',
+    'the unspecified address is not folded to 0.0.0.0 either');
+}
+
+// ------------------------------------------------- hostile / malformed input
+//
+// normalizeIp runs on the accept path, on whatever string arrives, before any
+// client state exists. A throw here is a crash in the DoS guard itself, so
+// the contract is: never throw, and hand anything unparseable back untouched
+// rather than mangling it into a key that might collide with a real address.
+
+function testNormalizeIpMalformed() {
+  const hostile = [
+    ':::',
+    '::::::::',
+    '1:2:3:4:5:6:7:8:9',
+    '2001:db8::1::2',
+    'gggg::1',
+    '2001:db8:',
+    ':',
+    '::ffff:999.1.1.1',
+    '::999.1.1.1',
+    'not an ip',
+    'localhost',
+    '203.0.113.7:1234',
+    '[2001:db8::1',
+    '[]',
+    '%',
+    '::%',
+    ' ',
+    '2001:db8::1\n2001:db8::2',
+  ];
+  for (const bad of hostile) {
+    let threw = false;
+    let out;
+    try {
+      out = normalizeIp(bad);
+    } catch (err) {
+      threw = true;
+    }
+    ok(!threw, `normalizeIp(${JSON.stringify(bad)}) does not throw`);
+    ok(typeof out === 'string',
+      `normalizeIp(${JSON.stringify(bad)}) still returns a string`);
+  }
+
+  // A long hostile string must be cheap, not a regex bomb: the parse is
+  // gated on net.isIPv6, which is a linear C-level check.
+  const long = '2001:db8:' + '0:'.repeat(200000) + '1';
+  const started = process.hrtime.bigint();
+  let longOut;
+  let longThrew = false;
+  try {
+    longOut = normalizeIp(long);
+  } catch (err) {
+    longThrew = true;
+  }
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  ok(!longThrew, 'a 400KB pseudo-address does not throw');
+  ok(longOut === long.toLowerCase(),
+    'and is handed back unchanged rather than mangled into a key');
+  ok(elapsedMs < 1000,
+    `and is rejected in bounded time (${elapsedMs.toFixed(1)}ms), not by backtracking`);
+
+  // Non-strings and empties keep returning '' (also pinned in
+  // testNormalizeIp; repeated here because ipCountKey shares the path).
+  for (const value of [undefined, null, 123, {}, [], () => {}, Symbol.iterator]) {
+    let threw = false;
+    let out;
+    try {
+      out = normalizeIp(value);
+    } catch (err) {
+      threw = true;
+    }
+    ok(!threw && out === '',
+      `normalizeIp(${String(value)}) returns '' without throwing`);
+
+    let keyThrew = false;
+    let keyOut;
+    try {
+      keyOut = ipCountKey(value);
+    } catch (err) {
+      keyThrew = true;
+    }
+    ok(!keyThrew && keyOut === '',
+      `ipCountKey(${String(value)}) returns '' without throwing`);
+  }
+
+  // An unparseable string must never acquire a /64 suffix -- that would be a
+  // key claiming to be a prefix when nothing was parsed.
+  ok(ipCountKey(':::') === ':::',
+    'an unparseable colon string keeps its exact value as a count key');
+  ok(ipCountKey('not an ip') === 'not an ip',
+    'and so does a string with no colons at all');
+}
+
+// ------------------------------------------------------------- IPv4 is intact
+//
+// The whole IPv6 change must be invisible to IPv4. Every dual-stack fold that
+// worked before still works, and an IPv4 address is still counted per exact
+// address -- an IPv4 host is one address, not a block.
+
+function testIpv4Unchanged() {
+  const pairs = [
+    ['203.0.113.7', '203.0.113.7'],
+    ['::ffff:203.0.113.7', '203.0.113.7'],
+    ['::ffff:cb00:7107', '203.0.113.7'],
+    ['::203.0.113.7', '203.0.113.7'],
+    ['[203.0.113.7]', '203.0.113.7'],
+    ['[::ffff:203.0.113.7]', '203.0.113.7'],
+    ['::FFFF:203.0.113.7', '203.0.113.7'],
+    ['  203.0.113.7  ', '203.0.113.7'],
+    ['127.0.0.1', '127.0.0.1'],
+    ['::ffff:127.0.0.1', '127.0.0.1'],
+    ['0.0.0.0', '0.0.0.0'],
+    ['255.255.255.255', '255.255.255.255'],
+    ['::ffff:255.255.255.255', '255.255.255.255'],
+    ['1.2.3.4', '1.2.3.4'],
+  ];
+  for (const [input, expected] of pairs) {
+    ok(normalizeIp(input) === expected,
+      `IPv4 behaviour is unchanged: "${input}" -> ${expected}`);
+    ok(ipCountKey(input) === expected,
+      `and its count key is the exact address, not a prefix: "${input}"`);
+  }
+
+  // The per-IP cap for IPv4 is still per exact address: neighbours in the
+  // same /24 (or any block) do not share a budget.
+  const clock = makeClock();
+  const limits = freshLimits(
+    { perIpConnections: 1, connectBurst: 100, maxPending: 100 }, clock);
+  limits.register('a', '203.0.113.7');
+  ok(limits.admit('203.0.113.7').reason === 'per_ip',
+    'an IPv4 address at its cap is refused');
+  ok(limits.admit('203.0.113.8').ok,
+    'and the address next to it is completely unaffected');
+}
+
+// -------------------------------------------------- the point: bans that fire
+//
+// The reason canonicalisation matters at all. A host bans the address their
+// log showed them; the peer connects and the kernel reports a different
+// spelling of the same address. Before the fix these were different keys.
+
+function testBanAcrossSpellings() {
+  const clock = makeClock();
+
+  {
+    const limits = freshLimits({}, clock);
+    limits.setBans(['2001:0db8:0000:0000:0000:0000:0000:0001']);
+    ok(limits.admit('2001:db8::1').reason === 'banned',
+      'a ban stored from an expanded log line fires against the compressed ' +
+      'spelling the kernel actually reports');
+  }
+
+  {
+    const limits = freshLimits({}, clock);
+    limits.setBans(['2001:db8::1']);
+    for (const spelling of [
+      '2001:0db8:0000:0000:0000:0000:0000:0001',
+      '2001:DB8:0:0:0:0:0:1',
+      '[2001:db8::1]',
+      '2001:db8::1%eth0',
+      '2001:0DB8::0001',
+    ]) {
+      ok(limits.admit(spelling).reason === 'banned',
+        `a ban on 2001:db8::1 catches a peer reporting "${spelling}"`);
+    }
+  }
+
+  // ...and in the other direction, for the allowlist.
+  {
+    const limits = freshLimits({}, clock);
+    limits.setAllowlist(['2001:0db8:0000:0000:0000:0000:0000:0001']);
+    ok(limits.admit('2001:db8::1').ok,
+      'an allowlist entry typed in expanded form still admits the peer');
+  }
+}
+
+// ------------------------------------------- bans stay exact; the cap does not
+//
+// This is the deliberate split, pinned so a later reader cannot mistake it
+// for an oversight:
+//
+//   * bans and the allowlist match ONE address. A host banning a griefer must
+//     not silently ban every other customer of that ISP -- an IPv6 /64 is a
+//     whole household and a /48 a whole subscriber, and the config file gives
+//     no hint that a single-address entry had been widened.
+//   * `perIpConnections` counts per /64, because a /128 cap is not a cap: a
+//     client with an ordinary residential /64 has 2^64 source addresses to
+//     rotate through and would never trip it.
+//
+// Different keys for different jobs, on purpose.
+
+function testBansStayExact() {
+  const clock = makeClock();
+
+  {
+    const limits = freshLimits({}, clock);
+    limits.setBans(['2001:db8:1:2::5']);
+    ok(limits.admit('2001:db8:1:2::5').reason === 'banned',
+      'the banned address itself is refused');
+    ok(limits.admit('2001:db8:1:2::6').ok,
+      'a DIFFERENT address in the same /64 is NOT banned -- bans are exact, ' +
+      'so banning one peer never bans their whole household or ISP block');
+    ok(limits.admit('2001:db8:1:3::5').ok,
+      'and neither is the neighbouring /64, obviously');
+  }
+
+  {
+    const limits = freshLimits({}, clock);
+    limits.setAllowlist(['2001:db8:1:2::5']);
+    ok(limits.admit('2001:db8:1:2::5').ok, 'the allow-listed address is admitted');
+    ok(limits.admit('2001:db8:1:2::6').reason === 'not_allowed',
+      'an address sharing its /64 is NOT allow-listed -- the allowlist is ' +
+      'exact too, so one entry never opens a whole block');
+  }
+
+  // The same two addresses that bans keep apart share one connection budget.
+  {
+    const limits = freshLimits(
+      { perIpConnections: 1, connectBurst: 100, maxPending: 100 }, clock);
+    limits.register('k', '2001:db8:1:2::5');
+    ok(limits.admit('2001:db8:1:2::6').reason === 'per_ip',
+      'the cap, unlike the ban, DOES span the /64: the same pair of addresses ' +
+      'that bans treat as two peers count as one household here');
+  }
+}
+
+// ------------------------------------------------------- /64 connection cap
+
+function testIpv6PrefixCap() {
+  const clock = makeClock();
+
+  // ---- the export exists and says what it counts
+  ok(typeof ipCountKey === 'function', 'ipCountKey is exported');
+  ok(ipCountKey('2001:db8:1:2:3:4:5:6') === '2001:db8:1:2::/64',
+    'the count key for an IPv6 address is its /64 prefix');
+  ok(ipCountKey('2001:0DB8:0001:0002::abcd') === '2001:db8:1:2::/64',
+    'and it is derived from the canonical form, so every spelling agrees');
+  ok(ipCountKey('2001:db8:1:2::') === '2001:db8:1:2::/64',
+    'the first address of a block is counted under that block like any other');
+  ok(ipCountKey('2001:db8:1:2::') !== normalizeIp('2001:db8:1:2::'),
+    'the /64 suffix keeps a prefix key from ever colliding with the exact ' +
+    'address that starts the block -- the two maps can never be confused');
+  ok(ipCountKey('::1') === '::/64',
+    'the loopback is counted under ::/64 (it has a /64 like anything else)');
+
+  // ---- two different addresses inside one /64 share the budget
+  {
+    const limits = freshLimits(
+      { perIpConnections: 2, connectBurst: 100, maxPending: 100 }, clock);
+    ok(limits.admit('2001:db8:1:2::1').ok, 'first address in the /64 is admitted');
+    limits.register('k1', '2001:db8:1:2::1');
+    ok(limits.admit('2001:db8:1:2::2').ok,
+      'a second, different address in the same /64 is admitted (cap is 2)');
+    limits.register('k2', '2001:db8:1:2::2');
+
+    const third = limits.admit('2001:db8:1:2::dead:beef');
+    ok(third.ok === false && third.reason === 'per_ip',
+      'a third address in that /64 is refused as per_ip: rotating the low 64 ' +
+      'bits does not buy a fresh budget');
+
+    ok(limits.connectionsFrom('2001:db8:1:2::1') === 2,
+      'connectionsFrom reports the whole /64 count, whichever member is asked');
+    ok(limits.connectionsFrom('2001:db8:1:2::ffff') === 2,
+      'including for an address in the block that has never connected');
+
+    // ---- and a different /64 does not share it
+    ok(limits.admit('2001:db8:1:3::1').ok,
+      'an address in a neighbouring /64 has its own budget');
+    ok(limits.admit('2001:db8:1:2:8000::1').ok === false,
+      'while a bit flipped BELOW the /64 boundary is still the same household');
+
+    // release frees the shared slot
+    ok(limits.release('k1') === true, 'releasing one member of the /64 succeeds');
+    ok(limits.connectionsFrom('2001:db8:1:2::2') === 1,
+      'and the shared count drops by exactly one');
+    ok(limits.admit('2001:db8:1:2::3').ok,
+      'freeing a slot lets another address in the same /64 in');
+  }
+
+  // ---- stats() reports the key it counted under
+  {
+    const statsLimits = freshLimits({ perIpConnections: 10 }, clock);
+    statsLimits.register('s1', '2001:db8:1:2::1');
+    statsLimits.register('s2', '2001:db8:1:2::2');
+    statsLimits.register('s3', '203.0.113.7');
+    const snapshot = statsLimits.stats();
+    ok(snapshot.perIp['2001:db8:1:2::/64'] === 2,
+      'stats().perIp reports the /64 for IPv6, with both members counted');
+    ok(snapshot.perIp['203.0.113.7'] === 1,
+      'and the exact address for IPv4');
+    ok(snapshot.connections === 3, 'and the raw connection total is unaffected');
+  }
+
+  // ---- the rate bucket is keyed the same way, for the same reason: a
+  // per-/128 bucket would let one client mint a fresh burst per connection
+  // (and churn the hub's bucket map while doing it).
+  {
+    const clock2 = makeClock(0);
+    const limits = freshLimits(
+      { connectBurst: 2, connectPerMinute: 60, perIpConnections: 1000, maxPending: 1000 },
+      clock2);
+    ok(limits.admit('2001:db8:9:9::1').ok, 'burst 1 of 2, from one address');
+    ok(limits.admit('2001:db8:9:9::2').ok, 'burst 2 of 2, from a different one');
+    ok(limits.admit('2001:db8:9:9::3').reason === 'rate',
+      'a third address in the same /64 is rate-limited: rotating addresses ' +
+      'does not mint a fresh token bucket');
+    ok(limits.admit('2001:db8:9:a::1').ok,
+      'while a genuinely different /64 still gets its own full burst');
+  }
 }
 
 // -------------------------------------------------------------- per-IP cap
@@ -730,6 +1136,12 @@ function testMemoryBoundsProxy() {
 
 function main() {
   testNormalizeIp();
+  testNormalizeIpv6Canonical();
+  testNormalizeIpMalformed();
+  testIpv4Unchanged();
+  testBanAcrossSpellings();
+  testBansStayExact();
+  testIpv6PrefixCap();
   testPerIpCap();
   testTokenBucket();
   testAdmitOrdering();

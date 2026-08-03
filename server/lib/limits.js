@@ -21,7 +21,12 @@
  * The caller owns the sockets. Nothing here destroys anything; `sweep`
  * reports who should go and `writeAllowed` reports who has stopped reading,
  * and closing those connections calls back into `release`.
+ *
+ * The one require is `node:net`, and only for its `isIPv6` validator -- no
+ * socket is created here.
  */
+
+const net = require('node:net');
 
 // ------------------------------------------------------------------- bounds
 //
@@ -102,8 +107,131 @@ const PRUNE_INTERVAL_MS = 30000;
 // indices are dropped rather than kept: a human writing a ban list writes
 // `fe80::1`, not `fe80::1%en0`, and a ban that misses because of an
 // interface name is a ban that did not happen.
+//
+// IPv6 makes the same point far more loudly, because one address has many
+// legal spellings: `2001:db8::1`, `2001:0db8:0000:0000:0000:0000:0000:0001`
+// and `2001:DB8:0:0:0:0:0:1` are one host. A ban list is typed by a human
+// reading a log, and a log that expanded the address produces a key
+// `socket.remoteAddress` will never emit -- so the ban reports success and
+// then never fires, which is worse than having no ban verb at all. Every
+// IPv6 address is therefore parsed and re-emitted in canonical RFC 5952
+// form: leading zeros dropped, lowercase hex, and the *longest* run of zero
+// groups compressed to `::` (leftmost wins a tie; a single zero group is
+// never compressed).
+//
+// **Nothing here throws.** This runs on the accept path against whatever
+// bytes an attacker's kernel felt like reporting, and a crash in the
+// admission check is a worse outcome than a key that misses, so anything
+// that does not parse is handed back exactly as it arrived.
 const V4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const HEX_GROUP = /^[0-9a-f]{1,4}$/;
 
+/*
+ * `text` -> eight 16-bit numbers, or null if it is not an IPv6 address.
+ *
+ * `net.isIPv6` is the gate rather than a regex of our own: it is the same
+ * C-level `inet_pton` the rest of Node validates with, it is linear in the
+ * input, and it cannot be walked into catastrophic backtracking by a hostile
+ * 200 KB "address". Everything after it is plain splitting on text already
+ * known to be well-formed.
+ */
+function parseIpv6(text) {
+  if (!net.isIPv6(text)) return null;
+
+  let body = text;
+
+  // A dotted-quad tail (`::ffff:1.2.3.4`) is two groups written in decimal.
+  // Rewrite it to hex first so the rest of the parse sees eight uniform
+  // groups and the mapped-address check below is spelling-independent.
+  if (body.indexOf('.') >= 0) {
+    const cut = body.lastIndexOf(':');
+    const quad = V4.exec(body.slice(cut + 1));
+    if (!quad) return null;
+    const o = [quad[1], quad[2], quad[3], quad[4]].map(Number);
+    if (!o.every((n) => n <= 255)) return null;
+    const hi = ((o[0] << 8) | o[1]).toString(16);
+    const lo = ((o[2] << 8) | o[3]).toString(16);
+    body = `${body.slice(0, cut + 1)}${hi}:${lo}`;
+  }
+
+  const halves = body.split('::');
+  if (halves.length > 2) return null;
+
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+
+  let groups;
+  if (halves.length === 1) {
+    if (head.length !== 8) return null;
+    groups = head;
+  } else {
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return null;
+    groups = head.concat(new Array(fill).fill('0'), tail);
+  }
+
+  const out = new Array(8);
+  for (let i = 0; i < 8; i += 1) {
+    if (!HEX_GROUP.test(groups[i])) return null;
+    out[i] = parseInt(groups[i], 16);
+  }
+  return out;
+}
+
+/* Eight groups -> the one RFC 5952 spelling of them. */
+function formatIpv6(groups) {
+  // Longest run of zero groups, leftmost on a tie -- `>` rather than `>=` is
+  // what makes the tie go left, and a run of one is left uncompressed
+  // because `2001:db8:0:1:...` is shorter and clearer than `2001:db8::1:...`
+  // and, more to the point, is what everything else emits.
+  let bestAt = -1;
+  let bestLen = 0;
+  let runAt = -1;
+  let runLen = 0;
+  for (let i = 0; i < 8; i += 1) {
+    if (groups[i] === 0) {
+      if (runAt < 0) runAt = i;
+      runLen += 1;
+      if (runLen > bestLen) {
+        bestLen = runLen;
+        bestAt = runAt;
+      }
+    } else {
+      runAt = -1;
+      runLen = 0;
+    }
+  }
+  if (bestLen < 2) return groups.map((g) => g.toString(16)).join(':');
+
+  const head = groups.slice(0, bestAt).map((g) => g.toString(16)).join(':');
+  const tail = groups.slice(bestAt + bestLen).map((g) => g.toString(16)).join(':');
+  return `${head}::${tail}`;
+}
+
+/*
+ * The IPv4 hiding inside an IPv6 address, or null.
+ *
+ * The mapped form (`::ffff:a.b.c.d`) is decided numerically, so every
+ * spelling of it -- dotted, hex, or fully expanded -- folds to the same
+ * dotted quad. The deprecated compatible form (`::a.b.c.d`) is decided on
+ * the presence of a literal dot instead, and deliberately so: numerically it
+ * is indistinguishable from `::1`, and folding the loopback address to
+ * `0.0.0.1` would be a considerably worse bug than the one being fixed.
+ */
+function embeddedIpv4(groups, text) {
+  for (let i = 0; i < 5; i += 1) if (groups[i] !== 0) return null;
+  const mapped = groups[5] === 0xffff;
+  const compatible = groups[5] === 0 && text.indexOf('.') >= 0;
+  if (!mapped && !compatible) return null;
+  const hi = groups[6];
+  const lo = groups[7];
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
+/*
+ * The exact-address key. This is the identity a host means when they type an
+ * address: bans, the allowlist, and anything a human compares by eye.
+ */
 function normalizeIp(value) {
   if (typeof value !== 'string') return '';
   let ip = value.trim();
@@ -120,26 +248,61 @@ function normalizeIp(value) {
   // both halves comparable without needing to know which one this is.
   ip = ip.toLowerCase();
 
-  // Dotted-quad tail: ::ffff:1.2.3.4 (mapped) and ::1.2.3.4 (the deprecated
-  // compatible form, which some proxies still emit).
-  let tail = null;
-  if (ip.startsWith('::ffff:')) tail = ip.slice(7);
-  else if (ip.startsWith('::') && ip.indexOf('.') > 0) tail = ip.slice(2);
+  // No colon means it is not IPv6, so there is nothing left to canonicalise:
+  // a dotted quad is already its own canonical form, and anything else is
+  // input we do not recognise and must not mangle.
+  if (ip.indexOf(':') < 0) return ip;
 
-  if (tail !== null) {
-    const quad = V4.exec(tail);
-    if (quad) {
-      const parts = [quad[1], quad[2], quad[3], quad[4]].map(Number);
-      if (parts.every((n) => n <= 255)) return parts.join('.');
-    }
-    const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
-    if (hex && ip.startsWith('::ffff:')) {
-      const hi = parseInt(hex[1], 16);
-      const lo = parseInt(hex[2], 16);
-      return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
-    }
-  }
-  return ip;
+  const groups = parseIpv6(ip);
+  if (!groups) return ip;
+
+  return embeddedIpv4(groups, ip) || formatIpv6(groups);
+}
+
+// --------------------------------------------------------------- /64 keying
+//
+// Bans and the allowlist are exact addresses. Connection *counting* is not,
+// and the split is deliberate:
+//
+//   * A ban is a host's judgement about one peer. Widening it to a /64 would
+//     silently ban a friend's entire ISP-assigned block on the strength of
+//     one address, and the host would have no way to tell from the config
+//     file that they had. Same for the allowlist in the other direction: a
+//     /64 allow entry would admit every address in a block the host only
+//     meant to name one member of. Exact, both ways.
+//
+//   * `perIpConnections` exists to bound *one household*, and a household is
+//     a /64 -- that is the smallest block any residential IPv6 assignment
+//     hands out. Keyed by the full /128 the cap is not a cap at all: a
+//     client with a normal /64 has 2^64 source addresses to rotate through
+//     and can open a connection from each. The rate bucket is keyed the same
+//     way and for the same reason, plus one of its own -- per-/128 buckets
+//     would let a single peer churn `MAX_BUCKETS` worth of the hub's memory
+//     without ever tripping a limit.
+//
+// The `/64` suffix is part of the key on purpose: it keeps a prefix key from
+// ever colliding with a real address (`2001:db8::/64` is not `2001:db8::`),
+// and it makes `stats().perIp` say plainly what it counted. IPv4 keeps
+// counting per exact address -- an IPv4 host is one address, not a block.
+const PREFIX_BITS = 64;
+
+/* Assumes an already-normalized address; `ipCountKey` is the public door. */
+function countKeyOf(addr) {
+  if (!addr || addr.indexOf(':') < 0) return addr;
+  const groups = parseIpv6(addr);
+  if (!groups) return addr;
+  const prefix = groups.slice(0, PREFIX_BITS / 16).concat([0, 0, 0, 0]);
+  return `${formatIpv6(prefix)}/${PREFIX_BITS}`;
+}
+
+/*
+ * The key a connection is *counted* under: the exact address for IPv4, the
+ * /64 prefix for IPv6. Exported so callers pick a key deliberately rather
+ * than by accident -- ban/allow verbs want `normalizeIp`, anything that
+ * counts or rate-limits wants this.
+ */
+function ipCountKey(value) {
+  return countKeyOf(normalizeIp(value));
 }
 
 function toIpSet(list) {
@@ -192,11 +355,11 @@ class Limits {
 
     this._tokensPerMs = this.connectPerMinute / 60000;
 
-    /** key -> { ip, at, greeted, lastActivity, partialSince } */
+    /** key -> { ip, countKey, at, greeted, lastActivity, partialSince } */
     this._conns = new Map();
-    /** ip -> live connection count */
+    /** count key (exact IPv4 / IPv6 /64) -> live connection count */
     this._perIp = new Map();
-    /** ip -> { tokens, last } */
+    /** count key -> { tokens, last } */
     this._buckets = new Map();
 
     this._pending = 0;
@@ -222,17 +385,23 @@ class Limits {
    *
    * Bans always beat the allowlist. An empty allowlist means "everyone",
    * which is what a hub with no allowlist configured wants.
+   *
+   * Two keys are in play and the order above is why: the policy checks read
+   * the exact address, because that is what a host banned or allowed, and
+   * everything below them reads the /64 count key, because that is the unit
+   * a cap has to bound to mean anything. See "/64 keying" above.
    */
   admit(ip) {
     const addr = normalizeIp(ip);
     if (this._bans.has(addr)) return REJECT.banned;
     if (this._allow.size > 0 && !this._allow.has(addr)) return REJECT.not_allowed;
 
+    const key = countKeyOf(addr);
     const now = this.now();
     this._prune(now);
-    if (!this._spendToken(addr, now)) return REJECT.rate;
+    if (!this._spendToken(key, now)) return REJECT.rate;
 
-    if ((this._perIp.get(addr) || 0) >= this.perIpConnections) {
+    if ((this._perIp.get(key) || 0) >= this.perIpConnections) {
       return REJECT.per_ip;
     }
     if (this._pending >= this.maxPending) return REJECT.pending;
@@ -253,15 +422,21 @@ class Limits {
   register(key, ip) {
     if (this._conns.has(key)) return;
     const addr = normalizeIp(ip);
+    const countKey = countKeyOf(addr);
     const now = this.now();
+    // Both keys are stored: `countKey` is what the cap is charged against,
+    // and `ip` is the exact address, kept so a caller that wants to report
+    // or ban this peer has the identity it actually connected from rather
+    // than the block it was counted under.
     this._conns.set(key, {
       ip: addr,
+      countKey,
       at: now,
       greeted: false,
       lastActivity: now,
       partialSince: null,
     });
-    this._perIp.set(addr, (this._perIp.get(addr) || 0) + 1);
+    this._perIp.set(countKey, (this._perIp.get(countKey) || 0) + 1);
     this._pending += 1;
   }
 
@@ -278,9 +453,9 @@ class Limits {
     this._conns.delete(key);
     if (!rec.greeted) this._pending -= 1;
 
-    const left = (this._perIp.get(rec.ip) || 1) - 1;
-    if (left > 0) this._perIp.set(rec.ip, left);
-    else this._perIp.delete(rec.ip);
+    const left = (this._perIp.get(rec.countKey) || 1) - 1;
+    if (left > 0) this._perIp.set(rec.countKey, left);
+    else this._perIp.delete(rec.countKey);
     return true;
   }
 
@@ -400,11 +575,21 @@ class Limits {
     return this._pending;
   }
 
+  /*
+   * Live connections charged against this address's budget -- so for IPv6
+   * this is the count for its whole /64, which is the number the cap is
+   * actually compared against. Asking with any address in the block gives
+   * the same answer, by design.
+   */
   connectionsFrom(ip) {
-    return this._perIp.get(normalizeIp(ip)) || 0;
+    return this._perIp.get(ipCountKey(ip)) || 0;
   }
 
-  /** The shape the CLI's `status` verb prints. */
+  /**
+   * The shape the CLI's `status` verb prints. `perIp` is keyed the way the
+   * cap counts: an exact address for IPv4, a `2001:db8::/64`-style prefix
+   * for IPv6.
+   */
   stats() {
     const perIp = {};
     for (const [ip, count] of this._perIp) perIp[ip] = count;
@@ -414,9 +599,9 @@ class Limits {
   // ------------------------------------------------------------- internals
 
   /*
-   * A token bucket per address: `connectBurst` capacity, refilled at
-   * `connectPerMinute`. A fresh address starts full, so the first
-   * connection from anyone is never rate-limited.
+   * A token bucket per count key -- one address for IPv4, one /64 for IPv6:
+   * `connectBurst` capacity, refilled at `connectPerMinute`. A fresh key
+   * starts full, so the first connection from anyone is never rate-limited.
    */
   _spendToken(ip, now) {
     let bucket = this._buckets.get(ip);
@@ -438,7 +623,7 @@ class Limits {
   }
 
   /*
-   * Buckets are keyed by address and a flooder can cycle addresses, so
+   * Buckets are keyed by count key and a flooder can cycle blocks, so
    * without this the rate limiter is itself a memory leak -- an unbounded
    * Map written to once per hostile connect.
    *
@@ -478,4 +663,4 @@ class Limits {
   }
 }
 
-module.exports = { Limits, normalizeIp, DEFAULTS, BOUNDS };
+module.exports = { Limits, normalizeIp, ipCountKey, DEFAULTS, BOUNDS };
