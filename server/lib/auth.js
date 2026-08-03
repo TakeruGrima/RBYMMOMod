@@ -14,6 +14,29 @@
  * LOVE ships no TLS), so the gap is real; only an overlay network like
  * WireGuard closes it. The docs say so in those words.
  *
+ * Strength, stated plainly: a passcode is 6 characters from a 32-symbol
+ * alphabet, so 32^6 = 2^30 -- 30 bits. That is a deliberate, accepted trade
+ * against the 80-bit form it replaces, made because a 16-character code was
+ * unusable UX. Two consequences follow, and only one of them is comfortable:
+ *
+ *   Online guessing is hopeless. limits.connectPerMinute defaults to 60, so
+ *   2^30 codes take about 34 years to exhaust and about 17 to reach even odds
+ *   -- and that is with the attacker holding the connection budget open the
+ *   whole time, in full view of the host's logs. Nobody brute-forces a hub
+ *   through its front door. (Raise connectPerMinute and this shrinks in
+ *   proportion: at its 6000 ceiling, even odds arrive in about two months.)
+ *
+ *   Offline grinding is not. The game port carries no TLS, so anyone who can
+ *   capture a single challenge/response pair off the wire -- a shared LAN, a
+ *   hostile router, a VPS neighbour -- holds everything needed to test codes
+ *   locally, where no rate limit exists. 2^30 HMAC-SHA256 evaluations is
+ *   seconds of work on commodity hardware. A captured pair should be assumed
+ *   to yield the passcode.
+ *
+ * So: the passcode keeps out strangers who merely find the port. It does not
+ * survive an eavesdropper. Run the hub behind an overlay network if the
+ * traffic can be captured.
+ *
  * Every constant and every encoding decision below is a wire contract: a
  * pure-Lua SHA-256 reimplements this exactly on the client side, and the two
  * must agree byte for byte or a correct join code looks like a wrong one.
@@ -35,9 +58,11 @@ const crypto = require('node:crypto');
 // this set without changing that grid.
 const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
-const CODE_GROUPS = 4;
-const CODE_GROUP_LEN = 4;
-const CODE_LEN = CODE_GROUPS * CODE_GROUP_LEN; // 16 chars = 80 bits
+// 6 chars from a 32-symbol alphabet = 32^6 = 2^30 exactly. Short enough to
+// read down a phone line and type on the in-game grid; see the header for
+// what those 30 bits do and do not buy. No grouping: at this length dashes
+// cost more to explain than they save to read.
+const CODE_LEN = 6;
 const NONCE_BYTES = 16;
 
 const HEX_RESPONSE = /^[0-9a-f]{64}$/;
@@ -62,7 +87,7 @@ function randomIndexes(count) {
   return out;
 }
 
-/** A fresh join code in its dashed, hand-it-to-a-friend form. */
+/** A fresh passcode in its hand-it-to-a-friend form: 6 chars, e.g. A7K3P9. */
 function generateJoinCode() {
   let code = '';
   for (const index of randomIndexes(CODE_LEN)) code += ALPHABET[index];
@@ -76,7 +101,9 @@ function generateJoinCode() {
  * should get in without being taught a format first.
  *
  * Returns null when nothing usable is left, or when the result is not
- * exactly CODE_LEN -- a short code is a typo, not a shorter key.
+ * exactly CODE_LEN -- a short code is a typo, not a shorter key, and a long
+ * one (an invite minted under the old 16-character format) is not a passcode
+ * this hub can check.
  */
 function normalizeCode(value) {
   if (typeof value !== 'string') return null;
@@ -88,14 +115,19 @@ function normalizeCode(value) {
   return out.length === CODE_LEN ? out : null;
 }
 
-/** ABCDEFGHJKMNPQRS -> ABCD-EFGH-JKMN-PQRS */
+/**
+ * The display form of a normalised passcode. At 6 characters the canonical
+ * and displayed spellings are the same string, so this is a passthrough --
+ * kept rather than deleted because it is the name every caller already uses
+ * for "render this code for a human" (lib/cli.js, src/Ui.lua's Lua twin), and
+ * because it is the seam a future format change would go back through.
+ *
+ * It returns the whole code, so it is a formatter and never a mask. Anything
+ * that must hide a code uses the whole-code mask in lib/config.js instead.
+ */
 function formatCode(normalized) {
   if (typeof normalized !== 'string') return '';
-  const groups = [];
-  for (let i = 0; i < normalized.length; i += CODE_GROUP_LEN) {
-    groups.push(normalized.slice(i, i + CODE_GROUP_LEN));
-  }
-  return groups.join('-');
+  return normalized;
 }
 
 // ------------------------------------------------------------- the exchange
@@ -279,8 +311,6 @@ function newCredential(options = {}) {
 
 module.exports = {
   ALPHABET,
-  CODE_GROUPS,
-  CODE_GROUP_LEN,
   CODE_LEN,
   NONCE_BYTES,
   generateJoinCode,

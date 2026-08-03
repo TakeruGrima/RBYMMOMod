@@ -17,10 +17,11 @@
 # Two windows will open and drive themselves. Leave them alone until it
 # finishes -- clicking into them steals the input the drivers are queueing.
 #
-# By default the host locks the game with a join code and the guest is
-# challenged for it -- refused once on a wrong one, admitted on the right one,
-# typed on the real naming grid. MMO_JOIN_CODE=0 turns that phase off for a
-# plain smoke test.
+# The host locks the game with a six-character passcode -- it cannot do
+# otherwise; HostServer refuses to bind a port without one -- and the guest
+# types it on the real naming grid before anything is dialled, wrong once and
+# then right. There is no switch to skip it: MMO_JOIN_CODE=0 used to select a
+# game with no code, which is now a game that cannot start.
 
 set -uo pipefail
 cd "$(dirname "$0")/../../../.." || exit 1
@@ -41,13 +42,6 @@ DRIVERS="$MOD_DIR/tests/drivers"
 ADDR_FILE="${MMO_ADDR_FILE:-/tmp/rby_mmo_addr.txt}"
 SHOT_DIR="${SHOT_DIR:-/tmp/rby_mmo_shots}"
 LIMIT="${MMO_LIMIT:-2}"
-# The join-code phase: the host locks the game before starting it, and the
-# guest is challenged, refused once for a wrong code, and then let in on the
-# right one. On by default -- it is the only test anywhere that drives that
-# path in a running game -- and MMO_JOIN_CODE=0 gets the plain smoke test
-# back for anyone who only wants to know the sockets still work. It costs
-# about half a minute of typing on the naming grid.
-JOIN_CODE="${MMO_JOIN_CODE:-1}"
 HOST_ID="mmohost-$$"
 GUEST_ID="mmoguest-$$"
 HOST_LOG="/tmp/rby_mmo_host_$$.log"
@@ -203,11 +197,10 @@ else
   echo "        importer. Set ROM_PATH in $ENV_FILE to make this reliable."
 fi
 
-echo "  host limit: $LIMIT   join code: $([ "$JOIN_CODE" = 0 ] && echo off || echo on)"
+echo "  host limit: $LIMIT   join code: required (6 chars, minted in game)"
 echo "  shots: $SHOT_DIR"
 echo "  starting host..."
 MMO_ADDR_FILE="$ADDR_FILE" SHOT_DIR="$SHOT_DIR" MMO_LIMIT="$LIMIT" MMO_SYNC_DIR="$SYNC_DIR" \
-  MMO_JOIN_CODE="$JOIN_CODE" \
   POKEPORT_IDENTITY="$HOST_ID" POKEPORT_DRIVER="$DRIVERS/mmo_host.lua" \
   love . >"$HOST_LOG" 2>&1 &
 HOST_PID=$!

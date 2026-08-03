@@ -273,17 +273,18 @@ eq(#fromHex(case6.keyHex), 131,
 -- The Lua-side key is the *normalised* code as ASCII bytes -- never the
 -- dashed display form -- which is what Wire.code produces and what Hub.lua
 -- actually signs with, so this doubles as a Wire.code cross-check.
-eq(Wire.code(Vectors.KAT.code), "ABCDEFGHJKMNPQRS",
+eq(Wire.code(Vectors.KAT.code), Vectors.KAT.code,
    "the known-answer vector's code normalises the way the digest assumes")
 eq(Sha256.hmacHex(Wire.code(Vectors.KAT.code), Vectors.KAT.nonce), Vectors.KAT.digest,
    "the cross-language known-answer vector (also fixed by server/auth.test.js) "
    .. "reproduces exactly")
 
--- the generated cross-language set: 24 (code, nonce) -> digest triples Node
--- produced, covering dashed/undashed/lowercase/messy spellings of one code,
--- every character of Config.CODE_ALPHABET across the set, and 32-hex
--- nonces throughout. A drift in either Wire.code or Sha256.hmacHex shows up
--- here as a specific failing label, not as "wrong join code" in the field.
+-- the generated cross-language set: (code, nonce) -> digest triples Node
+-- produced, covering canonical/lowercase/messy/old-dashed-habit spellings of
+-- one code, an I/L/O/U-noise spelling, every character of
+-- Config.CODE_ALPHABET across the set, and 32-hex nonces throughout. A drift
+-- in either Wire.code or Sha256.hmacHex shows up here as a specific failing
+-- label, not as "wrong join code" in the field.
 for _, v in ipairs(Vectors.CROSS) do
   eq(Wire.code(v.code), v.normalized,
      "Wire.code normalises like Node's normalizeCode: " .. v.label)
@@ -417,28 +418,44 @@ eq(Wire.payloadOk(wide), false, "an over-wide payload is refused")
 -- cases from testNormalization() in server/auth.test.js rather than two
 -- suites that quietly drift apart on what a "valid code" is.
 
-local CODE_DASHED = "ABCD-EFGH-JKMN-PQRS"
-local CODE_UNDASHED = "ABCDEFGHJKMNPQRS"
-local CODE_LOWER = "abcd-efgh-jkmn-pqrs"
-local CODE_MESSY = " abcd efgh, jkmn! pqrs?? "
+local CODE_CANON = "A7K3P9"
+local CODE_LOWER = "a7k3p9"
+local CODE_MESSY = " a7k-3p9, ?? "
+local CODE_DASH_HABIT = "A7K-3P9" -- someone who remembers the old grouped form
+local CODE_NOISY = "IA7LK3OP9U" -- I, L, O, U interspersed as noise
 
-eq(Wire.code(CODE_DASHED), CODE_UNDASHED, "the dashed form normalises to the bare 16 characters")
-eq(Wire.code(CODE_UNDASHED), CODE_UNDASHED, "the undashed form is unchanged")
-eq(Wire.code(CODE_LOWER), CODE_UNDASHED, "lowercase normalises the same as uppercase")
-eq(Wire.code(CODE_MESSY), CODE_UNDASHED, "spaces and stray punctuation are stripped")
+eq(Wire.code(CODE_CANON), CODE_CANON, "the canonical form is unchanged")
+eq(Wire.code(CODE_LOWER), CODE_CANON, "lowercase normalises the same as uppercase")
+eq(Wire.code(CODE_MESSY), CODE_CANON, "spaces and stray punctuation are stripped")
+eq(Wire.code(CODE_DASH_HABIT), CODE_CANON,
+   "a dash typed out of old 16-character habit still normalises to the same passcode")
 
-eq(Wire.code("ABCD-EFGH-JKMN"), nil, "a too-short input is rejected")
-eq(Wire.code("ABCD-EFGH-JKMN-PQRS-TVWX"), nil, "a too-long input is rejected")
+-- I, L, O and U are outside the alphabet, so they are dropped as noise like
+-- any other stray character -- never folded to a lookalike (O -> 0, I -> 1).
+-- A Lua half that aliased them would derive a different key from the same
+-- typed input and every such player would see "wrong passcode".
+eq(Wire.code(CODE_NOISY), CODE_CANON,
+   "I, L, O and U are dropped as noise, leaving the code intact")
+eq(Wire.code("A7K3PO"), nil,
+   "typing O for 0 drops a character and fails the length check, rather than aliasing to 0")
+check(Wire.code("A7K3P1") ~= Wire.code("A7K3PI"), "and I is not an alias for 1")
+
+eq(Wire.code("A7K3P"), nil, "a too-short input is rejected")
+eq(Wire.code("A7K3P99"), nil, "a too-long input is rejected")
+eq(Wire.code("ABCD-EFGH-JKMN-PQRS"), nil,
+   "a legacy 16-character code is refused outright, not truncated to 6")
 
 eq(Wire.code(42), nil, "a number is not a code")
 eq(Wire.code(true), nil, "a boolean is not a code")
 eq(Wire.code({}), nil, "a table is not a code")
 eq(Wire.code(nil), nil, "nil is not a code")
 
-eq(Wire.formatCode(Wire.code(CODE_DASHED)), CODE_DASHED,
-   "formatCode(code(x)) round-trips the canonical dashed form")
-eq(Wire.formatCode(Wire.code(CODE_MESSY)), CODE_DASHED,
-   "a messy input round-trips to the same canonical dashed form")
+eq(Wire.formatCode(Wire.code(CODE_CANON)), CODE_CANON,
+   "formatCode(code(x)) round-trips the canonical form")
+eq(Wire.formatCode(Wire.code(CODE_MESSY)), CODE_CANON,
+   "a messy input round-trips to the same canonical form")
+check(not Wire.formatCode(CODE_CANON):find("-"),
+      "formatCode adds no grouping at 6 characters")
 
 -- ------- Wire.hex: the digest/nonce sanitiser
 --
@@ -758,7 +775,7 @@ eq(#openPeer.outbox, 0, "mmo.auth with no outstanding challenge is a no-op")
 
 -- ------- a coded hub
 
-local JOIN_CODE = "ABCD-EFGH-JKMN-PQRS"
+local JOIN_CODE = "A7K3P9"
 local codedHub = Hub.new({ maxPlayers = 3, joinCode = JOIN_CODE })
 eq(codedHub:requiresCode(), true, "a hub constructed with a join code requires one")
 
@@ -801,7 +818,7 @@ local wrongChallenge = take(wrongPeer, Wire.CHALLENGE)
 check(wrongChallenge ~= nil, "a second connection is challenged independently")
 
 codedHub:receive(wrongClient,
-  { type = Wire.AUTH, response = answer("WXYZ-2345-6789-ABCD", wrongChallenge.nonce) })
+  { type = Wire.AUTH, response = answer("Z9Y8X7", wrongChallenge.nonce) })
 local wrongError = take(wrongPeer, Wire.ERROR)
 check(wrongError ~= nil, "a wrong response is refused")
 check(wrongError.message:find("code"), "naming the join code as the problem")
@@ -841,7 +858,7 @@ local messyClient = codedHub:accept(messyPeer)
 codedHub:receive(messyClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "MESSY" })
 local messyNonce = take(messyPeer, Wire.CHALLENGE).nonce
 codedHub:receive(messyClient,
-  { type = Wire.AUTH, response = answer("  abcd efgh, jkmn! pqrs  ", messyNonce) })
+  { type = Wire.AUTH, response = answer("  a7k 3p9!! ", messyNonce) })
 check(take(messyPeer, Wire.WELCOME) ~= nil,
       "a code typed lowercase and messily still authenticates")
 
@@ -879,14 +896,14 @@ eq(budgetHub.clients[silentClient.id], nil, "leaving no record behind")
 
 -- MAX_PENDING and greeted-only isFull() behave the same with a code
 -- configured: a challenged-but-unanswered peer is still just pending
-local pendingHub = Hub.new({ maxPlayers = 2, joinCode = "ZZZZ-ZZZZ-ZZZZ-ZZZZ" })
+local pendingHub = Hub.new({ maxPlayers = 2, joinCode = "ZZZZZZ" })
 local pendingClient, pendingPeer = join(pendingHub, "WAITING")
 check(pendingClient ~= nil, "a hello on a coded hub is still accepted")
 check(take(pendingPeer, Wire.CHALLENGE) ~= nil, "and still challenged")
 eq(pendingHub.players, 0, "but is not a player yet")
 eq(pendingHub:isFull(), false, "so isFull() does not count it")
 
-local floodCodedHub = Hub.new({ maxPlayers = 2, joinCode = "ZZZZ-ZZZZ-ZZZZ-ZZZZ" })
+local floodCodedHub = Hub.new({ maxPlayers = 2, joinCode = "ZZZZZZ" })
 local floodAccepted = 0
 for _ = 1, Config.MAX_PENDING + 6 do
   if floodCodedHub:accept(fakePeer()) then floodAccepted = floodAccepted + 1 end

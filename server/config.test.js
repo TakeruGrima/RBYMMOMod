@@ -7,7 +7,8 @@
  * Covers the precedence chain (flag > env > file > default), the legacy
  * RBY_MMO_* env vars hub.js has always read, clamping driven mechanically
  * from BOUNDS, the nesting of config.js's BOUNDS inside limits.js's BOUNDS,
- * the load()-never-throws contract, atomic/mode-0600 save() and its refusal
+ * the reachability of the authentication-failure throttle through env vars,
+ * flags and LEAF_PATHS, the load()-never-throws contract, atomic/mode-0600 save() and its refusal
  * to write through anything planted at its temporary path, permission
  * checking, redaction that keeps no part of a join code, migration and the
  * manifest/package version-parity guard.
@@ -186,6 +187,79 @@ function testBoundsNesting() {
   }
   ok(checked === Object.keys(limits.BOUNDS).length,
     'every knob limits.js bounds was checked for nesting inside config.js');
+}
+
+// ------------------------------------------------- the auth-throttle knobs
+//
+// The seven authentication-failure knobs are the newest arrivals in
+// `limits.`, and most of what matters about them is already pinned by the
+// two table-driven scenarios above: `testClamping` walks config.BOUNDS, so
+// each one's clamp and its warning are covered the moment the entry exists,
+// and `testBoundsNesting` walks limits.BOUNDS, so the entry existing at all
+// is covered too. What neither can see is the rest of the reachability
+// chain, which is what this pins:
+//
+//   * the default and the range are limits.js's *verbatim*, not merely
+//     nested inside it. Nesting would still pass if config.js invented a
+//     tighter range or a different default, and then a host reading the two
+//     files would find two answers to the same question.
+//   * the default is itself inside the range -- a default that needs
+//     clamping is a default nobody ever runs.
+//   * the key reached LEAF_PATHS, which is derived by walking DEFAULTS. That
+//     is what `config set` enumerates (server/cli.test.js drives every leaf),
+//     so a knob missing from it is a knob with no CLI and no test coverage,
+//     silently.
+//   * an env var and a short flag both actually land on the value, which is
+//     the project's standing rule that every setting is reachable through the
+//     software rather than only through a hand-edited file.
+const AUTH_KNOBS = [
+  ['authFailureGrace', 'RBY_MMO_AUTH_FAILURE_GRACE', 'authFailureGrace'],
+  ['authFailureWindowMs', 'RBY_MMO_AUTH_FAILURE_WINDOW_MS', 'authFailureWindow'],
+  ['authBackoffBaseMs', 'RBY_MMO_AUTH_BACKOFF_BASE_MS', 'authBackoffBase'],
+  ['authBackoffMaxMs', 'RBY_MMO_AUTH_BACKOFF_MAX_MS', 'authBackoffMax'],
+  ['authGlobalFailures', 'RBY_MMO_AUTH_GLOBAL_FAILURES', 'authGlobalFailures'],
+  ['authGlobalWindowMs', 'RBY_MMO_AUTH_GLOBAL_WINDOW_MS', 'authGlobalWindow'],
+  ['authLockoutMs', 'RBY_MMO_AUTH_LOCKOUT_MS', 'authLockout'],
+];
+
+function testAuthThrottleKeys(tmp) {
+  const missing = path.join(tmp, 'auth-throttle-does-not-exist.json');
+
+  for (const [bare, envName, flagName] of AUTH_KNOBS) {
+    const dotted = 'limits.' + bare;
+
+    ok(config.DEFAULTS.limits[bare] === limits.DEFAULTS[bare],
+      `${dotted}: the default (${config.DEFAULTS.limits[bare]}) is limits.js's own, verbatim`);
+    ok(JSON.stringify(config.BOUNDS[dotted]) === JSON.stringify(limits.BOUNDS[bare]),
+      `${dotted}: the range ${JSON.stringify(config.BOUNDS[dotted])} is limits.js's own, verbatim`);
+
+    const [min, max] = config.BOUNDS[dotted];
+    const fallback = config.DEFAULTS.limits[bare];
+    ok(fallback >= min && fallback <= max,
+      `${dotted}: the built-in default sits inside its own range`);
+
+    ok(config.LEAF_PATHS.includes(dotted),
+      `${dotted}: LEAF_PATHS picked it up, so \`config set\` reaches it`);
+
+    ok(config.ENV_MAP[envName] === dotted, `${envName} maps to ${dotted}`);
+    const fromEnv = config.load({ path: missing, env: { [envName]: String(min) }, flags: {} });
+    ok(config.getPath(fromEnv.config, dotted) === min,
+      `${envName}=${min} sets ${dotted} (and is not re-clamped)`);
+    ok(fromEnv.sources[dotted] === 'env', `${dotted}: sources reports "env" for it`);
+
+    ok(config.FLAG_MAP[flagName] === dotted, `--${flagName} maps to ${dotted}`);
+    const fromFlag = config.load({ path: missing, env: {}, flags: { [flagName]: max } });
+    ok(config.getPath(fromFlag.config, dotted) === max,
+      `--${flagName} ${max} sets ${dotted} (and is not re-clamped)`);
+  }
+
+  // The end of the chain: a config this module produced, handed to the class
+  // that consumes it, comes back out unchanged. That is the "one wall inside
+  // the other" guarantee stated as behaviour rather than as arithmetic.
+  const loaded = config.load({ path: missing, env: {}, flags: {} }).config;
+  const live = new limits.Limits(loaded.limits);
+  ok(AUTH_KNOBS.every(([bare]) => live[bare] === loaded.limits[bare]),
+    'every auth knob survives a round-trip through the Limits class unclamped');
 }
 
 // ----------------------------------------------------------- load never throws
@@ -468,7 +542,7 @@ function testRedact() {
  * stated purpose of telling two credentials apart in a listing. That is 4 of
  * 16 characters, 20 of 80 bits, printed into exactly the outputs the docs
  * call safe to screen-share; and `credential.id` is in the same table and
- * already does the disambiguating. Every group is hidden now, so the
+ * already does the disambiguating. Every character is hidden now, so the
  * assertion is the strong one: no run of the secret survives at all.
  */
 function testMaskKeepsNoPartOfTheSecret() {
@@ -479,7 +553,7 @@ function testMaskKeepsNoPartOfTheSecret() {
   }];
 
   const masked = config.redact(source).auth.credentials[0].secret;
-  ok(masked === '****-****-****-****', 'every group of the join code is masked');
+  ok(masked === '******', 'the join code is masked as six ungrouped characters');
 
   const bare = SECRET.replace(/-/g, '');
   let windows = 0;
@@ -543,6 +617,7 @@ function main() {
     testLegacyEnvVars(tmp);
     testClamping();
     testBoundsNesting();
+    testAuthThrottleKeys(tmp);
     testLoadNeverThrows(tmp);
     testSaveAndRoundTrip(tmp);
     testSaveRefusesPlantedSymlink(tmp);

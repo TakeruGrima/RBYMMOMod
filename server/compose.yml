@@ -55,11 +55,12 @@ services:
       # RBY_MMO_PORT: "7788"        # container-side port; keep ports: in step
       # RBY_MMO_LOG_LEVEL: "debug"  # debug | info | warn | error | silent
       #
-      # RBY_MMO_AUTH_REQUIRED: "false"
-      #   Turns the join code off. Read this before you use it: it makes the
-      #   world joinable by anyone who can reach the port, which on a published
-      #   port means anyone on the internet. It exists for a hub that is only
-      #   reachable on your LAN or over a VPN.
+      # There is deliberately no setting here that turns the passcode off.
+      # RBY_MMO_AUTH_REQUIRED=false used to open the hub to anyone who could
+      # reach the port; it now makes the hub refuse to start, so a container
+      # carrying it restart-loops instead of quietly serving an open world.
+      # A LAN or VPN hub still wants a passcode -- it costs one `docker
+      # compose exec hub rby-mmo-hub invite list --reveal` to read it out.
 
     # --- persistence -------------------------------------------------------
     volumes:

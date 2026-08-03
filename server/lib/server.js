@@ -32,6 +32,12 @@
  *    is a flood signal**, and answered in one sentence when it is not. Bytes
  *    spent on a flooder are the attack; bytes spent on an honest friend
  *    behind the same NAT are the whole point of having a message at all.
+ *  - **The authentication throttle is asked before a nonce is minted, and
+ *    told only about genuine credential rejections.** Both halves matter: a
+ *    refusal that got recorded as a failure would let an honest player extend
+ *    their own backoff by retrying, and a check that ran after the challenge
+ *    was sent would not be a throttle at all. What a tripped hub-wide ceiling
+ *    must *not* do is touch anybody already playing; see the call site.
  *
  * No dependencies: node:net plus this directory.
  */
@@ -113,6 +119,73 @@ function refusalFor(reason, limits) {
   }
 }
 
+// "3 seconds", "1 second". A throttled player is being told how long to wait,
+// and a sentence that says "1 seconds" reads like a bug in the hub they are
+// already unhappy with.
+function seconds(ms) {
+  const whole = Math.max(1, Math.ceil(ms / 1000));
+  return whole === 1 ? '1 second' : `${whole} seconds`;
+}
+
+/*
+ * The two sentences a throttled join attempt gets, and they are deliberately
+ * different.
+ *
+ * `auth_lockdown` is about the hub: the hub-wide ceiling has tripped, so
+ * *nobody* is being authenticated for a moment, and a player holding the
+ * right code is being turned away through no fault of their own. Telling
+ * them "your code was wrong too many times" there would be a lie they would
+ * act on -- by re-reading a code that is perfectly good.
+ *
+ * `auth_backoff` is about them: this address has produced wrong codes, and
+ * the fix is to check the code before trying again.
+ *
+ * Neither names a credential, a count or a threshold. The wait is the one
+ * number worth giving, because it is the only one that answers "so what do I
+ * do now".
+ */
+function authRefusalFor(reason, retryAfterMs) {
+  if (reason === 'auth_lockdown') {
+    return 'This hub has paused new join attempts for a moment: too many wrong ' +
+      `join codes have been tried on it. Try again in ${seconds(retryAfterMs)}. ` +
+      'Players already on the hub are unaffected.';
+  }
+  return 'Too many wrong join codes from your address. Check the code with ' +
+    `whoever is hosting, then try again in ${seconds(retryAfterMs)}.`;
+}
+
+// --------------------------------------------------- the door has to be locked
+//
+// The owner's instruction, for both hosting paths: the passcode is required.
+// The in-game host refuses to start without one; so does this.
+
+/*
+ * Would this configuration admit anyone who found the port? Returns the
+ * sentence to fail with, or null when the door has a lock on it.
+ *
+ * Two ways in, and a player can walk into either without meaning to:
+ * `auth.required` off, and `auth.required` on with nothing behind it -- every
+ * credential revoked, expired, spent, or never minted. The second is the one
+ * worth catching by hand, because it *looks* configured.
+ *
+ * Both name the command that fixes them. A hub that will not start is only a
+ * good outcome if the host learns what to type next.
+ */
+function openDoorRefusal(config) {
+  const settings = (config && config.auth) || {};
+  if (!settings.required) {
+    return 'this hub would let in anyone who finds the port: auth.required is ' +
+      'false. Run `rby-mmo-hub init` to write a config with a join code in it, ' +
+      'or `rby-mmo-hub invite` to add one to the config you already have.';
+  }
+  if (auth.activeCredentials(settings.credentials).length === 0) {
+    return 'this hub requires a join code and has none that still works -- ' +
+      'every credential is missing, revoked, expired or used up -- so nobody ' +
+      'could join it. Run `rby-mmo-hub invite` to mint one.';
+  }
+  return null;
+}
+
 /*
  * The auth port the relay expects: null, or exactly newNonce() and
  * verify(nonce, response). The relay knows the shape of the handshake and
@@ -142,7 +215,7 @@ function refusalFor(reason, limits) {
  * replaces config.auth.credentials in place and the very next challenge is
  * judged against the new list.
  */
-function authPort(config, onUse) {
+function authPort(config, onUse, throttle) {
   const settings = (config && config.auth) || {};
   if (!settings.required) return null;
   const liveCredentials = () => {
@@ -156,7 +229,19 @@ function authPort(config, onUse) {
     verify(nonce, response) {
       const credentials = liveCredentials();
       const verdict = auth.verify(nonce, response, credentials);
-      if (!verdict || !verdict.ok) return verdict;
+      /*
+       * The one place in the program that learns a *passcode was wrong*, as
+       * opposed to "this connection did not become a player" -- which is a
+       * far larger set: a peer that answered a stale challenge, one the
+       * throttle turned away before a nonce was minted, one whose socket died
+       * mid-handshake. Only a rejection from here is a guess at the code, so
+       * only a rejection from here is charged to the address that made it.
+       */
+      if (!verdict || !verdict.ok) {
+        throttle.failed();
+        return verdict;
+      }
+      throttle.passed();
 
       const used = credentials.find(
         (credential) => credential && credential.id === verdict.credentialId);
@@ -209,6 +294,15 @@ function logFor(config) {
  * is this package's main, and an embedding caller must not be able to reach
  * authPort's "no auth section means admit everyone" branch by passing a
  * half-built object.
+ *
+ * **A hub that would admit anyone does not start.** `auth.required` off, or on
+ * with no credential that still works, is refused here with a sentence naming
+ * the command that fixes it -- see openDoorRefusal(). `allowUnauthenticated:
+ * true` is the one way past it, and it exists for exactly one caller: the
+ * legacy `hub.js` shim, which passes it explicitly and says out loud at
+ * startup that it has no join code. Anything else that sets it is making the
+ * same choice deliberately and in writing, which is the whole difference
+ * between a decision and an accident.
  */
 function start(options = {}) {
   const opts = options || {};
@@ -243,17 +337,81 @@ function start(options = {}) {
   const handleSignals = opts.handleSignals !== false;
   const onShutdown = typeof opts.onShutdown === 'function' ? opts.onShutdown : null;
 
+  const unauthenticatedAllowed = opts.allowUnauthenticated === true;
+
   for (const warning of checked.warnings) log.warn(`config: ${warning}`);
   if (authWasMissing) {
     log.warn('config: no auth section was given, so this hub is defaulting to ' +
       `requiring a join code and has none -- nobody can join. Pass ` +
-      `auth: { required: false } for an open hub, or auth.credentials from ` +
-      '`rby-mmo-hub invite`.');
+      `auth.credentials from \`rby-mmo-hub invite\`, or auth: { required: ` +
+      `false } together with allowUnauthenticated: true if this really is an ` +
+      'open hub on a trusted LAN.');
+  }
+
+  if (!unauthenticatedAllowed) {
+    const refusal = openDoorRefusal(config);
+    if (refusal) {
+      /*
+       * Rejected, not thrown. Every caller in this package reaches start()
+       * through .then/.catch -- bin/rby-mmo-hub.js turns a rejection into
+       * "The hub failed to start: <sentence>", hub.js into "hub failed to
+       * start: <sentence>" -- and a synchronous throw would reach both of
+       * them as a stack trace instead, which is precisely the outcome this
+       * check exists to avoid. Nothing has been allocated yet, so there is
+       * nothing to unwind: no listener, no limits, no relay, no handlers.
+       */
+      return Promise.reject(new Error(refusal));
+    }
   }
 
   const limits = new Limits(config.limits || {});
   limits.setBans(config.bans);
   limits.setAllowlist(config.allowlist);
+
+  /*
+   * The address whose line the relay is processing right now, or null.
+   *
+   * The auth port relay.js calls back into is handed a nonce and a response
+   * and nothing else -- that port contract is relay.js's, and relay.js is not
+   * this module's file to widen. But the throttle is *per address*, so the
+   * address has to reach it somehow.
+   *
+   * It rides as a call-scoped parameter. `relay.handle()` is synchronous end
+   * to end -- it parses, dispatches and writes without ever yielding -- and
+   * node runs one of them at a time, so between the assignment below and the
+   * `finally` that clears it there is exactly one connection in flight and
+   * this is its address. It is not shared mutable state; it is an argument
+   * with nowhere else to ride.
+   */
+  let activeAddress = null;
+
+  /*
+   * What the auth port tells the throttle. Two calls, both about the *result
+   * of a credential check* and nothing else -- see authPort's verify().
+   */
+  const authThrottle = {
+    failed() {
+      // No connection in flight means the port is being driven directly (a
+      // suite with a stub). There is no address to charge, and inventing one
+      // would put a fictional entry in a table that decides who gets in.
+      if (!activeAddress) return;
+      // The return value is the *edge*: true only on the failure that trips
+      // the hub-wide ceiling, so this says so once rather than once per
+      // attempt for the whole lockout. Neither the code nor the response is
+      // ever logged -- the point of a challenge is that they do not leak.
+      if (limits.noteAuthFailure(activeAddress)) {
+        log.warn('too many wrong join codes across this hub ' +
+          `(${limits.authGlobalFailures} within ` +
+          `${Math.round(limits.authGlobalWindowMs / 1000)}s): new join attempts ` +
+          `are refused for the next ${seconds(limits.authLockoutMs)}. Players ` +
+          'already connected are not affected and stay in the game.');
+      }
+    },
+    passed() {
+      if (!activeAddress) return;
+      limits.noteAuthSuccess(activeAddress);
+    },
+  };
 
   const relay = new Relay({
     maxPlayers: config.maxPlayers,
@@ -262,7 +420,7 @@ function start(options = {}) {
     // schema deliberately does not know about, so it is read from the object
     // as given rather than from the validated copy validate() pruned it out of.
     protocol: given.protocol,
-    auth: authPort(config, noteCredentialUse),
+    auth: authPort(config, noteCredentialUse, authThrottle),
     log,
   });
 
@@ -472,7 +630,54 @@ function start(options = {}) {
 
         const msg = parseLine(line);
         if (!msg) continue; // a malformed line is dropped, never fatal
-        relay.handle(id, msg);
+
+        /*
+         * The authentication throttle, and the only place this module reads a
+         * message type.
+         *
+         * It has to be asked on the path that would *mint a nonce*, and that
+         * path is relay.js's `mmo.hello` handler -- so either this check sits
+         * inside relay.js, or it sits in front of the call that reaches it.
+         * In front is the better of the two even ignoring file ownership: the
+         * relay's refusal for a nonce it could not issue is one generic
+         * sentence, and `auth_lockdown` and `auth_backoff` are two different
+         * situations that deserve two different things said to the player.
+         *
+         * `greeted` is the guard against charging the gate twice: an already
+         * admitted player's stray hello is a no-op inside the relay and must
+         * not be read as a fresh attempt to authenticate.
+         *
+         * Answered in a sentence rather than destroyed in silence, unlike the
+         * flood refusals at the top of this file. The population here is not
+         * the same: a lockdown turns away everyone including the friend who
+         * has the right code, and a backoff is most often somebody who read a
+         * character wrong. The connect-rate bucket already bounds how often
+         * either of them can arrive, so the sentence costs one short line per
+         * connection an attacker was going to be allowed to make anyway.
+         */
+        if (relay.auth && msg.type === 'mmo.hello' && !relay.greeted(id)) {
+          const attempt = limits.authAllowed(ip);
+          if (!attempt.ok) {
+            // Refused, and deliberately *not* recorded as a failure: retrying
+            // into a closed door is not a guess at the code, and counting it
+            // would let an honest player extend their own backoff forever.
+            log.debug(`refused a join attempt from ${safe(ip)}: ${attempt.reason}`);
+            const client = relay.get(id);
+            const message = authRefusalFor(attempt.reason, limits.authRetryAfterMs(ip));
+            if (client) relay.refuse(client, message);
+            else socket.destroy();
+            return;
+          }
+        }
+
+        // See `activeAddress`: the address rides here, scoped to this one
+        // synchronous dispatch, because the auth port has no parameter for it.
+        activeAddress = ip;
+        try {
+          relay.handle(id, msg);
+        } finally {
+          activeAddress = null;
+        }
 
         /*
          * The seam for "the handshake is over". relay.js exposes no event

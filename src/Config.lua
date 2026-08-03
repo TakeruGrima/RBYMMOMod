@@ -91,15 +91,24 @@ M.HANDSHAKE_TIMEOUT = 10
 -- Crockford-style: I, L, O and U are gone, so nothing is mistyped off a
 -- screenshot (1/I, 0/O) and no code spells anything.  The deeper reason the
 -- alphabet is this and not base32 or hex is that every character here is on
--- the mod's own naming grid (src/Ui.lua:51-64), dash included and on both
--- pages -- a code has to be typeable with a d-pad, without a page flip.
+-- the mod's own naming grid (src/Ui.lua:51-64), on both pages -- a code has
+-- to be typeable with a d-pad, without a page flip.
 M.CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-M.CODE_LEN = 16             -- 16 symbols of 5 bits = 80 bits of secret
-M.CODE_GROUP_LEN = 4        -- displayed in fours: ABCD-EFGH-JKMN-PQRS
--- What the naming grid will let you type for a code: the dashed form is 19
--- characters, and the slop is there because a player pasting from a chat
--- message may bring spare punctuation that normalisation drops anyway.
-M.CODE_ENTRY_MAX = 24
+M.CODE_LEN = 6              -- 6 symbols of 5 bits = 30 bits of secret
+-- 30 bits is the whole of it, and it is a chosen trade: six characters, no
+-- dashes (A7K3P9), is what a host can read out over voice once and a guest
+-- can type on a d-pad without giving up.  Be honest about what that buys.
+-- Online it is not the weak link: the hub rate limits connects (60 a minute
+-- by default, server/lib/limits.js), so walking 2^30 codes past it takes
+-- decades.  Offline it is: nothing here is under TLS, so anyone who can
+-- capture one challenge and the response to it can grind the same 2^30
+-- against that pair at their own speed, where no limit reaches them, and
+-- recover the code.  A code is a door lock on a session, not a secret.
+--
+-- What the naming grid will let you type for a code: six characters plus
+-- slop, because a player pasting from a chat message may bring spare
+-- punctuation or spaces that normalisation drops anyway.
+M.CODE_ENTRY_MAX = 12
 
 -- The challenge nonce is 16 random bytes, lowercase hex on the wire...
 M.NONCE_HEX = 32

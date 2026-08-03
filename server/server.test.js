@@ -10,7 +10,8 @@
  * built around that relay: the HMAC challenge/response handshake, refusal
  * uniformity, replay resistance, the §3.6 seat-at-hello fix, per-IP and ban
  * enforcement, the handshake timeout, invite use-counting, and graceful
- * shutdown.
+ * shutdown -- plus the authentication throttle that guards a 30-bit passcode,
+ * and the refusal to start a hub anyone could walk into.
  *
  * Same idiom as hub.test.js on purpose: the throwing `ok()`, the
  * promise-based `Client` wrapper with `expect`/`expectSilence`, one scenario
@@ -62,8 +63,11 @@ async function waitFor(predicate, timeoutMs) {
 // around a real socket speaking the mod's newline-JSON.
 
 class Client {
-  constructor(port) {
-    this.socket = net.createConnection({ port, host: '127.0.0.1' });
+  // `host` is almost always the default. It is a parameter for exactly one
+  // reason: the per-address throttle has to be shown sparing a *different*
+  // address, and on a dual-stack listener ::1 is one. See secondLoopback().
+  constructor(port, host = '127.0.0.1') {
+    this.socket = net.createConnection({ port, host });
     this.socket.setEncoding('utf8');
     this.buffer = '';
     this.inbox = [];
@@ -143,15 +147,38 @@ function hmacHex(key, nonceHex) {
     .digest('hex');
 }
 
-// Three join codes, hand-picked from the mod's Crockford-style alphabet
-// (0-9, A-Z minus I L O U) so they are valid without going through
-// auth.normalizeCode() at all -- stripping the dashes is the whole job.
-const PRIMARY_CODE = 'ABCD-EFGH-JKMN-PQRS';
-const PRIMARY_KEY = 'ABCDEFGHJKMNPQRS';
-const EXPIRED_CODE = 'TVWX-YZ01-2345-6789';
-const EXPIRED_KEY = 'TVWXYZ0123456789';
-const REVOKED_CODE = 'GHJK-MNPQ-RSTV-WXYZ';
-const REVOKED_KEY = 'GHJKMNPQRSTVWXYZ';
+// Join codes, hand-picked from the mod's Crockford-style alphabet (0-9, A-Z
+// minus I L O U) so every one of them is already in its normalised form.
+//
+// A passcode is six characters now, not sixteen: 2^30 rather than 2^80, taken
+// deliberately because a code a player has to type on an in-game naming grid
+// has to be short (server/lib/auth.js's header states the trade and what pays
+// for it). At six characters the typed form and the normalised form are the
+// same string, so there is no separate `_KEY` spelling any more -- the code
+// *is* the HMAC key. WRONG_CODE is well-formed and belongs to no hub in this
+// file, which is what "a wrong code" means to a player: not malformed, just
+// not theirs.
+const PRIMARY_CODE = 'A7K3P9';
+const EXPIRED_CODE = 'TVWXYZ';
+const REVOKED_CODE = 'GHJKMN';
+const WRONG_CODE = 'ZZ9ZZ9';
+
+// A credential in the shape config.json stores. Written out by hand rather
+// than built with auth.newCredential(), for the same reason hmacHex() is: a
+// suite that constructs its fixtures with the module under test grades its
+// own homework.
+function credential(id, secret, extra = {}) {
+  return Object.assign({
+    id,
+    label: id,
+    secret,
+    createdAt: new Date().toISOString(),
+    expiresAt: null,
+    maxUses: null,
+    uses: 0,
+    revoked: false,
+  }, extra);
+}
 
 // ------------------------------------------------------------- server helper
 
@@ -193,11 +220,24 @@ function baseConfig(overrides = {}) {
   });
 }
 
+/*
+ * `allowUnauthenticated` is passed by default, and it is not a shortcut.
+ *
+ * start() refuses to bring up a hub anyone could walk into -- that is its own
+ * scenario (passcodeRequiredTest), asserted there without this flag. Every
+ * *other* scenario in this file is about something underneath that decision:
+ * the seat-at-hello fix, the per-IP cap, the sweep, shutdown. Making each of
+ * them mint a join code and run a handshake first would test the door three
+ * times over and the subject once, and would hide which of the two a failure
+ * came from. So the door is opted out of exactly where it is not the subject,
+ * in as many words, which is the same thing the option asks of hub.js.
+ */
 function startServer(overrides = {}, extra = {}) {
   return start(Object.assign({
     config: baseConfig(overrides),
     log: NULL_LOG,
     handleSignals: false,
+    allowUnauthenticated: true,
   }, extra));
 }
 
@@ -209,6 +249,14 @@ function startServer(overrides = {}, extra = {}) {
 
 async function authHandshakeTest() {
   const handle = await startServer({
+    // This scenario deliberately produces four wrong codes in a row from one
+    // address -- wrong, expired, revoked, replayed -- and every one of them is
+    // the subject of an assertion below. Under the shipped grace of three the
+    // fourth would be met by the throttle instead of by the credential check,
+    // and the handshake's own behaviour would stop being observable. The
+    // throttle is not disabled, it is moved out of the frame; it has three
+    // scenarios of its own further down.
+    limits: { authFailureGrace: 100 },
     auth: {
       required: true,
       credentials: [
@@ -241,7 +289,7 @@ async function authHandshakeTest() {
     const challenge = await good.expect('mmo.challenge');
     ok(/^[0-9a-f]{32}$/.test(challenge.nonce),
       'the nonce is 32 lowercase hex characters');
-    good.send('mmo.auth', { response: hmacHex(PRIMARY_KEY, challenge.nonce) });
+    good.send('mmo.auth', { response: hmacHex(PRIMARY_CODE, challenge.nonce) });
     const welcome = await good.expect('mmo.welcome');
     ok(typeof welcome.id === 'string', 'a correctly-answered challenge is welcomed');
     good.close();
@@ -252,7 +300,7 @@ async function authHandshakeTest() {
     wrong.send('mmo.hello', { proto: 2, name: 'WRONG' });
     const wrongChallenge = await wrong.expect('mmo.challenge');
     wrong.send('mmo.auth', {
-      response: hmacHex('ZZZZYYYYXXXXWWWW', wrongChallenge.nonce),
+      response: hmacHex(WRONG_CODE, wrongChallenge.nonce),
     });
     const wrongRefusal = await wrong.expect('mmo.error');
     wrong.close();
@@ -263,7 +311,7 @@ async function authHandshakeTest() {
     expired.send('mmo.hello', { proto: 2, name: 'EXPIRED' });
     const expiredChallenge = await expired.expect('mmo.challenge');
     expired.send('mmo.auth', {
-      response: hmacHex(EXPIRED_KEY, expiredChallenge.nonce),
+      response: hmacHex(EXPIRED_CODE, expiredChallenge.nonce),
     });
     const expiredRefusal = await expired.expect('mmo.error');
     expired.close();
@@ -274,7 +322,7 @@ async function authHandshakeTest() {
     revoked.send('mmo.hello', { proto: 2, name: 'REVOKED' });
     const revokedChallenge = await revoked.expect('mmo.challenge');
     revoked.send('mmo.auth', {
-      response: hmacHex(REVOKED_KEY, revokedChallenge.nonce),
+      response: hmacHex(REVOKED_CODE, revokedChallenge.nonce),
     });
     const revokedRefusal = await revoked.expect('mmo.error');
     revoked.close();
@@ -291,7 +339,7 @@ async function authHandshakeTest() {
     await capture.ready();
     capture.send('mmo.hello', { proto: 2, name: 'CAPTURE' });
     const capturedChallenge = await capture.expect('mmo.challenge');
-    const capturedResponse = hmacHex(PRIMARY_KEY, capturedChallenge.nonce);
+    const capturedResponse = hmacHex(PRIMARY_CODE, capturedChallenge.nonce);
     capture.close(); // never finishes its own handshake
 
     const replay = new Client(port);
@@ -310,7 +358,7 @@ async function authHandshakeTest() {
     await twice.ready();
     twice.send('mmo.hello', { proto: 2, name: 'TWICE' });
     const twiceChallenge = await twice.expect('mmo.challenge');
-    const twiceResponse = hmacHex(PRIMARY_KEY, twiceChallenge.nonce);
+    const twiceResponse = hmacHex(PRIMARY_CODE, twiceChallenge.nonce);
     twice.send('mmo.auth', { response: twiceResponse });
     await twice.expect('mmo.welcome');
     // the nonce was already consumed by the line above; a second mmo.auth
@@ -324,14 +372,14 @@ async function authHandshakeTest() {
     // ---- mmo.auth with no outstanding challenge at all
     const unsolicited = new Client(port);
     await unsolicited.ready();
-    unsolicited.send('mmo.auth', { response: hmacHex(PRIMARY_KEY, '00'.repeat(16)) });
+    unsolicited.send('mmo.auth', { response: hmacHex(PRIMARY_CODE, '00'.repeat(16)) });
     await unsolicited.expectSilence('mmo.error', 300);
     await unsolicited.expectSilence('mmo.welcome', 50);
     // and the connection is still usable afterwards -- ignored, not spent
     unsolicited.send('mmo.hello', { proto: 2, name: 'LATER' });
     const laterChallenge = await unsolicited.expect('mmo.challenge');
     unsolicited.send('mmo.auth', {
-      response: hmacHex(PRIMARY_KEY, laterChallenge.nonce),
+      response: hmacHex(PRIMARY_CODE, laterChallenge.nonce),
     });
     await unsolicited.expect('mmo.welcome');
     ok(true, 'an unsolicited mmo.auth is ignored, not treated as a fatal error');
@@ -477,7 +525,7 @@ async function capHoldsWhenEveryoneGreetsBeforeAnswering() {
 
     // Phase two: everybody answers, correctly.
     for (let i = 0; i < 6; i++) {
-      clients[i].send('mmo.auth', { response: hmacHex(PRIMARY_KEY, challenges[i].nonce) });
+      clients[i].send('mmo.auth', { response: hmacHex(PRIMARY_CODE, challenges[i].nonce) });
     }
 
     const verdicts = await Promise.all(clients.map(
@@ -578,17 +626,12 @@ async function handshakeTimeoutTest() {
 async function inviteUsesPersistTest() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rby-mmo-server-test-'));
   const configPath = path.join(dir, 'config.json');
-  const code = 'JKMN-PQRS-TVWX-YZ23';
-  const key = code.replace(/-/g, '');
+  const code = 'JKMN67';
 
   const cfg = baseConfig({
     auth: {
       required: true,
-      credentials: [{
-        id: 'limited', label: 'One use', secret: code,
-        createdAt: new Date().toISOString(), expiresAt: null,
-        maxUses: 1, uses: 0, revoked: false,
-      }],
+      credentials: [credential('limited', code, { label: 'One use', maxUses: 1 })],
     },
   });
   fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), { mode: 0o600 });
@@ -603,14 +646,14 @@ async function inviteUsesPersistTest() {
       await first.ready();
       first.send('mmo.hello', { proto: 2, name: 'FIRST' });
       const firstChallenge = await first.expect('mmo.challenge');
-      first.send('mmo.auth', { response: hmacHex(key, firstChallenge.nonce) });
+      first.send('mmo.auth', { response: hmacHex(code, firstChallenge.nonce) });
       await first.expect('mmo.welcome');
 
       const second = new Client(port);
       await second.ready();
       second.send('mmo.hello', { proto: 2, name: 'SECOND' });
       const secondChallenge = await second.expect('mmo.challenge');
-      second.send('mmo.auth', { response: hmacHex(key, secondChallenge.nonce) });
+      second.send('mmo.auth', { response: hmacHex(code, secondChallenge.nonce) });
       await second.expect('mmo.error');
       ok(true, 'a maxUses:1 credential admits exactly one client');
       second.close();
@@ -639,16 +682,11 @@ async function inviteUsesPersistTest() {
 // ------- and the converse: no configPath, no write, ever
 
 async function inviteUsesNoWriteWithoutConfigPathTest() {
-  const code = 'PQRS-TVWX-YZ23-4567';
-  const key = code.replace(/-/g, '');
+  const code = 'PQRS45';
   const cfg = baseConfig({
     auth: {
       required: true,
-      credentials: [{
-        id: 'ephemeral', label: 'No file', secret: code,
-        createdAt: new Date().toISOString(), expiresAt: null,
-        maxUses: null, uses: 0, revoked: false,
-      }],
+      credentials: [credential('ephemeral', code, { label: 'No file' })],
     },
   });
 
@@ -669,7 +707,7 @@ async function inviteUsesNoWriteWithoutConfigPathTest() {
       await client.ready();
       client.send('mmo.hello', { proto: 2, name: 'EPHEMERAL' });
       const challenge = await client.expect('mmo.challenge');
-      client.send('mmo.auth', { response: hmacHex(key, challenge.nonce) });
+      client.send('mmo.auth', { response: hmacHex(code, challenge.nonce) });
       await client.expect('mmo.welcome');
       // past the ~1s coalescing window a persisted write would have used
       await sleep(1300);
@@ -696,26 +734,18 @@ async function sighupReloadTest() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rby-mmo-reload-test-'));
   const configPath = path.join(dir, 'config.json');
 
-  const invite = 'JKMN-PQRS-TVWX-YZ23';
-  const inviteKey = invite.replace(/-/g, '');
-  const minted = 'QRST-VWXY-Z234-5678';
-  const mintedKey = minted.replace(/-/g, '');
-
-  const credential = (id, secret, revoked) => ({
-    id, label: id, secret,
-    createdAt: new Date().toISOString(), expiresAt: null,
-    maxUses: null, uses: 0, revoked,
-  });
+  const invite = 'JKMN67';
+  const minted = 'QRST89';
 
   const write = (auth, bans) => fs.writeFileSync(configPath,
     JSON.stringify(baseConfig({ auth, bans }), null, 2), { mode: 0o600 });
 
-  write({ required: true, credentials: [credential('invite', invite, false)] }, []);
+  write({ required: true, credentials: [credential('invite', invite)] }, []);
 
   const log = recordingLog();
   const handle = await start({
     config: baseConfig({
-      auth: { required: true, credentials: [credential('invite', invite, false)] },
+      auth: { required: true, credentials: [credential('invite', invite)] },
     }),
     log,
     configPath,
@@ -743,7 +773,7 @@ async function sighupReloadTest() {
   };
 
   try {
-    const staying = await join('STAYING', inviteKey);
+    const staying = await join('STAYING', invite);
     ok(staying.verdict.type === 'mmo.welcome',
       'the invite code works before it is revoked');
 
@@ -757,20 +787,20 @@ async function sighupReloadTest() {
     write({
       required: true,
       credentials: [
-        credential('invite', invite, true),
-        credential('minted', minted, false),
+        credential('invite', invite, { revoked: true }),
+        credential('minted', minted),
       ],
     }, []);
     await hangup('credentials');
 
-    const rejected = await join('REVOKED', inviteKey);
+    const rejected = await join('REVOKED', invite);
     ok(rejected.verdict.type === 'mmo.error',
       'the revoked code is refused after SIGHUP, with no restart');
     ok(/not accepted/i.test(rejected.verdict.message),
       'and refused in the ordinary sentence, not a new one');
     rejected.client.close();
 
-    const admitted = await join('MINTED', mintedKey);
+    const admitted = await join('MINTED', minted);
     ok(admitted.verdict.type === 'mmo.welcome',
       'a credential added by the same edit admits immediately');
     admitted.client.close();
@@ -785,7 +815,7 @@ async function sighupReloadTest() {
     await sleep(1300);
     write({
       required: true,
-      credentials: [credential('minted', minted, false)],
+      credentials: [credential('minted', minted)],
     }, ['127.0.0.1']);
     await hangup('bans');
 
@@ -912,6 +942,9 @@ function childHubScript(port) {
     '    allowlist: [],',
     '  },',
     '  log: { debug(){}, info(){}, warn(){}, error(){} },',
+    // Same reason startServer() passes it: this scenario is about SIGTERM, and
+    // a handshake in front of it would only add a second thing that can fail.
+    '  allowUnauthenticated: true,',
     '}).then(() => {',
     "  process.stdout.write('listening\\n');",
     '}).catch((err) => {',
@@ -985,6 +1018,365 @@ async function gracefulShutdownSigtermTest() {
 }
 
 // =========================================================================
+// the authentication throttle
+// =========================================================================
+//
+// A passcode is 2^30 now, not 2^80 (server/lib/auth.js). Per-address limiting
+// alone does not defend a number that small -- it tells an attacker how many
+// addresses to rent -- so limits.js throttles wrong codes twice: an escalating
+// per-address backoff shaped for humans who mistype, and a hub-wide ceiling
+// that does not care how many addresses the attacker has. One scenario each,
+// and then the one that matters most: what a tripped ceiling is *not* allowed
+// to do to the people already playing.
+
+/*
+ * limits.js's knobs, scaled to a suite.
+ *
+ * The shipped values are shaped for a real evening: three free typos, a
+ * two-second first backoff doubling to five minutes, a hundred wrong codes a
+ * minute before the ceiling trips, and a minute of lockout. Every one of them
+ * is set to its floor here, so the same code paths run in tenths of a second
+ * and nothing below ever waits out a real lockout.
+ */
+const THROTTLE_LIMITS = Object.freeze({
+  authFailureGrace: 0,        // no free typos: the first wrong code counts
+  authFailureWindowMs: 60000,
+  authBackoffBaseMs: 1000,    // the first backoff, doubling from there
+  authBackoffMaxMs: 2000,
+  authGlobalFailures: 6,      // six wrong codes hub-wide trips the ceiling
+  authGlobalWindowMs: 60000,
+  authLockoutMs: 1000,        // the shortest lockout the schema allows
+  // Every socket in these scenarios dials the same loopback address, many
+  // times over, and none of that is the subject.
+  perIpConnections: 20,
+  connectBurst: 200,
+  connectPerMinute: 6000,
+  maxPending: 32,
+});
+
+function startThrottleServer(overrides = {}) {
+  return startServer(Object.assign({
+    maxPlayers: 4,
+    limits: THROTTLE_LIMITS,
+    auth: { required: true, credentials: [credential('primary', PRIMARY_CODE)] },
+  }, overrides));
+}
+
+/*
+ * One join attempt, start to finish: hello, the challenge if one comes, the
+ * response, and whatever verdict comes back.
+ *
+ * `challenged` is the fact these scenarios turn on. The relay mints its nonce
+ * inside the hello handler, so a refusal that arrives *instead of* a challenge
+ * is the throttle speaking, and one that arrives after the response is the
+ * credential check. Telling those two apart is the whole point of putting the
+ * limiter in front of the nonce rather than behind it.
+ */
+async function joinAttempt(port, name, code, host) {
+  const client = new Client(port, host);
+  await client.ready();
+  client.send('mmo.hello', { proto: 2, name });
+  const first = await client.expectEither('mmo.challenge', 'mmo.error');
+  if (first.type !== 'mmo.challenge') {
+    return { client, verdict: first, challenged: false };
+  }
+  client.send('mmo.auth', { response: hmacHex(code, first.nonce) });
+  const verdict = await client.expectEither('mmo.welcome', 'mmo.error');
+  return { client, verdict, challenged: true };
+}
+
+/*
+ * A second loopback address, where the host has one.
+ *
+ * The per-address backoff only means anything if a *different* address is
+ * shown getting in while one is shut out, and every other socket in this file
+ * comes from 127.0.0.1. A dual-stack listener supplies the second one for
+ * free: it sees an IPv4 loopback connection as 127.0.0.1 and an IPv6 one as
+ * ::1, two genuinely distinct addresses to the limiter, with no interface
+ * aliasing and no privileges.
+ *
+ * A machine with IPv6 switched off simply has no second address, which is not
+ * a fact about the hub -- so the scenario asks the limiter the same question
+ * directly instead. Same assertion count either way, and the answer is read
+ * off the same object the socket path consults one line before it mints a
+ * nonce.
+ */
+let secondLoopbackProbe = null;
+function secondLoopback() {
+  if (secondLoopbackProbe) return secondLoopbackProbe;
+  secondLoopbackProbe = new Promise((resolve) => {
+    const server = net.createServer((socket) => socket.destroy());
+    const answer = (value) => {
+      try { server.close(); } catch (err) { /* it never bound */ }
+      resolve(value);
+    };
+    server.once('error', () => answer(null));
+    server.listen(0, '::', () => {
+      const probe = net.createConnection({ port: server.address().port, host: '::1' });
+      probe.once('error', () => { probe.destroy(); answer(null); });
+      probe.once('connect', () => { probe.destroy(); answer('::1'); });
+    });
+  });
+  return secondLoopbackProbe;
+}
+
+// ------- wrong codes back one address off, and only that address
+
+async function authBackoffPerAddressTest() {
+  const other = await secondLoopback();
+  const handle = await startThrottleServer(
+    other ? { listen: { host: '::', port: 0 } } : {});
+  const port = handle.port;
+  const opened = [];
+
+  try {
+    // ---- the first wrong code is answered by the credential check
+    const typo = await joinAttempt(port, 'TYPO', WRONG_CODE);
+    const failedAt = Date.now();
+    opened.push(typo.client);
+    ok(typo.challenged, 'a first wrong code is challenged like any other attempt');
+    ok(/not accepted/i.test(typo.verdict.message),
+      'and refused in the ordinary sentence, which names no throttle');
+
+    // ---- the next one never reaches it. The code below is the *right* one:
+    // a backed-off address is not being told its code is wrong, it is being
+    // told to wait, and that has to be true even when it finally has the code.
+    const again = await joinAttempt(port, 'AGAIN', PRIMARY_CODE);
+    opened.push(again.client);
+    ok(!again.challenged,
+      'the next attempt from that address is refused before a nonce is minted');
+    ok(/wrong join codes from your address/i.test(again.verdict.message),
+      'and told that it is their address that is backed off');
+    ok(/try again in/i.test(again.verdict.message),
+      'with the one number that answers "so what do I do now"');
+
+    // ---- meanwhile a different address is not throttled at all
+    if (other) {
+      const elsewhere = await joinAttempt(port, 'ELSEWHERE', PRIMARY_CODE, other);
+      opened.push(elsewhere.client);
+      ok(elsewhere.verdict.type === 'mmo.welcome',
+        'a correct code from a different address still gets in meanwhile');
+    } else {
+      ok(handle.limits.authAllowed('198.51.100.9').ok,
+        'a correct code from a different address still gets in meanwhile');
+    }
+
+    // ---- retrying into the closed door does not push the door further shut
+    let refused = 0;
+    for (let i = 0; i < 3; i++) {
+      const retry = await joinAttempt(port, 'RETRY' + i, PRIMARY_CODE);
+      opened.push(retry.client);
+      if (!retry.challenged) refused += 1;
+    }
+    ok(refused === 3, 'every retry during the backoff is refused the same way');
+
+    /*
+     * ---- and the address recovers on its own schedule.
+     *
+     * One failure, so the backoff is authBackoffBaseMs (1s above) from the
+     * instant of that failure. Had the four refusals since been recorded as
+     * failures too, the wait would have doubled to the 2s ceiling and this
+     * would still be shut -- which is exactly the collateral limits.js refuses
+     * to inflict on an honest player who keeps trying.
+     */
+    await sleep(Math.max(0, failedAt + 1300 - Date.now()));
+    const recovered = await joinAttempt(port, 'RECOVERED', PRIMARY_CODE);
+    opened.push(recovered.client);
+    ok(recovered.verdict.type === 'mmo.welcome',
+      'and the address gets back in once its own backoff elapses, un-extended');
+  } finally {
+    for (const client of opened) client.close();
+    await handle.close();
+  }
+}
+
+// ------- the hub-wide ceiling: the half that survives a rented botnet
+
+async function authGlobalCeilingTest() {
+  const handle = await startThrottleServer();
+  const port = handle.port;
+  const opened = [];
+
+  try {
+    ok(!handle.limits.authLockdown, 'the ceiling starts untripped');
+
+    /*
+     * Six wrong codes from six different addresses.
+     *
+     * Driven through limits.noteAuthFailure -- the exact call lib/server.js's
+     * auth port makes on a rejected verify, and nothing else -- because the
+     * ceiling's entire premise is an attacker with more addresses than a
+     * loopback interface has. Everything the ceiling then *does* is observed
+     * below over real sockets, which is the half that could actually be wired
+     * up wrong.
+     */
+    for (let i = 1; i <= 6; i += 1) handle.limits.noteAuthFailure(`203.0.113.${i}`);
+    ok(handle.limits.authLockdown,
+      'enough failures across enough distinct addresses trip the hub-wide ceiling');
+
+    // 127.0.0.1 has failed nothing, so nothing but the ceiling can refuse it
+    const correct = await joinAttempt(port, 'CORRECT', PRIMARY_CODE);
+    opened.push(correct.client);
+    ok(!correct.challenged,
+      'while it is tripped a newcomer is turned away before a nonce is minted');
+    ok(correct.verdict.type === 'mmo.error',
+      'and a *correct* join code is refused, because the ceiling is not about them');
+    ok(/paused new join attempts/i.test(correct.verdict.message),
+      'in the hub-wide sentence, which says the hub paused joins');
+    ok(!/your address/i.test(correct.verdict.message),
+      'and never blames an address that has failed nothing');
+
+    ok(handle.limits.stats().auth.trackedAddresses === 6,
+      'a refusal is not recorded as a seventh address failing');
+
+    // ---- and it releases on its own, without a restart
+    await sleep(1200); // authLockoutMs is 1000 above
+    ok(!handle.limits.authLockdown, 'the ceiling releases when the lockout elapses');
+    const after = await joinAttempt(port, 'AFTER', PRIMARY_CODE);
+    opened.push(after.client);
+    ok(after.verdict.type === 'mmo.welcome',
+      'and the correct code works again the moment it does');
+  } finally {
+    for (const client of opened) client.close();
+    await handle.close();
+  }
+}
+
+// ------- the collateral boundary, which is the point of the whole design
+//
+// A hub under attack goes temporarily closed to newcomers. It does not go
+// down. Everything a tripped ceiling touches is the *authentication* path:
+// limits.js never reads a connection record for it, never lists anyone in
+// sweep() for it, and never consults it in admit(). This scenario is the
+// end-to-end statement of that -- a friend group mid-session must not be able
+// to tell that a stranger is grinding passcodes at the door, except by
+// reading the host's log.
+
+async function authLockdownSparesConnectedPlayersTest() {
+  const handle = await startThrottleServer();
+  const port = handle.port;
+  const opened = [];
+
+  try {
+    // Two friends, in the world, authenticated before anything went wrong.
+    const ann = await joinAttempt(port, 'ANN', PRIMARY_CODE);
+    const bob = await joinAttempt(port, 'BOB', PRIMARY_CODE);
+    opened.push(ann.client, bob.client);
+    ok(ann.verdict.type === 'mmo.welcome' && bob.verdict.type === 'mmo.welcome',
+      'two players are on the hub before the attack starts');
+
+    // The attack: enough wrong codes, from enough addresses, to trip it.
+    for (let i = 1; i <= 6; i += 1) handle.limits.noteAuthFailure(`198.51.100.${i}`);
+    ok(handle.limits.authLockdown, 'the hub-wide ceiling is tripped');
+
+    // Nobody was disconnected, and nobody was dropped from the roster.
+    ok(handle.relay.playerCount === 2,
+      'both players are still on the roster with the ceiling tripped');
+    ok(!ann.client.socket.destroyed && !bob.client.socket.destroyed,
+      'and neither socket was closed');
+
+    // They can still be heard...
+    ann.client.send('mmo.chat', { scope: 'global', text: 'still here' });
+    const heard = await bob.client.expect('mmo.chat');
+    ok(heard.text === 'still here',
+      'a player who authenticated before the ceiling tripped can still send');
+
+    // ...still get answers back...
+    bob.client.send('mmo.ping', {});
+    await bob.client.expect('mmo.pong');
+    ok(true, 'and still gets an answer back from the hub');
+
+    // ...and the world keeps moving for both of them.
+    bob.client.send('mmo.move', { map: 'PALLET', x: 4, y: 7, facing: 'left' });
+    const moved = await ann.client.expect('mmo.move');
+    ok(moved.x === 4 && moved.facing === 'left',
+      'and presence keeps flowing between the players who are in it');
+
+    // Meanwhile the door really is shut: this is not a hub where nothing
+    // happened, it is a hub that closed to newcomers and kept playing.
+    const newcomer = await joinAttempt(port, 'NEWCOMER', PRIMARY_CODE);
+    opened.push(newcomer.client);
+    ok(newcomer.verdict.type === 'mmo.error',
+      'while a newcomer holding the correct code is refused at the door');
+
+    // And refusing them changed nothing for the two who were already in.
+    ok(handle.relay.playerCount === 2,
+      'which does not disturb the players already on the hub');
+    bob.client.send('mmo.chat', { scope: 'global', text: 'after' });
+    const stillHeard = await ann.client.expect('mmo.chat');
+    ok(stillHeard.text === 'after',
+      'and they are still talking to each other afterwards');
+  } finally {
+    for (const client of opened) client.close();
+    await handle.close();
+  }
+}
+
+// ------- "for both, the pass code is required"
+//
+// The in-game host refuses to start without a passcode; so does this. The
+// configuration a player can walk into is not a malicious one -- it is
+// `auth.required: false` left over from a LAN evening, or a hub whose only
+// invite quietly expired -- so both are refused by name, and both name the
+// command that fixes them rather than arriving as a stack trace.
+
+async function passcodeRequiredTest() {
+  // Runs start() and reports the error, or null if the hub came up. A hub that
+  // does come up is closed immediately: a scenario about refusing to listen
+  // must not leave a listener behind when it is wrong.
+  const attempt = async (auth, extra) => {
+    let handle = null;
+    try {
+      handle = await start(Object.assign({
+        config: baseConfig({ auth }), log: NULL_LOG, handleSignals: false,
+      }, extra));
+      return null;
+    } catch (err) {
+      return err;
+    } finally {
+      if (handle) await handle.close();
+    }
+  };
+
+  const off = await attempt({ required: false, credentials: [] });
+  ok(off instanceof Error, 'start() refuses a hub with auth.required false');
+  ok(/auth\.required is false/.test(off.message),
+    'and names the setting that made it an open hub');
+  ok(/rby-mmo-hub (init|invite)/.test(off.message),
+    'and names the command that fixes it');
+
+  const empty = await attempt({ required: true, credentials: [] });
+  ok(empty instanceof Error,
+    'and refuses one that requires a join code it does not have');
+  ok(/rby-mmo-hub invite/.test(empty.message), 'naming `invite` as the fix');
+
+  const unusable = await attempt({
+    required: true,
+    credentials: [
+      credential('revoked', REVOKED_CODE, { revoked: true }),
+      credential('expired', EXPIRED_CODE, {
+        expiresAt: new Date(Date.now() - 60000).toISOString(),
+      }),
+      credential('spent', PRIMARY_CODE, { maxUses: 1, uses: 1 }),
+    ],
+  });
+  ok(unusable instanceof Error,
+    'three credentials that are revoked, expired and used up count as none');
+
+  // The opt-out, and only the opt-out, gets past it. This is the option
+  // server/hub.js -- the deprecated LAN front door that announces at startup
+  // that it has no join code -- is the intended and only caller of.
+  const opted = await attempt({ required: false, credentials: [] },
+    { allowUnauthenticated: true });
+  ok(opted === null, 'allowUnauthenticated: true is the one way past the check');
+
+  const usable = await attempt({
+    required: true, credentials: [credential('primary', PRIMARY_CODE)],
+  });
+  ok(usable === null, 'and a hub with a join code that works starts unremarkably');
+}
+
+// =========================================================================
 // driver
 // =========================================================================
 
@@ -999,6 +1391,10 @@ async function main() {
   await handshakeTimeoutTest();
   await inviteUsesPersistTest();
   await inviteUsesNoWriteWithoutConfigPathTest();
+  await authBackoffPerAddressTest();
+  await authGlobalCeilingTest();
+  await authLockdownSparesConnectedPlayersTest();
+  await passcodeRequiredTest();
   await sighupReloadTest();
   await shutdownHookTest();
   await gracefulShutdownInProcessTest();

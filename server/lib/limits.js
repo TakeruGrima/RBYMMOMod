@@ -10,11 +10,19 @@
  * `socket.setTimeout(45000)` doubles as both the handshake budget and the
  * idle timeout. All of that is closed here.
  *
+ * A second question sits beside the connection ones and is answered by the
+ * same object: how fast may passcodes be *guessed*. `authAllowed` /
+ * `noteAuthFailure` / `noteAuthSuccess` are that half -- see
+ * "authentication failures" below for why a per-IP limit alone cannot
+ * answer it.
+ *
  * **No sockets appear anywhere below, and no timers.** Everything is pure
  * bookkeeping over an injected clock, driven by the caller: `admit` before a
  * client record exists, `register`/`markGreeted`/`noteActivity`/`release`
- * across the connection's life, and `sweep` on whatever tick the server
- * already runs. That is the same split `src/Hub.lua` uses for the relay
+ * across the connection's life, `authAllowed` before a challenge is minted
+ * and `noteAuthFailure`/`noteAuthSuccess` on its answer, and `sweep` on
+ * whatever tick the server already runs. That is the same split
+ * `src/Hub.lua` uses for the relay
  * itself, and for the same reason: it makes every rule testable under a
  * plain unit test with no port opened and no wall clock waited on.
  *
@@ -57,6 +65,31 @@ const net = require('node:net');
 //                                     line (hub.js MAX_LINE is 64 KiB) so
 //                                     the guard cannot fire on a legitimate
 //                                     single message.
+//
+// The `auth*` knobs are the same idea applied to *wrong passcodes* rather
+// than connections; see "authentication failures" below for what each one
+// governs and why its default is where it is.
+//
+//   authFailureGrace       0 .. 100        0 backs off from the first wrong
+//                                     code; 100 is "per-IP backoff off".
+//   authFailureWindowMs 1000 .. 86400000   how long one address's failures
+//                                     are remembered. A day is the ceiling
+//                                     because a grudge longer than that is
+//                                     a ban, and bans have their own verb.
+//   authBackoffBaseMs    100 .. 3600000    the first delay past the grace.
+//   authBackoffMaxMs    1000 .. 86400000   the ceiling that delay escalates
+//                                     to. Below the base is harmless -- the
+//                                     `Math.min` simply makes the ceiling
+//                                     win, which is what a host who set it
+//                                     that way asked for.
+//   authGlobalFailures     1 .. 1000000    hub-wide failures per window
+//                                     before the ceiling trips. The top of
+//                                     the range is "effectively off".
+//   authGlobalWindowMs  1000 .. 3600000    the window they are counted over.
+//   authLockoutMs       1000 .. 3600000    how long the ceiling stays
+//                                     tripped. An hour is the longest a
+//                                     refusal should outlive the burst that
+//                                     caused it without a human looking.
 const BOUNDS = Object.freeze({
   perIpConnections: [1, 256],
   connectBurst: [1, 1000],
@@ -66,6 +99,13 @@ const BOUNDS = Object.freeze({
   idleTimeoutMs: [5000, 3600000],
   partialLineTimeoutMs: [1000, 300000],
   maxWriteBufferBytes: [4096, 67108864],
+  authFailureGrace: [0, 100],
+  authFailureWindowMs: [1000, 86400000],
+  authBackoffBaseMs: [100, 3600000],
+  authBackoffMaxMs: [1000, 86400000],
+  authGlobalFailures: [1, 1000000],
+  authGlobalWindowMs: [1000, 3600000],
+  authLockoutMs: [1000, 3600000],
 });
 
 const DEFAULTS = Object.freeze({
@@ -77,6 +117,38 @@ const DEFAULTS = Object.freeze({
   idleTimeoutMs: 45000,
   partialLineTimeoutMs: 10000,
   maxWriteBufferBytes: 262144,
+
+  // Three free failures inside ten minutes. A friend reading a code off a
+  // phone photo gets a typo, a stale invite and one more before anything
+  // slows down; a fourth wrong code inside ten minutes is not how humans
+  // fail. The window is long enough that pausing half a minute does not
+  // launder the count, and short enough that someone who gave up, made tea
+  // and came back is clean.
+  authFailureGrace: 3,
+  authFailureWindowMs: 600000,
+
+  // 2s, 4s, 8s ... capped at 5 minutes, which arrives on the twelfth wrong
+  // code. From there one address gets at most twelve guesses an hour, so
+  // 2^30 codes is about 10^4 years from a single peer, half that for even
+  // odds -- an order of magnitude less than this comment first claimed, and
+  // still far past the point where a lone attacker is the threat. The first
+  // step is deliberately small: the honest player who fat-fingered a fourth
+  // time waits two seconds and never notices.
+  authBackoffBaseMs: 2000,
+  authBackoffMaxMs: 300000,
+
+  // The control that survives an attacker renting addresses. A hundred wrong
+  // passcodes hub-wide in one minute is not a thing a friend group produces
+  // -- a four-seat hub sees a handful across an entire evening -- so the
+  // threshold sits far above honest traffic and far below the volume a
+  // distributed grind needs. With a one-minute cooling period the whole
+  // internet together gets ~100 guesses a minute, which puts even odds on a
+  // 30-bit code at roughly a decade, with the host's log screaming the whole
+  // time. That number does not improve when the attacker rents more hosts,
+  // which is the entire point of the ceiling being global.
+  authGlobalFailures: 100,
+  authGlobalWindowMs: 60000,
+  authLockoutMs: 60000,
 });
 
 function clamp(name, value) {
@@ -91,6 +163,7 @@ function clamp(name, value) {
 // the shape of a memory guard, and exposing them would only widen the
 // surface a bad config can damage.
 const MAX_BUCKETS = 4096;
+const MAX_AUTH_RECORDS = 4096;
 const PRUNE_INTERVAL_MS = 30000;
 
 // ------------------------------------------------------------- address keys
@@ -329,6 +402,10 @@ const REJECT = Object.freeze({
   per_ip: Object.freeze({ ok: false, reason: 'per_ip' }),
   rate: Object.freeze({ ok: false, reason: 'rate' }),
   pending: Object.freeze({ ok: false, reason: 'pending' }),
+  // This address is serving out its own backoff after wrong passcodes.
+  auth_backoff: Object.freeze({ ok: false, reason: 'auth_backoff' }),
+  // Nobody is being authenticated right now: the hub-wide ceiling is tripped.
+  auth_lockdown: Object.freeze({ ok: false, reason: 'auth_lockdown' }),
 });
 
 // -------------------------------------------------------------------- Limits
@@ -346,6 +423,17 @@ class Limits {
       clamp('partialLineTimeoutMs', opts.partialLineTimeoutMs);
     this.maxWriteBufferBytes =
       clamp('maxWriteBufferBytes', opts.maxWriteBufferBytes);
+
+    this.authFailureGrace = clamp('authFailureGrace', opts.authFailureGrace);
+    this.authFailureWindowMs =
+      clamp('authFailureWindowMs', opts.authFailureWindowMs);
+    this.authBackoffBaseMs = clamp('authBackoffBaseMs', opts.authBackoffBaseMs);
+    this.authBackoffMaxMs = clamp('authBackoffMaxMs', opts.authBackoffMaxMs);
+    this.authGlobalFailures =
+      clamp('authGlobalFailures', opts.authGlobalFailures);
+    this.authGlobalWindowMs =
+      clamp('authGlobalWindowMs', opts.authGlobalWindowMs);
+    this.authLockoutMs = clamp('authLockoutMs', opts.authLockoutMs);
 
     // The clock is injected so a test can advance time by an hour without
     // waiting one. Anything that is not callable falls back to the real one
@@ -367,6 +455,13 @@ class Limits {
 
     this._bans = new Set();
     this._allow = new Set();
+
+    /** count key -> { failures, last, until } -- wrong-passcode history */
+    this._authFails = new Map();
+    /** the hub-wide failure counter; see _authRoll for the window shape */
+    this._authWindow = { start: -Infinity, count: 0, prev: 0 };
+    /** 0, or the instant the tripped ceiling releases */
+    this._authTrippedUntil = 0;
   }
 
   // ------------------------------------------------------------ admission
@@ -502,6 +597,158 @@ class Limits {
     return true;
   }
 
+  // ------------------------------------------------ authentication failures
+  //
+  // A wrong passcode is not an ordinary connection and must not be limited
+  // like one. The join code is 6 characters from a 32-symbol alphabet -- 2^30
+  // exactly (lib/auth.js) -- and the connect bucket is keyed per address, so
+  // per-IP limiting alone does not bound the guess rate at all: it tells an
+  // attacker precisely how many addresses to rent. At the default 60/min one
+  // address needs decades, a thousand addresses need a fortnight, and the
+  // difference is a hosting invoice.
+  //
+  // So failures are throttled twice, and the second one is the load-bearing
+  // half:
+  //
+  //   Per address -- an escalating backoff past a small grace. This is the
+  //     part shaped for humans: a friend who fat-fingers the code twice
+  //     notices nothing, and someone grinding stops making progress.
+  //
+  //   Hub-wide -- a ceiling on total failures per window, and a cooling
+  //     period once it trips. This is the part that does not care how many
+  //     addresses the attacker has, which is the only reason the 30-bit code
+  //     is defensible online. Nobody legitimate produces a hundred wrong
+  //     passcodes across a whole hub in a minute.
+  //
+  // **What a tripped ceiling does, exactly:** `authAllowed` starts refusing.
+  // That is the entire blast radius. It does not touch `admit`, so
+  // connections are still accepted; it does not appear in `sweep`, so nobody
+  // is disconnected for it; it does not read or alter any connection record,
+  // so **every already-authenticated player keeps playing, un-disconnected
+  // and unthrottled, for the whole lockout**. A hub under attack goes
+  // temporarily closed to newcomers, not down. The accepted cost is that a
+  // player holding the *correct* code, arriving mid-attack, is turned away
+  // until the cooling period ends -- a minute by default, and the honest
+  // alternative (keep answering challenges) is the attack succeeding.
+  //
+  // Keyed by the /64 count key rather than the exact address, for the reason
+  // in "/64 keying" above: a per-/128 backoff is not a backoff, because the
+  // attacker has 2^64 addresses to spend one failure each from.
+
+  /*
+   * May this address attempt authentication right now?
+   *
+   * Asked *before* a nonce is issued and again is not necessary -- one call
+   * per attempt, on the path that would otherwise mint a challenge. The
+   * global ceiling is checked first: it is one comparison, it is the more
+   * decisive fact, and it makes the refusal uniform for everybody rather
+   * than dependent on who is asking.
+   *
+   * Verdicts are the same frozen singletons `admit` hands back, so a refusal
+   * allocates nothing even when the hub is being hammered. The "how long"
+   * that a log line or a client message wants is a separate question with a
+   * separate, allocation-free answer: `authRetryAfterMs`.
+   */
+  authAllowed(ip) {
+    const now = this.now();
+    if (this._authTick(now)) return REJECT.auth_lockdown;
+
+    const rec = this._authFails.get(ipCountKey(ip));
+    if (rec && now < rec.until) return REJECT.auth_backoff;
+    return OK;
+  }
+
+  /*
+   * Record one rejected passcode. Returns true only on the edge where this
+   * failure trips the global ceiling, so a caller can log the event once
+   * instead of once per attempt.
+   *
+   * **Only genuine credential rejections belong here.** A refusal handed
+   * down by `authAllowed` is not a failure and must not be recorded: an
+   * attacker gains nothing by retrying into a closed door, while an honest
+   * player who retries during their own backoff would otherwise extend it
+   * every time and be locked out for the evening -- which is precisely the
+   * collateral this design exists to avoid.
+   *
+   * A refused attempt also does **not** spend a connect token. The
+   * connection it arrived on already spent one in `admit`, and charging a
+   * second would drain a shared household's whole connection budget over one
+   * roommate's typo while making `connectPerMinute` mean something other
+   * than what it says. Auth failures are governed by these knobs; connection
+   * volume is governed by the bucket. Two limiters, two budgets, no hidden
+   * coupling where tuning one quietly retunes the other.
+   */
+  noteAuthFailure(ip) {
+    const now = this.now();
+    this._prune(now);
+    const tripped = this._authTick(now);
+
+    const key = ipCountKey(ip);
+    let rec = this._authFails.get(key);
+    // A record whose window has lapsed *and* whose backoff has run out is
+    // indistinguishable from an address that has never failed -- that is the
+    // recovery path, and it is why an honest player is never permanently
+    // locked out. Both halves are checked because a hand-edited config can
+    // set a backoff longer than the window it is remembered over.
+    if (!rec ||
+        (now - rec.last >= this.authFailureWindowMs && now >= rec.until)) {
+      rec = { failures: 0, last: now, until: 0 };
+      this._authFails.set(key, rec);
+    }
+    rec.failures += 1;
+    rec.last = now;
+
+    const excess = rec.failures - this.authFailureGrace;
+    if (excess > 0) {
+      // Doubling, capped. `Math.pow` overflowing to Infinity on a long grind
+      // is harmless: the ceiling wins the `min`, which is what it is for.
+      const delay = Math.min(
+        this.authBackoffMaxMs,
+        this.authBackoffBaseMs * Math.pow(2, excess - 1));
+      rec.until = now + delay;
+    }
+
+    this._authWindow.count += 1;
+    if (!tripped && this._authRate(now) >= this.authGlobalFailures) {
+      this._authTrippedUntil = now + this.authLockoutMs;
+      return true;
+    }
+    return false;
+  }
+
+  /*
+   * This address just proved it holds a valid code, so its failure history
+   * goes. There is no way to reach here without having been allowed to try,
+   * so clearing cannot be used to launder a backoff.
+   *
+   * The hub-wide counter is deliberately *not* decremented. It measures how
+   * much wrong-passcode traffic the hub is absorbing, and one friend getting
+   * in does not make a thousand failures elsewhere benign; the window is
+   * what forgives them, on its own schedule.
+   */
+  noteAuthSuccess(ip) {
+    return this._authFails.delete(ipCountKey(ip));
+  }
+
+  /** Is the hub-wide ceiling tripped right now? */
+  get authLockdown() {
+    return this._authTick(this.now());
+  }
+
+  /*
+   * Milliseconds until this address may attempt authentication again; 0 when
+   * it may right now. The larger of the two clocks, because both have to
+   * elapse. For a message to a human, not a control -- `authAllowed` is the
+   * decision.
+   */
+  authRetryAfterMs(ip) {
+    const now = this.now();
+    let wait = this._authTick(now) ? this._authTrippedUntil - now : 0;
+    const rec = this._authFails.get(ipCountKey(ip));
+    if (rec && now < rec.until) wait = Math.max(wait, rec.until - now);
+    return Math.max(0, wait);
+  }
+
   // ----------------------------------------------------------------- sweep
 
   /*
@@ -589,14 +836,110 @@ class Limits {
    * The shape the CLI's `status` verb prints. `perIp` is keyed the way the
    * cap counts: an exact address for IPv4, a `2001:db8::/64`-style prefix
    * for IPv6.
+   *
+   * `auth` is what lets `status` and `doctor` say "someone is hammering your
+   * hub" rather than leaving the host to guess from the log. It is the whole
+   * picture in five numbers: how many wrong passcodes arrived recently and
+   * what the ceiling is (so the reading has a scale), whether the ceiling is
+   * currently tripped and for how much longer, and how many individual
+   * addresses are backed off (so a host can tell one grinder from a rented
+   * fleet). Rounded, because the recent count is a windowed estimate and a
+   * fraction of a failure is not a thing to print at a human.
    */
   stats() {
     const perIp = {};
     for (const [ip, count] of this._perIp) perIp[ip] = count;
-    return { connections: this._conns.size, pending: this._pending, perIp };
+
+    const now = this.now();
+    const lockdown = this._authTick(now);
+    let throttled = 0;
+    for (const rec of this._authFails.values()) {
+      if (now < rec.until) throttled += 1;
+    }
+
+    return {
+      connections: this._conns.size,
+      pending: this._pending,
+      perIp,
+      auth: {
+        recentFailures: Math.round(this._authRate(now)),
+        failureThreshold: this.authGlobalFailures,
+        windowMs: this.authGlobalWindowMs,
+        lockdown,
+        lockdownMs: lockdown ? this._authTrippedUntil - now : 0,
+        throttledAddresses: throttled,
+        trackedAddresses: this._authFails.size,
+      },
+    };
   }
 
   // ------------------------------------------------------------- internals
+
+  /*
+   * Roll the hub-wide failure window forward and release an expired trip.
+   * Returns whether the ceiling is tripped *after* rolling, which is the
+   * answer every public auth method actually wants.
+   *
+   * Releasing zeroes the counters rather than letting them keep decaying:
+   * the failures that caused the trip have already been paid for with a
+   * lockout, and carrying them into the next window would re-trip the hub
+   * instantly on a single stray attempt.
+   *
+   * The backwards-clock guard is the same concern as the token bucket's
+   * `Math.max(0, ...)`. An NTP step backwards would otherwise leave
+   * `_authTrippedUntil` arbitrarily far in the future and close the hub to
+   * new players until it caught up; re-anchoring to one lockout from now
+   * bounds the damage to the lockout the host configured.
+   */
+  _authTick(now) {
+    if (this._authTrippedUntil !== 0) {
+      if (this._authTrippedUntil - now > this.authLockoutMs) {
+        this._authTrippedUntil = now + this.authLockoutMs;
+      } else if (now >= this._authTrippedUntil) {
+        this._authTrippedUntil = 0;
+        this._authWindow = { start: now, count: 0, prev: 0 };
+      }
+    }
+    this._authRoll(now);
+    return this._authTrippedUntil !== 0;
+  }
+
+  /*
+   * The window is two counters, current and previous, and `_authRate`
+   * reads them as a sliding estimate. Neither of the obvious alternatives
+   * works here: a plain fixed window is blind to a burst straddling its
+   * boundary, so an attacker who fails `threshold - 1` times either side of
+   * the tick gets nearly double the ceiling for free, and a list of failure
+   * timestamps is a Map an attacker writes to once per guess -- a memory
+   * leak inside a memory-leak guard. Two integers and a division do neither.
+   */
+  _authRoll(now) {
+    const w = this.authGlobalWindowMs;
+    const win = this._authWindow;
+    if (now < win.start) {
+      // The clock moved backwards; there is no honest way to age a window
+      // across that, so start a fresh one rather than invent a rate.
+      this._authWindow = { start: now, count: 0, prev: 0 };
+      return;
+    }
+    const elapsed = now - win.start;
+    if (elapsed >= 2 * w) {
+      // Two whole windows of silence: nothing recent survives.
+      this._authWindow = { start: now, count: 0, prev: 0 };
+    } else if (elapsed >= w) {
+      win.prev = win.count;
+      win.count = 0;
+      win.start += w;
+    }
+  }
+
+  /* Estimated failures over the trailing window. Assumes `_authRoll` ran. */
+  _authRate(now) {
+    const w = this.authGlobalWindowMs;
+    const win = this._authWindow;
+    const into = Math.min(w, Math.max(0, now - win.start));
+    return win.count + win.prev * (1 - into / w);
+  }
 
   /*
    * A token bucket per count key -- one address for IPv4, one /64 for IPv6:
@@ -638,9 +981,12 @@ class Limits {
    * traffic drives it, which means an idle hub does no work at all.
    */
   _prune(now, force) {
-    const over = this._buckets.size > MAX_BUCKETS;
+    const over = this._buckets.size > MAX_BUCKETS ||
+      this._authFails.size > MAX_AUTH_RECORDS;
     if (!force && !over && now - this._prunedAt < PRUNE_INTERVAL_MS) return;
     this._prunedAt = now;
+
+    this._pruneAuth(now);
 
     for (const [ip, bucket] of this._buckets) {
       const elapsed = Math.max(0, now - bucket.last);
@@ -659,6 +1005,40 @@ class Limits {
     const target = Math.floor(MAX_BUCKETS * 0.9);
     for (let i = 0; i < ranked.length && this._buckets.size > target; i += 1) {
       this._buckets.delete(ranked[i][0]);
+    }
+  }
+
+  /*
+   * The same guard for the failure map, on the same rule: a record whose
+   * window has lapsed and whose backoff has run out carries no information,
+   * because a fresh address is treated identically. Dropping it grants the
+   * attacker nothing.
+   *
+   * Over the hard cap, the *least*-throttled records go first -- mirror
+   * image of the bucket eviction above, and for the mirror reason: they are
+   * the closest to being free to drop and the furthest from anyone actually
+   * being held back. Ties break on the staler record.
+   *
+   * Eviction is safe here only because the hub-wide ceiling exists. An
+   * attacker who cycles addresses fast enough to force it is, by
+   * construction, producing failures fast enough to trip the global ceiling
+   * long before the per-IP records they are flushing would have mattered.
+   * That is the division of labour: the per-IP map shapes the honest case,
+   * the global counter holds the line when the map cannot.
+   */
+  _pruneAuth(now) {
+    for (const [key, rec] of this._authFails) {
+      if (now < rec.until) continue;
+      if (now - rec.last < this.authFailureWindowMs) continue;
+      this._authFails.delete(key);
+    }
+    if (this._authFails.size <= MAX_AUTH_RECORDS) return;
+
+    const ranked = [...this._authFails.entries()]
+      .sort((a, b) => (a[1].until - b[1].until) || (a[1].last - b[1].last));
+    const target = Math.floor(MAX_AUTH_RECORDS * 0.9);
+    for (let i = 0; i < ranked.length && this._authFails.size > target; i += 1) {
+      this._authFails.delete(ranked[i][0]);
     }
   }
 }

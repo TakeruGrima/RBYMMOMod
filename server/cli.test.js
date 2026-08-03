@@ -43,8 +43,37 @@ const ok = (cond, label) => {
   passed++;
 };
 
-// A code in its printed, dashed form: ABCD-EFGH-JKMN-PQRS.
-const CODE_RE = /[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}/;
+/*
+ * A passcode in its printed form: CODE_LEN ungrouped characters from auth.js's
+ * alphabet, standing alone. Both patterns are built from auth.js rather than
+ * spelled out, so the day the format changes again this suite fails on the
+ * assertions that are really about shape -- not on a regex nobody remembered.
+ */
+const CODE_RE = new RegExp(
+  `(?<![${auth.ALPHABET}])[${auth.ALPHABET}]{${auth.CODE_LEN}}(?![${auth.ALPHABET}])`);
+
+/*
+ * The framed block `init` and `invite` draw is the only place a whole code is
+ * printed on purpose, so extraction goes through it. Matching a bare six
+ * characters anywhere in stdout would sooner or later pick up the random tail
+ * of a mkdtemp path -- ~2% of runs, on a suite that then fails for a reason
+ * that has nothing to do with the code.
+ */
+const BOXED_CODE_RE = new RegExp(
+  `\\|\\s+([${auth.ALPHABET}]{${auth.CODE_LEN}})\\s+\\|`);
+
+// The seven knobs the auth-failure throttle is configured with. Named here so
+// the LEAF_PATHS sweep can assert it really drove every one of them, rather
+// than reporting them as uncovered and still passing.
+const AUTH_LIMIT_PATHS = [
+  'limits.authFailureGrace',
+  'limits.authFailureWindowMs',
+  'limits.authBackoffBaseMs',
+  'limits.authBackoffMaxMs',
+  'limits.authGlobalFailures',
+  'limits.authGlobalWindowMs',
+  'limits.authLockoutMs',
+];
 
 const EXCEPT_PATHS = new Set(['auth.credentials', 'version']);
 
@@ -131,6 +160,41 @@ function countMatches(haystack, re) {
   return matches ? matches.length : 0;
 }
 
+/** Occurrences of an exact string -- the honest way to count a known secret. */
+function countLiteral(haystack, needle) {
+  return String(haystack).split(needle).length - 1;
+}
+
+/** The code out of the framed block, with the block's presence asserted. */
+function extractCode(text, label) {
+  const match = BOXED_CODE_RE.exec(text);
+  ok(!!match, label);
+  return match[1];
+}
+
+/*
+ * A stdin that answers the wizard one line at a time and only then ends.
+ *
+ * Not the same thing as endedStdin(): Node's readline discards whatever is
+ * still buffered when the stream ends, so pushing four answers at once answers
+ * one question and defaults the rest (which is its own scenario, below). Pacing
+ * them is the only way to exercise a question that is not the first one.
+ */
+function pacedStdin(answers) {
+  const stream = new Readable({ read() {} });
+  let index = 0;
+  const timer = setInterval(() => {
+    if (index < answers.length) {
+      stream.push(`${answers[index++]}\n`);
+      return;
+    }
+    clearInterval(timer);
+    stream.push(null);
+  }, 15);
+  if (typeof timer.unref === 'function') timer.unref();
+  return stream;
+}
+
 function same(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
@@ -210,9 +274,18 @@ async function initScenarios() {
   ok(fs.existsSync(file), 'and writes the config file');
   ok(fileMode(file) === 0o600, 'the config file is written mode 0600');
 
-  const printedCount = countMatches(first.stdout, CODE_RE);
+  const printedCode = extractCode(first.stdout, 'init frames the passcode in a block of its own');
+  const printedCount = countLiteral(first.stdout, printedCode);
   ok(printedCount === 1, `the join code is printed exactly once (saw ${printedCount})`);
-  const printedCode = first.stdout.match(CODE_RE)[0];
+
+  // The shape itself, asserted against auth.js rather than a literal: six
+  // ungrouped characters, no dashes, nothing outside the alphabet.
+  ok(printedCode.length === auth.CODE_LEN,
+    `the printed passcode is ${auth.CODE_LEN} characters (got ${printedCode.length})`);
+  ok(!printedCode.includes('-'), 'and is ungrouped -- no dashes in the printed form');
+  ok(CODE_RE.test(printedCode), 'and uses only the alphabet auth.js publishes');
+  ok(auth.normalizeCode(printedCode) === printedCode,
+    'the printed form is already the normalised form, so a friend can type it back verbatim');
 
   const onDisk = readConfigFile(file);
   ok(onDisk.auth.credentials.length === 1, 'a primary credential is written');
@@ -231,7 +304,8 @@ async function initScenarios() {
   // --- with --force it overwrites (and actually rotates the code)
   const forced = await runCli(['init', '--yes', '--force', '--config', file], { cwd: dir });
   ok(forced.code === cli.OK, 'init --force overwrites');
-  ok(countMatches(forced.stdout, CODE_RE) === 1, 'the forced run also prints exactly one code');
+  const forcedCode = extractCode(forced.stdout, 'the forced run frames a passcode too');
+  ok(countLiteral(forced.stdout, forcedCode) === 1, 'the forced run also prints exactly one code');
   const secondOnDisk = readConfigFile(file);
   ok(secondOnDisk.auth.credentials[0].secret !== onDisk.auth.credentials[0].secret,
     '--force writes a fresh join code, not the old one');
@@ -239,14 +313,6 @@ async function initScenarios() {
   // --- the default is auth ON (so a careless first run is not an open hub)
   ok(config.DEFAULTS.auth.required === true, 'the built-in default requires a join code');
   ok(secondOnDisk.auth.required === true, 'a plain init --yes leaves auth on');
-
-  // --- --no-auth turns it off, explicitly
-  const noAuthFile = path.join(dir, 'config-no-auth.json');
-  const noAuth = await runCli(['init', '--yes', '--no-auth', '--config', noAuthFile], { cwd: dir });
-  ok(noAuth.code === cli.OK, 'init --yes --no-auth succeeds');
-  const noAuthOnDisk = readConfigFile(noAuthFile);
-  ok(noAuthOnDisk.auth.required === false, '--no-auth writes auth.required: false');
-  ok(noAuthOnDisk.auth.credentials.length === 0, 'and mints no credential for it');
 
   // --- init is scriptable: no TTY, no stdin (docker run without -t, CI) --
   //     it must terminate, not hang forever on rl.question()
@@ -259,6 +325,136 @@ async function initScenarios() {
   ok(fs.existsSync(scriptedFile), 'and still writes a config file, on the defaults');
   ok(/input ended/i.test(scripted.stderr),
     'and says plainly that it took defaults because the input ended');
+  const scriptedOnDisk = readConfigFile(scriptedFile);
+  ok(scriptedOnDisk.auth.required === true,
+    'a config written with no input at all still requires a passcode');
+  ok(scriptedOnDisk.auth.credentials.length === 1,
+    'and still has one to admit somebody with -- the unattended path is not the open path');
+  ok(!/--no-auth/.test(scripted.stderr),
+    'and the scripted-run hint no longer advertises a flag that has been withdrawn');
+}
+
+// =====================================================================
+// a passcode is required: init cannot be talked into an open hub
+// =====================================================================
+
+async function authIsMandatoryScenario() {
+  const dir = scratchDir('auth-required');
+
+  // --- --no-auth: a usage error that explains itself, not "unknown option",
+  //     because people paste old commands out of their shell history
+  const noAuthFile = path.join(dir, 'no-auth.json');
+  const noAuth = await runCli(['init', '--yes', '--no-auth', '--config', noAuthFile], { cwd: dir });
+  ok(noAuth.code === cli.USAGE, 'init --no-auth is a usage error (exit 2), not a quiet success');
+  ok(!fs.existsSync(noAuthFile), 'and writes no config file at all');
+  ok(/passcode is required/i.test(noAuth.stderr),
+    'the refusal says a passcode is required, in as many words');
+  ok(/--no-auth/.test(noAuth.stderr),
+    'it names the flag the host actually typed, so they know which one went');
+  ok(/--code/.test(noAuth.stderr),
+    'and points at --code, which is the thing they probably wanted');
+
+  // --- the other spellings of the same thing reach the same sentence
+  for (const argv of [['--auth', 'false'], ['--auth=off'], ['--auth', 'no']]) {
+    const file = path.join(dir, `spelling-${argv.join('')}.json`.replace(/[^\w.-]/g, ''));
+    const result = await runCli(['init', '--yes', ...argv, '--config', file], { cwd: dir });
+    ok(result.code === cli.USAGE, `init ${argv.join(' ')} is refused the same way`);
+    ok(!fs.existsSync(file), `init ${argv.join(' ')} writes nothing`);
+  }
+
+  // --- and the environment cannot do it either: RBY_MMO_AUTH_REQUIRED=false
+  //     is a real variable config.js honours, so init has to overrule it
+  const envFile = path.join(dir, 'env.json');
+  const env = Object.assign(cleanEnv(), { RBY_MMO_AUTH_REQUIRED: 'false' });
+  const fromEnv = await runCli(['init', '--yes', '--config', envFile], { cwd: dir, env });
+  ok(fromEnv.code === cli.OK, 'init still succeeds with RBY_MMO_AUTH_REQUIRED=false in the environment');
+  const envOnDisk = readConfigFile(envFile);
+  ok(envOnDisk.auth.required === true, 'but writes auth.required: true regardless');
+  ok(envOnDisk.auth.credentials.length === 1, 'with a usable passcode in it');
+  ok(/ignored/i.test(fromEnv.stderr),
+    'and says the request for an open hub was ignored rather than silently overruling it');
+
+  // --- the standing claim, stated once: no init produces a config without a
+  //     passcode, whatever it is handed
+  for (const argv of [['init', '--yes'], ['init', '--yes', '--force']]) {
+    const file = path.join(dir, `always-${argv.length}.json`);
+    await runCli([...argv, '--config', file], { cwd: dir });
+    const written = readConfigFile(file);
+    ok(written.auth.required === true && written.auth.credentials.length === 1,
+      `\`${argv.join(' ')}\` produces a hub that requires a passcode and has one`);
+  }
+}
+
+// =====================================================================
+// a host may choose the passcode -- "the same passcode can be configured"
+// =====================================================================
+
+async function suppliedPasscodeScenario() {
+  const dir = scratchDir('supplied-code');
+
+  // --- init --code, in the untidy spelling a code arrives in from a chat
+  //     message: lower case, with a dash through it
+  const file = path.join(dir, 'chosen.json');
+  const chosen = await runCli(['init', '--yes', '--code', 'a7k3-p9', '--config', file], { cwd: dir });
+  ok(chosen.code === cli.OK, 'init --code succeeds');
+  const printed = extractCode(chosen.stdout, 'init --code prints the passcode it was given');
+  ok(printed === 'A7K3P9', `the supplied code round-trips, normalised (got ${printed})`);
+  ok(readConfigFile(file).auth.credentials[0].secret === 'A7K3P9',
+    'and is what lands on disk, in its normalised form -- not the spelling that was typed');
+  ok(auth.normalizeCode('a7k3-p9') === readConfigFile(file).auth.credentials[0].secret,
+    'so the hub answers to the code the host chose, however they spell it back');
+
+  // --- a passcode that will not normalise is a usage error that names the
+  //     alphabet, and never echoes what was typed
+  const badFile = path.join(dir, 'bad.json');
+  const bad = await runCli(['init', '--yes', '--code', 'A7K3P', '--config', badFile], { cwd: dir });
+  ok(bad.code === cli.USAGE, 'a passcode that will not normalise is a usage error (exit 2)');
+  ok(!fs.existsSync(badFile), 'and no config is written');
+  ok(bad.stderr.includes(auth.ALPHABET), 'the refusal names the alphabet in full');
+  ok(/I, L, O and U/.test(bad.stderr), 'and says which letters are missing from it, and why');
+  ok(!bad.stderr.includes('A7K3P'),
+    'but never echoes what was typed -- a near-miss passcode is still nearly a passcode');
+
+  const noValue = await runCli(['init', '--yes', '--code', '--config', badFile], { cwd: dir });
+  ok(noValue.code === cli.USAGE, '--code with nothing after it is a usage error too');
+
+  // --- invite --code: the same choice, for a hub that already exists
+  const invited = await runCli(
+    ['invite', '--code', 'zz9 yy8', '--label', 'LAN game', '--config', file], { cwd: dir });
+  ok(invited.code === cli.OK, 'invite --code succeeds');
+  const invitedCode = extractCode(invited.stdout, 'invite --code prints the code it was given');
+  ok(invitedCode === 'ZZ9YY8', `invite --code normalises the same way (got ${invitedCode})`);
+  ok(readConfigFile(file).auth.credentials.some((c) => c.secret === 'ZZ9YY8'),
+    'and the chosen code is on disk beside the first one');
+
+  const badInvite = await runCli(['invite', '--code', 'nope!', '--config', file], { cwd: dir });
+  ok(badInvite.code === cli.USAGE, 'invite --code refuses an unusable passcode with a usage error');
+  ok(badInvite.stderr.includes(auth.ALPHABET), 'naming the alphabet there too');
+  ok(readConfigFile(file).auth.credentials.length === 2,
+    'and mints nothing when it refuses');
+
+  // --- the same code twice is refused: verify() would match the first entry,
+  //     so the second one's expiry and use budget would never be spent
+  const duplicate = await runCli(['invite', '--code', 'ZZ9-YY8', '--config', file], { cwd: dir });
+  ok(duplicate.code === cli.ERROR, 'a passcode already configured is refused');
+  ok(/already configured/i.test(duplicate.stderr), 'and says so');
+  ok(readConfigFile(file).auth.credentials.length === 2, 'without adding a duplicate');
+
+  // --- and the wizard asks for one, rather than asking whether to require one
+  const wizardFile = path.join(dir, 'wizard.json');
+  const wizard = await withTimeout(
+    runCli(['init', '--config', wizardFile], {
+      cwd: dir,
+      stdin: pacedStdin(['', '', 'q4w5e6', '']),
+    }), 5000, 'the wizard to take a passcode');
+  ok(wizard.code === cli.OK, 'the wizard finishes');
+  ok(/Passcode/i.test(wizard.stdout), 'and asks for a passcode');
+  ok(!/Require a join code/i.test(wizard.stdout),
+    'and no longer asks whether to require one -- that question had a wrong answer');
+  ok(readConfigFile(wizardFile).auth.credentials[0].secret === 'Q4W5E6',
+    'the passcode typed at the prompt is the one stored');
+  ok(readConfigFile(wizardFile).auth.required === true,
+    'and the config it writes requires it');
 }
 
 // =====================================================================
@@ -328,6 +524,18 @@ async function configLeafPathScenario() {
   ok(driven.length + refused.length + cannotSet.length === config.LEAF_PATHS.length,
     'every LEAF_PATHS entry was accounted for (driven, refused-by-design, or reported as uncovered)');
 
+  /*
+   * The auth-failure throttle arrived as seven new leaves, and a knob that is
+   * only reachable by hand-editing JSON is the exact thing this file exists to
+   * catch. Named explicitly rather than left to the count above, which would
+   * stay green if all seven quietly landed in `cannotSet`.
+   */
+  for (const dotted of AUTH_LIMIT_PATHS) {
+    ok(config.LEAF_PATHS.includes(dotted), `${dotted} is a real setting`);
+    ok(driven.includes(dotted), `${dotted} was really driven through config set / config get`);
+    ok(dotted in config.BOUNDS, `${dotted} has a clamp range, so a wild value is pulled back`);
+  }
+
   console.log(`\n  LEAF_PATHS driven (${driven.length}): ${driven.join(', ')}`);
   console.log(`  LEAF_PATHS refused by design (${refused.length}): ${refused.join(', ')}`);
   if (cannotSet.length) {
@@ -382,8 +590,7 @@ async function secretsDisciplineScenario() {
   const dir = scratchDir('secrets');
   const file = path.join(dir, 'config.json');
   const init = await runCli(['init', '--yes', '--config', file], { cwd: dir });
-  const printedCode = init.stdout.match(CODE_RE)[0];
-  ok(!!printedCode, 'a known join code exists to test secrecy against');
+  const printedCode = extractCode(init.stdout, 'a known join code exists to test secrecy against');
 
   const status = await runCli(['status', '--config', file], { cwd: dir });
   const doctor = await runCli(['doctor', '--config', file], { cwd: dir });
@@ -396,6 +603,31 @@ async function secretsDisciplineScenario() {
 
   const listRevealed = await runCli(['invite', 'list', '--reveal', '--config', file], { cwd: dir });
   ok(listRevealed.stdout.includes(printedCode), 'invite list --reveal does print it in full');
+
+  /*
+   * The masked column is a mask, not a shortened code: at six characters there
+   * is no prefix small enough to be safe, so nothing of the code may survive
+   * into the masked listing. Asserted character by character rather than
+   * against a literal, because the mask's spelling belongs to config.js.
+   */
+  const masked = listMasked.stdout.split('\n').find((line) => line.startsWith('primary'));
+  ok(!!masked, 'the primary credential has a row in the masked listing');
+  // Columns are joined by two spaces and the mask carries none, so the last
+  // cell is the CODE column. Checked as a cell rather than as a substring of
+  // the whole row, where a two-character prefix could collide with a date.
+  const codeCell = masked.trimEnd().split(/\s{2,}/).pop();
+  ok(!/[0-9A-Za-z]/.test(codeCell),
+    `the masked CODE column carries no part of the code at all (saw "${codeCell}")`);
+  ok(codeCell.includes('*'), 'and is visibly masked rather than blank');
+  const revealedRow = listRevealed.stdout.split('\n').find((line) => line.startsWith('primary'));
+  ok(revealedRow.trimEnd().split(/\s{2,}/).pop() === printedCode,
+    'while --reveal puts the whole code in that same column');
+
+  // The one place a code appears whole is still --reveal, and it is still
+  // announced: a host who reveals should know the terminal now holds it.
+  ok(/--reveal/.test(listMasked.stdout), 'the masked listing says how to see them in full');
+  ok(/records this terminal/i.test(listRevealed.stdout),
+    'and the revealed listing says what revealing them costs');
 }
 
 // =====================================================================
@@ -675,6 +907,115 @@ async function startSurvivesAnUnreachableRouterScenario() {
 }
 
 // =====================================================================
+// start refuses a hub anybody could join, before it binds anything
+// =====================================================================
+
+async function startRefusesALooseConfigScenario() {
+  const dir = scratchDir('start-auth');
+  const file = path.join(dir, 'config.json');
+  await runCli(['init', '--yes', '--config', file], { cwd: dir });
+
+  const starts = [];
+  const restoreServer = stubServer({
+    async start(options) {
+      starts.push(options);
+      return { closed: Promise.resolve() };
+    },
+  });
+
+  try {
+    // --- the baseline: a hub with a passcode starts, so the refusals below
+    //     are about the configuration and not about `start` being broken
+    const healthy = await runCli(['start', '--config', file], { cwd: dir });
+    ok(healthy.code === cli.OK, 'start runs a hub that requires a passcode and has one');
+    ok(starts.length === 1, 'and reaches server.start()');
+
+    // --- auth.required false: refused here, with the fix, rather than left to
+    //     server.js to refuse further down where a host is not reading
+    const off = await runCli(
+      ['config', 'set', 'auth.required', 'false', '--config', file], { cwd: dir });
+    ok(off.code === cli.OK, 'auth.required is still settable -- the tool does not fight a script');
+    ok(/refuses/i.test(off.stderr), 'but says on the spot that the hub will not run like that');
+
+    const openHub = await runCli(['start', '--config', file], { cwd: dir });
+    ok(openHub.code === cli.ERROR, 'start on auth.required=false exits with the runtime error code');
+    ok(starts.length === 1, 'and never reaches server.start() -- it refuses, it does not warn');
+    ok(/Refusing to start/.test(openHub.stderr), 'the refusal says so in as many words');
+    ok(/passcode is required/i.test(openHub.stderr), 'and why');
+    ok(openHub.stderr.includes('rby-mmo-hub config set auth.required true'),
+      'and gives the exact command that fixes it');
+    ok(openHub.stderr.includes('rby-mmo-hub invite'),
+      'and names `rby-mmo-hub invite`, which is the other half of the fix');
+
+    // --- auth on, but nothing usable to authenticate with: the other way to
+    //     end up with a hub nobody can use
+    await runCli(['config', 'set', 'auth.required', 'true', '--config', file], { cwd: dir });
+    const revoked = await runCli(['revoke', 'primary', '--config', file], { cwd: dir });
+    ok(revoked.code === cli.OK, 'the only passcode can still be revoked');
+
+    const noCode = await runCli(['start', '--config', file], { cwd: dir });
+    ok(noCode.code === cli.ERROR, 'start with no usable passcode is a runtime error');
+    ok(starts.length === 1, 'and still never reaches server.start()');
+    ok(/Refusing to start/.test(noCode.stderr), 'refusing, in the same words');
+    ok(noCode.stderr.includes('rby-mmo-hub invite'), 'and naming `rby-mmo-hub invite` as the fix');
+    ok(/revoked/i.test(noCode.stderr),
+      'and saying why the codes it has do not count, so the host is not left guessing');
+
+    // --- and one `invite` really is enough to make it start again
+    const minted = await runCli(['invite', '--config', file], { cwd: dir });
+    ok(minted.code === cli.OK, 'invite mints a replacement');
+    const recovered = await runCli(['start', '--config', file], { cwd: dir });
+    ok(recovered.code === cli.OK, 'after which start runs again');
+    ok(starts.length === 2, 'reaching server.start() a second time');
+  } finally {
+    restoreServer();
+  }
+}
+
+// =====================================================================
+// the wrong-passcode throttle is visible to a host
+// =====================================================================
+
+async function throttleVisibilityScenario() {
+  const dir = scratchDir('throttle');
+  const file = path.join(dir, 'config.json');
+  await runCli(['init', '--yes', '--config', file], { cwd: dir });
+
+  const status = await runCli(['status', '--config', file], { cwd: dir });
+  ok(status.code === cli.OK, 'status succeeds');
+  ok(/throttle/i.test(status.stdout), 'status reports the wrong-passcode throttle');
+  ok(/per address/.test(status.stdout) && /hub-wide/.test(status.stdout),
+    'in both of its halves: the per-address backoff and the hub-wide ceiling');
+  ok(new RegExp(String(config.DEFAULTS.limits.authGlobalFailures)).test(status.stdout),
+    'with the numbers actually configured');
+  ok(/running hub/i.test(status.stdout),
+    'and is honest that the live counts belong to the running hub, not to this command');
+
+  const doctor = await runCli(['doctor', '--config', file], { cwd: dir });
+  ok(doctor.code === cli.OK, 'doctor is happy with the shipped throttle defaults');
+  ok(/wrong passcodes are throttled/.test(doctor.stdout), 'and reports the throttle');
+  ok(/only to the hub while it runs/.test(doctor.stdout),
+    'saying plainly that it cannot see how many attempts have actually arrived');
+
+  // --- a setting that would lock the host's own friends out is called out.
+  //     maxPlayers defaults to 4, so a ceiling of 4 trips on four typos.
+  const tightened = await runCli(
+    ['config', 'set', 'limits.authGlobalFailures', '4', '--config', file], { cwd: dir });
+  ok(tightened.code === cli.OK, 'the hub-wide ceiling can be set very low');
+  const tight = await runCli(['doctor', '--config', file], { cwd: dir });
+  ok(/\[warn\].*authGlobalFailures/.test(tight.stdout),
+    'and doctor warns that a full house mistyping once would trip it');
+  ok(tight.code === cli.OK, 'without failing -- it is a choice, not a broken config');
+
+  // --- and the seven knobs are readable through the ordinary listing, so a
+  //     host does not have to know they exist to find them
+  const listed = await runCli(['config', 'list', '--config', file], { cwd: dir });
+  for (const dotted of AUTH_LIMIT_PATHS) {
+    ok(listed.stdout.includes(dotted), `config list shows ${dotted}`);
+  }
+}
+
+// =====================================================================
 // doctor
 // =====================================================================
 
@@ -738,6 +1079,8 @@ async function spawnExitCodeScenario() {
 async function main() {
   try {
     await initScenarios();
+    await authIsMandatoryScenario();
+    await suppliedPasscodeScenario();
     await configLeafPathScenario();
     await clampReportScenario();
     await statusPrecedenceScenario();
@@ -746,8 +1089,10 @@ async function main() {
     await revokeScenario();
     await banAllowScenario();
     await startRefusesExposedConfigScenario();
+    await startRefusesALooseConfigScenario();
     await startUnmapsThroughOnShutdownScenario();
     await startSurvivesAnUnreachableRouterScenario();
+    await throttleVisibilityScenario();
     await doctorScenario();
     await exitCodesScenario();
     await spawnExitCodeScenario();

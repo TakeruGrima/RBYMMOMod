@@ -85,6 +85,34 @@ function M.selectLabel(game, label, frames)
   return true
 end
 
+-- The labels of whatever menu is on top, in order.
+--
+-- Worth having shared: "which rows exist" is an assertion in its own right
+-- now that a row has been *removed* -- HOST > JOIN CODE no longer offers NO
+-- CODE, because a game with no code is one the hub refuses to open a port
+-- for. A driver can only check that by reading the whole list.
+function M.menuLabels(game)
+  local top = M.top(game)
+  local labels = {}
+  for _, item in ipairs((top and top.items) or {}) do
+    labels[#labels + 1] = tostring(item.label)
+  end
+  return labels
+end
+
+-- One row of the menu on top, by label, so its right-hand column can be
+-- read. That column carries the join code itself on the HOST screen -- it
+-- used to say ON -- and reading it back is the only way to check the thing a
+-- host actually sees without reaching into the mod for a code it
+-- deliberately keeps out of exports and logs.
+function M.menuRow(game, label)
+  local top = M.top(game)
+  for _, item in ipairs((top and top.items) or {}) do
+    if labelMatches(item.label, label) then return item end
+  end
+  return nil
+end
+
 function M.exports(game)
   local loader = game.mods
   return loader and loader.exports and loader.exports.rby_mmo or nil
@@ -189,40 +217,47 @@ end
 
 -- Config.CODE_ALPHABET, as a Lua character class. Crockford-style, so I, L,
 -- O and U are absent -- which is also what stops "will" or "code" in the
--- surrounding sentence from looking like a group of code.
+-- surrounding sentence from looking like a code.
 local CODE_CHAR = "[0-9A-HJKMNP-TV-Z]"
-local CODE_GROUP = "(" .. CODE_CHAR:rep(4) .. ")"
+-- Config.CODE_LEN. Six ungrouped characters -- A7K3P9, not
+-- ABCD-EFGH-JKMN-PQRS -- so there is no dash left anywhere to anchor a
+-- match on, and Wire.formatCode is a passthrough.
+M.CODE_LEN = 6
 
 -- Pull a join code out of whatever a screen is showing.
 --
--- Ui shows one as Wire.formatCode does -- four-character groups joined by
--- dashes, broken after two groups so a text box does not wrap it -- so what
--- comes back from textOf is "... ABCD-EFGH JKMN-PQRS". Only dashed pairs are
--- matched, which is what keeps the prose in front of it out of the answer.
+-- Ui shows one as Wire.formatCode does, which at six characters is the code
+-- itself, so what comes back from textOf is "Players will need: A7K3P9" and
+-- the dashed pair this used to key on is gone. Whole alphanumeric *tokens*
+-- are matched rather than any six-character window: a token counts only if
+-- all of it is code characters, which is what stops six usable letters in
+-- the middle of a longer word from being read as a code. Case does most of
+-- the work on top of that -- every code character is upper case and the
+-- mod's own prose is not -- so "Players" is refused before its length is
+-- even considered.
 function M.codeFrom(text)
   if type(text) ~= "string" then return nil end
-  local parts = {}
-  for a, b in text:gmatch(CODE_GROUP .. "%-" .. CODE_GROUP) do
-    parts[#parts + 1] = a
-    parts[#parts + 1] = b
+  local shaped = "^" .. CODE_CHAR:rep(M.CODE_LEN) .. "$"
+  for token in text:gmatch("%w+") do
+    if #token == M.CODE_LEN and token:match(shaped) then return token end
   end
-  local code = table.concat(parts)
-  if #code ~= 16 then return nil end
-  return code
+  return nil
 end
 
--- the display form, for logs and for asserting a screen reads it back
+-- The display form, for logs and for asserting a screen reads it back.
+--
+-- A passthrough, and it has to stay the mirror of Wire.formatCode: a driver
+-- that dressed a code up in dashes the game no longer prints would compare
+-- its own invention against the screen and fail for the wrong reason.
 function M.formatCode(code)
   if type(code) ~= "string" then return "" end
-  local groups = {}
-  for i = 1, #code, 4 do groups[#groups + 1] = code:sub(i, i + 3) end
-  return table.concat(groups, "-")
+  return code
 end
 
 -- A code of the right shape that is not the right code.
 --
 -- Derived from the real one rather than invented, so it is guaranteed to
--- normalise (Wire.code refuses anything that is not exactly 16 symbols of
+-- normalise (Wire.code refuses anything that is not exactly six symbols of
 -- the alphabet) and guaranteed to be wrong. A hand-written constant could
 -- be neither.
 function M.wrongCode(code)
@@ -296,27 +331,73 @@ function M.typeOnGrid(game, text)
   return true
 end
 
+-- Is a naming screen on top, and is it the one that wants a join code?
+--
+-- The title is the only thing that tells them apart, and telling them apart
+-- became load-bearing when the join flow changed: JOIN GAME now asks for the
+-- address and the code back to back on two naming screens, so "a grid is up"
+-- no longer means "the grid that wants a code". Typing six characters into
+-- the wrong one dials a hostname made of join code and reports a refused
+-- connection. src/Ui.lua owns both titles (ownTitle).
+local ADDRESS_TITLE = "JOIN"
+local CODE_TITLE = "JOIN CODE"
+
+M.ADDRESS_TITLE = ADDRESS_TITLE
+M.CODE_TITLE = CODE_TITLE
+
+local function namingScreen(game)
+  local top = M.top(game)
+  if not (top and type(top.glyphs) == "table" and top.grid) then return nil end
+  return top
+end
+
+local function titledGrid(game, title)
+  local screen = namingScreen(game)
+  if not screen then return nil end
+  if tostring(screen.title or "") ~= title then return nil end
+  return screen
+end
+
+-- the screen that wants a hub address, and the screen that wants the code
+-- for it -- in that order, both before anything is dialled
+function M.addressGrid(game)
+  return titledGrid(game, ADDRESS_TITLE)
+end
+
+function M.codeGrid(game)
+  return titledGrid(game, CODE_TITLE)
+end
+
 -- Answer a join-code prompt: dismiss whatever box is asking, type the code
 -- on the grid, and confirm with START.
 --
--- The box comes first and its onDone pushes the grid, and a refusal arrives
--- as two boxes rather than one (the hub's sentence, then Transport's), so
--- the way through is to keep pressing A until the grid is actually there
--- instead of counting screens.
+-- Reached two ways now, and this handles both without being told which.
+-- Straight after the address screen the grid is simply already up, because
+-- that screen's onDone pushes it. On the challenge path -- a wrong code, or
+-- one this copy never had -- a text box comes first and its onDone pushes
+-- the grid, and a refusal arrives as two boxes rather than one (the hub's
+-- sentence, then Transport's). So: keep pressing A until the grid is
+-- actually there, rather than counting screens.
+--
+-- A *different* naming screen on top is waited out rather than pressed
+-- through: A there would type a character into the address field instead of
+-- advancing anything.
 function M.enterJoinCode(game, code)
   local screen
   for _ = 1, 40 do
-    local top = M.top(game)
-    if top and type(top.glyphs) == "table" and top.grid then
-      screen = top
-      break
+    screen = M.codeGrid(game)
+    if screen then break end
+    if namingScreen(game) then
+      U.wait(10)
+    else
+      U.tap(game, "a")
+      U.wait(10)
     end
-    U.tap(game, "a")
-    U.wait(10)
   end
   if not screen then
+    local top = M.top(game)
     U.log("WARN never reached the join-code grid; top is",
-          tostring(M.top(game) and (M.top(game).title or "?")))
+          tostring(top and (top.title or "?")))
     return false
   end
   if not M.typeOnGrid(game, code) then return false end
@@ -396,6 +477,48 @@ local PHASE = {
   host_address_checked   = 150,  -- menus only
   -- host waits on the guest leaving and proving the world still works
   guest_left_game        = 240,  -- 60 leave drive + walk test
+
+  -- ------- the dedicated-hub scenario (tests/drivers/run-hub-e2e.sh)
+  --
+  -- Two guests on server/bin/rby-mmo-hub.js and no in-game host anywhere.
+  -- Both instances run one driver (tests/drivers/mmo_guest.lua) and meet at
+  -- `hub_<role>_<tag>` markers, so almost every barrier here comes in an a/b
+  -- pair: each side signals its own and waits for the other's.
+  --
+  -- The two `ready` budgets are the odd ones out, and deliberately large:
+  -- phaseClock starts when the driver loads, so what they measure is a whole
+  -- cold boot -- intro, naming, the MMO menus -- plus a join code typed one
+  -- character at a time on a d-pad grid. Role a types two of them (a wrong
+  -- one, then the right one); b types one, and gets the same budget because
+  -- the boot dominates both.
+  hub_a_ready            = 600,  -- boot + menus + a wrong code AND a right one
+  hub_b_ready            = 600,  -- boot + menus + one code
+  -- b waits on a reaching the walk leg
+  hub_a_walk_start       =  90,  -- floor
+  -- a waits on b taking its baseline before it moves
+  hub_b_baseline         =  90,  -- floor
+  -- b waits on a's three scripted steps
+  hub_a_walk_done        = 120,  -- floor + the walk
+  -- a waits on b judging the walk a cannot judge itself
+  hub_a_walk             = 120,  -- floor
+  hub_b_walk             = 240,  -- 60 roster move + 60 avatar catch-up
+  -- both sides repeat their lines until they hear the other's, in two scopes
+  hub_a_chat             = 300,  -- 150 chat drive
+  hub_b_chat             = 300,  -- the same
+  -- b waits on a walking the PLAYERS menu, reading the card and asking
+  hub_a_trade_asked      = 180,  -- menus + profile card
+  -- each waits on the other's half of the trade
+  hub_a_trade            = 360,  -- 180 trade drive
+  hub_b_trade            = 360,  -- 180 trade drive
+  -- a waits on b waiting for it to be free, then asking for a battle
+  hub_b_battle_asked     = 180,  -- 90 free + menus
+  -- each waits on the other running a link battle to a decision
+  hub_a_battle           = 540,  -- 120 start + 300 run + transition
+  hub_b_battle           = 540,  -- the same
+  -- b waits on a leaving first, so it can watch the roster empty
+  hub_a_left             = 240,  -- menus + the chat log + LEAVE
+  -- a waits on b noticing that, then leaving too
+  hub_b_left             = 300,  -- 120 watching + menus + LEAVE
 }
 
 local SYNC_DIR = os.getenv("MMO_SYNC_DIR") or "/tmp/rby_mmo_sync"

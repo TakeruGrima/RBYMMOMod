@@ -67,7 +67,16 @@ const { config, warnings } = validate({
 const log = createLog({ level: config.log.level });
 for (const warning of warnings) log.warn(warning);
 
-start({ config, log }).then(() => {
+start({
+  config,
+  log,
+  // This front door is the one deprecated caller that is *supposed* to bring
+  // up a hub with no join code (see the header above): a LAN game, no config
+  // file, and the startup warning below said out loud. Named here in as many
+  // words rather than inferred, so lib/server.js never has to guess which
+  // process is asking. See lib/server.js's start() for the option's contract.
+  allowUnauthenticated: true,
+}).then(() => {
   // Said out loud, once, because it is not visible from anywhere else: this
   // front door is open by design, and a host who put it on a public box
   // deserves to learn that from the hub rather than from a stranger.

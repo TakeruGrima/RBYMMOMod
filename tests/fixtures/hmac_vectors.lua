@@ -35,15 +35,16 @@
 --         return crypto.createHmac("sha256", Buffer.from(key, "ascii"))
 --           .update(nonce, "ascii").digest("hex");
 --       }
---       console.log(sign("ABCD-EFGH-JKMN-PQRS", "<32-hex-nonce>"));
+--       console.log(sign("A7K3P9", "<32-hex-nonce>"));
 --     '
 --
 --   which is exactly the recipe auth.sign() documents at the top of
 --   server/lib/auth.js, and the one src/Sha256.lua + src/Wire.lua reimplement.
 --   Each entry below records its `code` exactly as a player would type or
---   paste it (dashed, undashed, lowercase, messy) plus the `normalized` form
---   Wire.code() must reduce it to, so a vector doubles as a normalisation
---   check when read alongside the Wire.code tests in rby_mmo_test.lua.
+--   paste it (dashed, undashed, lowercase, messy, with I/L/O/U noise) plus the
+--   `normalized` form Wire.code() must reduce it to, so a vector doubles as a
+--   normalisation check when read alongside the Wire.code tests in
+--   rby_mmo_test.lua.
 --
 -- No love, no engine modules: a plain table, safe to require from anywhere.
 
@@ -112,9 +113,9 @@ M.SHA256 = {
 --    or the other rather than two tests that quietly drift together.
 -- ------------------------------------------------------------------
 M.KAT = {
-  code = "ABCD-EFGH-JKMN-PQRS",
+  code = "A7K3P9",
   nonce = "a1b2c3d4e5f6070819293a4b5c6d7e8f",
-  digest = "025b38b6dc30464f973489da3bf148a208877406707fd1b6d93abfc521c663e7",
+  digest = "56a6349bae6c261ba588e3d29671234ba74ff295d8deb0fff22254e83acf9670",
 }
 
 -- ------------------------------------------------------------------
@@ -125,172 +126,162 @@ M.KAT = {
 -- ------------------------------------------------------------------
 M.CROSS = {
   {
-    label = "dashed form",
-    code = "ABCD-EFGH-JKMN-PQRS",
-    normalized = "ABCDEFGHJKMNPQRS",
-    nonce = "af0370b116f5d5e7ff962a6059fe10a2",
-    digest = "41372829d8875e30262ae9cd4384d882ded7e04b937a3fa93b5e3b7b034388e4",
-  },
-  {
-    label = "undashed spelling of the same code",
-    code = "ABCDEFGHJKMNPQRS",
-    normalized = "ABCDEFGHJKMNPQRS",
-    nonce = "af0370b116f5d5e7ff962a6059fe10a2",
-    digest = "41372829d8875e30262ae9cd4384d882ded7e04b937a3fa93b5e3b7b034388e4",
+    label = "canonical form",
+    code = "A7K3P9",
+    normalized = "A7K3P9",
+    nonce = "cae662172fd450bb0cd710a769079c05",
+    digest = "0a30ce88f02a82822cfa9834e6d862347b4ee5af9fd0d8283bdfcbbf9173b5ad",
   },
   {
     label = "lowercase spelling of the same code",
-    code = "abcd-efgh-jkmn-pqrs",
-    normalized = "ABCDEFGHJKMNPQRS",
-    nonce = "af0370b116f5d5e7ff962a6059fe10a2",
-    digest = "41372829d8875e30262ae9cd4384d882ded7e04b937a3fa93b5e3b7b034388e4",
+    code = "a7k3p9",
+    normalized = "A7K3P9",
+    nonce = "cae662172fd450bb0cd710a769079c05",
+    digest = "0a30ce88f02a82822cfa9834e6d862347b4ee5af9fd0d8283bdfcbbf9173b5ad",
+  },
+  {
+    label = "spaces stripped from the same code",
+    code = " A7K 3P9 ",
+    normalized = "A7K3P9",
+    nonce = "cae662172fd450bb0cd710a769079c05",
+    digest = "0a30ce88f02a82822cfa9834e6d862347b4ee5af9fd0d8283bdfcbbf9173b5ad",
   },
   {
     label = "messy spacing and punctuation, same code",
-    code = " abcd efgh, jkmn! pqrs?? ",
-    normalized = "ABCDEFGHJKMNPQRS",
-    nonce = "af0370b116f5d5e7ff962a6059fe10a2",
-    digest = "41372829d8875e30262ae9cd4384d882ded7e04b937a3fa93b5e3b7b034388e4",
+    code = " a7k-3p9, ?? ",
+    normalized = "A7K3P9",
+    nonce = "cae662172fd450bb0cd710a769079c05",
+    digest = "0a30ce88f02a82822cfa9834e6d862347b4ee5af9fd0d8283bdfcbbf9173b5ad",
   },
   {
-    label = "alphabet coverage block 1 (chars 1-16)",
-    code = "0123456789ABCDEF",
-    normalized = "0123456789ABCDEF",
-    nonce = "56e393452650ccda3d58584b9d1f4709",
-    digest = "499582825143509f014bdda1a939a3992e6f6180fdf494943158b68a66da9775",
+    label = "a dash typed out of old 16-character habit",
+    code = "A7K-3P9",
+    normalized = "A7K3P9",
+    nonce = "cae662172fd450bb0cd710a769079c05",
+    digest = "0a30ce88f02a82822cfa9834e6d862347b4ee5af9fd0d8283bdfcbbf9173b5ad",
   },
   {
-    label = "alphabet coverage block 2 (chars 17-32)",
-    code = "GHJKMNPQRSTVWXYZ",
-    normalized = "GHJKMNPQRSTVWXYZ",
-    nonce = "1f25d2ca18c9b971f9fdc62544978f0a",
-    digest = "972cbc9214aa425d1e2a22be7a675b04b62e7d80aacbefb864744e641aa18855",
+    -- I, L, O and U are outside the alphabet, so they are dropped as noise
+    -- like any stray character -- not folded to a lookalike (O -> 0, I -> 1).
+    -- A Lua half that aliased them would derive a different key from the
+    -- same typed input and every such player would see "wrong passcode".
+    label = "I, L, O, U dropped as noise, not aliased -- not folded to 1/0",
+    code = "IA7LK3OP9U",
+    normalized = "A7K3P9",
+    nonce = "cae662172fd450bb0cd710a769079c05",
+    digest = "0a30ce88f02a82822cfa9834e6d862347b4ee5af9fd0d8283bdfcbbf9173b5ad",
+  },
+  {
+    label = "alphabet coverage block 1 (offset 0)",
+    code = "012345",
+    normalized = "012345",
+    nonce = "6521606f8a85812aec066190a006e8a7",
+    digest = "ab03abeb1607f15ba534c476c52dacfb8009d4b6c4f8c0295a753927769b3f2a",
+  },
+  {
+    label = "alphabet coverage block 2 (offset 6)",
+    code = "6789AB",
+    normalized = "6789AB",
+    nonce = "e59b1474205d8721cc8784c8539d44e1",
+    digest = "2737e411a5fa84842699167c393ec0151dca087450c390f635a5390d8bc3484b",
+  },
+  {
+    label = "alphabet coverage block 3 (offset 12)",
+    code = "CDEFGH",
+    normalized = "CDEFGH",
+    nonce = "f2aa1ac251e6613e8b05824940748226",
+    digest = "6e72faf1f649a30554f2d61d0f5d6d8e3440da185423eeed758841cbb171eded",
+  },
+  {
+    label = "alphabet coverage block 4 (offset 18)",
+    code = "JKMNPQ",
+    normalized = "JKMNPQ",
+    nonce = "924f31efb185b98b103f157ca64cebe8",
+    digest = "c6fa75daae7993243b7df893001800cb08e16eaa7361f1240322c266e251a80f",
+  },
+  {
+    label = "alphabet coverage block 5 (offset 24)",
+    code = "RSTVWX",
+    normalized = "RSTVWX",
+    nonce = "e825819a4bddae455af8b086aae9a53f",
+    digest = "b1d646abe2fe23d2ae7b14436bd85a7ef240dc42c27e6ed97559391415f344f0",
+  },
+  {
+    label = "alphabet coverage block 6 (offset 30, wraps to the top)",
+    code = "YZ0123",
+    normalized = "YZ0123",
+    nonce = "384343b7f71365cb97a46f765e9e182c",
+    digest = "d0a09d080e9e925dc6b39bc3cfed115d284a6737e0b2c70328b34b15ede70cb3",
   },
   {
     label = "generated code 1 (stride 3)",
-    code = "0369CFJNRVY147AD",
-    normalized = "0369CFJNRVY147AD",
-    nonce = "6afa931347675ff7f41490a20b54bc7d",
-    digest = "a0a9bdc2650033a060a9e10223efa21d8b1b1bddb66d30ac4fd8ef1e85093976",
+    code = "0369CF",
+    normalized = "0369CF",
+    nonce = "04af6944008245e071741421e4712e4f",
+    digest = "c67f777237f69abd677313f2a2f0213ed87e46f89a35ee4976fa9b1271e4d4d6",
   },
   {
     label = "generated code 2 (stride 5)",
-    code = "16BGNTZ49EKRX27C",
-    normalized = "16BGNTZ49EKRX27C",
-    nonce = "c6f8d734991af6c65b20568996fd7e8b",
-    digest = "402e57bf096a6af0b64f80cac420013d4d6c62a4319f54e7fa09bdd1d4fcbd72",
+    code = "05AFMS",
+    normalized = "05AFMS",
+    nonce = "1669a4adc518313541a2a973f63152cf",
+    digest = "23e06ad6c9e576fc331363ec1041c3577a8831bab5b27e0651c165af2a7404f3",
   },
   {
     label = "generated code 3 (stride 7)",
-    code = "29GQY5CKT18FPX4B",
-    normalized = "29GQY5CKT18FPX4B",
-    nonce = "1b52c0b723d697774d9ea196be43d6df",
-    digest = "4be4e8f74eb0a8cb1317d3fdb6f40ebb93ce42e2ca3277862d92f2b6ea698f0d",
+    code = "07ENW3",
+    normalized = "07ENW3",
+    nonce = "e30f4eee963fe3d349d9c872965122da",
+    digest = "2cf5b06032902e909908c1e0442d6d7c499d2133b44e5d4efc741abcba8ff531",
   },
   {
     label = "generated code 4 (stride 9)",
-    code = "3CNY7GS2BMX6FR1A",
-    normalized = "3CNY7GS2BMX6FR1A",
-    nonce = "ae02d33ec4e7ede74c1b436e8f056983",
-    digest = "9dea366a154b0e6043af2c2e178ca8ae129dc4442c718fb8d5dfc6f2fb9e72c5",
+    code = "09JV4D",
+    normalized = "09JV4D",
+    nonce = "35e1472bceafdd0cd60fb6ad6c668041",
+    digest = "6f43c53002d485a7946c656a40a44405725e059ca0aece5632d01ea29840cfec",
   },
   {
     label = "generated code 5 (stride 11)",
-    code = "4FT5GV6HW7JX8KY9",
-    normalized = "4FT5GV6HW7JX8KY9",
-    nonce = "7e7f34e245a74e6eefcb11c6b304fca8",
-    digest = "67a5bbb22e55c3def1d247ac64ac51dcabd78175cc1467431c02484eaf008601",
+    code = "0BP1CQ",
+    normalized = "0BP1CQ",
+    nonce = "24bf9350c1ad7c5e8571a8988447d71c",
+    digest = "7429f80bfb039752d54c409fe6ab873d23d7dd3bcec6d99513fe5a9923ab84e3",
   },
   {
     label = "generated code 6 (stride 13)",
-    code = "5JZCS6K0DT7M1EV8",
-    normalized = "5JZCS6K0DT7M1EV8",
-    nonce = "29a87032e31e2de50b92bb3e19413d43",
-    digest = "1d8c91b58ee91b59e62f89d81086da9137e56eec06851bddc26bd2819df80cc2",
+    code = "0DT7M1",
+    normalized = "0DT7M1",
+    nonce = "26ad4b341a2e78667d7557ecc9e16f6c",
+    digest = "99e6f4b9b8fd1ba49534b918b6eda9304fa44eb4dd3d6586d206256a86f0b5a2",
   },
   {
-    label = "generated code 7 (stride 15)",
-    code = "6N4K2H0FYDWBT9R7",
-    normalized = "6N4K2H0FYDWBT9R7",
-    nonce = "4d2359196ecab7c40849ed4d708bd636",
-    digest = "4730a14afe23d3536e79630d8795e3dd249dfdec98f8df9dfb144fe70068d86e",
+    label = "generated code 7 (stride 17)",
+    code = "0H2K4N",
+    normalized = "0H2K4N",
+    nonce = "8eacdfcb81b585b785516533a580ad5e",
+    digest = "9d38385ca171d30408efd422f2e0d104b0e8bb0ef3022520fb807985824f868a",
   },
   {
-    label = "generated code 8 (stride 17)",
-    code = "7R9TBWDYF0H2K4N6",
-    normalized = "7R9TBWDYF0H2K4N6",
-    nonce = "4ea96f8ba0ac4a4bc9eb6dd479bcf11d",
-    digest = "13ae4af1f6307e29f52687bfb965874dc1b0cb63a5df7f13c92831355f5b4fdf",
-  },
-  {
-    label = "generated code 9 (stride 19)",
-    code = "8VE1M7TD0K6SCZJ5",
-    normalized = "8VE1M7TD0K6SCZJ5",
-    nonce = "fbea1e091a8e6dff5eebd7a369dc745d",
-    digest = "52bedcc489bc168b7117de7d715f99b031021af81245d3976af034051bc2b596",
-  },
-  {
-    label = "generated code 10 (stride 21)",
-    code = "9YK8XJ7WH6VG5TF4",
-    normalized = "9YK8XJ7WH6VG5TF4",
-    nonce = "7a8c1f4a42731b2be8343055a8280222",
-    digest = "df2ac18a1a50cdffa1f384be819c3fa1651d2ee850b8bfda02d803d3ed37d931",
-  },
-  {
-    label = "generated code 11 (stride 23)",
-    code = "A1RF6XMB2SG7YNC3",
-    normalized = "A1RF6XMB2SG7YNC3",
-    nonce = "586899a53e7ad15a3900d0b85a189848",
-    digest = "7b5aa183647ab22ba5d8c1462b90b43e0b4a2d0affc527b99fbd77c83da5d230",
-  },
-  {
-    label = "generated code 12 (stride 25)",
-    code = "B4XPF81TKC5YQG92",
-    normalized = "B4XPF81TKC5YQG92",
-    nonce = "892e01528447bc0ee2ba0bc932df4571",
-    digest = "1df5b0ec385611cd4aca1e52c7f4e9b5a111576d966e09f778c09f5e51ec88a0",
-  },
-  {
-    label = "generated code 13 (stride 27)",
-    code = "C72XRKE94ZTNGB61",
-    normalized = "C72XRKE94ZTNGB61",
-    nonce = "506b0bd8c7aa1374fdb30dcc76633238",
-    digest = "b76b91f837e62b5bd47e08f7518c425317249da342ff0f38e226d1ecc9ea1d11",
-  },
-  {
-    label = "generated code 14 (stride 29)",
-    code = "DA741YVRNJFC9630",
-    normalized = "DA741YVRNJFC9630",
-    nonce = "90eeb3db5f247d8a4ec64a974a561ba6",
-    digest = "7628a01ea1197a316e75544235f739f6e647dfd9644c87374a5df33a4154a2e2",
-  },
-  {
-    label = "generated code 15 (stride 31)",
-    code = "EDCBA9876543210Z",
-    normalized = "EDCBA9876543210Z",
-    nonce = "d60fcbb2a206ec48b9077faf98f24a4e",
-    digest = "1f4d83b5c8a1256503ccf97e179fb9420cd57fdcab8ce090ab1b9af574842692",
-  },
-  {
-    label = "generated code 16 (stride 1)",
-    code = "FGHJKMNPQRSTVWXY",
-    normalized = "FGHJKMNPQRSTVWXY",
-    nonce = "ddf6e202bac907081e75d2f8a69a85b1",
-    digest = "c0a3fc9eaf847507c3c25e06b21aafc7cc194bc8b952a6ad7de4e8a5238fc434",
+    label = "generated code 8 (stride 19)",
+    code = "0K6SCZ",
+    normalized = "0K6SCZ",
+    nonce = "01f90f64e3787939997c025dac8f0e63",
+    digest = "0878999a8ad87d30cd17a8ea207a4d7b0838bd580fc06025988b2078f3be2edf",
   },
   {
     label = "dashed spelling of a generated code",
-    code = "29GQ-Y5CK-T18F-PX4B",
-    normalized = "29GQY5CKT18FPX4B",
-    nonce = "ea5d3078b803015f80cdf55855aaa4c8",
-    digest = "1453c424013208195a1dbed2a6e28217efca7397bd4ea2be1d2a00b9560b0d2e",
+    code = "036-9CF",
+    normalized = "0369CF",
+    nonce = "e0e8c460a5102d48becf5d5052385e35",
+    digest = "2bae838948a2207f6cca5eed73f6e6d6930a6060f207d965ef65007d45f7a8d6",
   },
   {
     label = "lowercase dashed spelling of a generated code",
-    code = "5gv6-hw7j-x8ky-9mza",
-    normalized = "5GV6HW7JX8KY9MZA",
-    nonce = "8cd28d7c25eeb75b2880ccb8751cc4be",
-    digest = "75976d9cdccdb8d47279149cbf3613d6f4f88237dc894614c76c05bd5f931e5a",
+    code = "036-9cf",
+    normalized = "0369CF",
+    nonce = "7cbcf7bcf1ebc7b1bdd4667c48e11756",
+    digest = "0796ea584a178f9df0f32d0e670729fa97e35c94a18643ef3fe27bce788effc6",
   },
 }
 

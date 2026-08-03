@@ -3,8 +3,13 @@
 **You may not need this.** A player can host from inside the game —
 `START > MMO > HOST GAME` — and that is the normal way to play. Reach for
 this when you want a hub that stays up when nobody is playing, one on a box
-with a public address so nobody has to forward a port, or one you can hand a
-join code out for.
+with a public address so nobody has to forward a port, or one whose passcode
+comes from a real CSPRNG rather than a Lua entropy pool.
+
+**Both halves require a passcode.** The in-game host mints one on the way in
+and cannot open a port without it; this hub refuses to start without one.
+There is no open-world setting on either side, and no flag that brings one
+back.
 
 It is the same protocol and the same 2–64 player bounds as the in-game host
 (`src/Hub.lua`); the two are interchangeable and a joining client cannot tell
@@ -16,8 +21,12 @@ Node 22+, no dependencies. Everything below is Node core.
 
 ## Quick start
 
-Two paths to the same thing: a hub that is running, requires a join code, and
-has put that code somewhere exactly one person can read it.
+Two paths to the same thing: a hub that is running, requires a passcode, and
+has put that passcode somewhere exactly one person can read it.
+
+*Passcode* and *join code* are the same six characters — the in-game row is
+labelled `JOIN CODE`, the CLI mints them with `invite`, and this page uses
+whichever word the surface being described uses.
 
 ### Docker
 
@@ -54,39 +63,61 @@ node bin/rby-mmo-hub.js doctor    # what would stop friends connecting
 node bin/rby-mmo-hub.js start     # run it
 ```
 
-`init` writes `config.json` (mode 0600) and prints the code once:
+`init` writes `config.json` (mode 0600) and prints the passcode once:
 
 ```
 Configuration written to /srv/hub/config.json (mode 0600, readable only by you).
 
   listening on   0.0.0.0:7788
   players        up to 4
-  join code      required
+  join code      required (always -- there is no open-hub setting)
   log level      info
 
 Your join code
 
-  ------------------------------------------------------------
+      +------------+
+      |   RM3P02   |
+      +------------+
 
-      PQZX-Q1YP-FSXV-7J31
-
-  ------------------------------------------------------------
-
-  Give that to the friends you want in your world. …
+  Give that to the friends you want in your world. They type it once,
+  in game, on the screen where they enter this hub's address. …
 ```
+
+**Six characters, no dashes.** The wizard's third question is *which*
+passcode, not whether to have one — it used to be "require a join code?", and
+a host who answered *n* got a hub anyone could walk into. Press Enter and one
+is generated for you. `--code
+A7K3P9` on `init` picks your own instead, which is how you make this hub
+answer to the same passcode as your in-game LAN game. Dashes, spaces and
+lower case are normalised away, so `a7k3-p9` is the same passcode as
+`A7K3P9`.
 
 To see it again: `rby-mmo-hub invite list --reveal`.
 
 ### Where a friend types it
 
-In game, before joining: `START > MMO > JOIN CODE`, type the sixteen
-characters (dashes and case do not matter — the code is normalised on both
-ends), then `JOIN GAME` and the hub's `host:port`. If they skip the code and
-the hub asks for one, the game says *"This game needs a join code."* and puts
-them on the entry screen; saving it there dials again.
+In game: `START > MMO > JOIN GAME`, make a trainer, then **the address and
+the passcode are both asked for before anything is dialled** — the address
+first, the passcode straight after it. The passcode is filed against that
+address, so a player who plays on two hubs types neither of them twice.
 
-Every character in a code is on the mod's own naming grid, and **SELECT**
-flips it between letters and digits — the vanilla grid has no digits at all.
+The address field takes 32 characters and accepts an **IP or a hostname** —
+`192.168.1.125:7788` and `MYBOX.EXAMPLE.COM:7788` both reach the socket
+untouched. The naming grid is uppercase-only, which costs nothing: DNS is
+case-insensitive. **Leave the port off and the mod fills in 7788**
+(`Config.DEFAULT_PORT`) — worth knowing, because the engine's own fallback is
+7778, the pokeserver relay's, and a bare hostname dialled there would report
+the relay as unreachable.
+
+`START > MMO > JOIN CODE` is still there for changing a saved passcode
+deliberately. The other way onto that screen is a mistyped one: a hub that
+challenges a copy whose passcode is absent or wrong hangs up, says *"This
+game needs a join code."*, and puts the player back on the entry screen,
+which dials again on save.
+
+Every character in a passcode is on the mod's own naming grid, and
+**SELECT** flips it between letters and digits — the vanilla grid has no
+digits at all.
 
 ---
 
@@ -118,13 +149,13 @@ container, where it is on `PATH`.
 
 | Command | What it does | Its own options |
 | --- | --- | --- |
-| `init` | first-run wizard: writes `config.json` at mode 0600 and prints a join code once. Refuses to overwrite an existing file. | `--yes` (ask nothing, take flags and defaults), `--force` (replace an existing config), `--no-auth` (do not require a join code), plus any config flag below |
+| `init` | first-run wizard: writes `config.json` at mode 0600 and prints a passcode once. Refuses to overwrite an existing file. | `--yes` (ask nothing, take flags and defaults), `--force` (replace an existing config), `--code CODE` (use this passcode instead of a generated one), plus any config flag below |
 | `start` | loads the config, prints who can reach this machine, runs the hub until stopped. **Refuses to run on a group- or world-readable config**, printing the `chmod 600` that fixes it. | any config flag; `--limits.maxPending 12` works as well as `--max 8`; `--insecure-config` (run on a loose config anyway, printing what is being accepted) |
 | `status` | every effective setting, its value, and where that value came from (`flag` / `env` / `file` / `default`). Codes masked. | — |
 | `config list` | every setting, its current value, and its clamp range | — |
 | `config get <path>` | one setting, e.g. `limits.maxPending` | — |
 | `config set <path> <value>` | change one setting: clamped, reported, then saved | — |
-| `invite` † | mint a join code and print it once | `--label TEXT`, `--expires 30m\|24h\|7d`, `--uses N` |
+| `invite` † | mint a join code and print it once | `--label TEXT`, `--expires 30m\|24h\|7d`, `--uses N`, `--code CODE` (use this passcode rather than a generated one) |
 | `invite list` | every code: id, label, created, expires, uses, status. Masked by default. | `--reveal` (print them in full) |
 | `revoke <id>` † | revoke one code. Ids come from `invite list`; a unique prefix is enough. | — |
 | `ban <ip>` † | refuse an address. Normalised first, so every spelling of one address is one ban — see [Addresses](#addresses-what-one-address-means). | `--reason TEXT` (printed, **not** stored — the ban list holds addresses only) |
@@ -139,6 +170,52 @@ container, where it is on `PATH`.
 until you tell it to look.** See
 [Changing things while the hub is running](#changing-things-while-the-hub-is-running).
 
+### `--code`, and the flag that is gone
+
+`init --code CODE` and `invite --code CODE` take a passcode you choose rather
+than one that was generated. It is normalised on the way in — six characters
+from `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, with dashes, spaces and lower case
+dropped — so `--code a7k3-p9` and `--code A7K3P9` are one passcode. Anything
+that does not leave exactly six usable characters is refused, without echoing
+what was typed:
+
+```
+$ rby-mmo-hub invite --code PQZX-Q1YP-FSXV-7J31
+--code: that is not a passcode this hub can use.
+A passcode is 6 characters from 0123456789ABCDEFGHJKMNPQRSTVWXYZ
+-- the digits and the capital letters except I, L, O and U, which are
+left out so nothing is mistyped off a screenshot. Dashes, spaces and
+lower case are fine; they are normalised away.
+```
+
+(That example is a 16-character code from the format this replaced. There is
+no upgrade path for one: `invite --code` a new six-character passcode and
+hand it out.) `invite --code` also refuses a passcode already in the config,
+naming the credential that holds it, because two credentials sharing a
+passcode cannot each carry their own expiry and use count.
+
+**`--no-auth` is gone.** It used to write a hub anyone who found the port
+could walk into. It is still *recognised*, by name — along with `--auth
+false` and `--auth=off`, which meant the same thing — only so it can be
+answered with a sentence rather than "unknown option":
+
+```
+$ rby-mmo-hub init --yes --no-auth
+A passcode is required, so there is no way to turn it off.
+
+  --no-auth (and --auth false) used to write a hub anyone who found the
+  port could join. Both halves of this software now require a passcode:
+  the in-game LAN host asks for one, and this hub refuses to start
+  without one.
+
+  Run `rby-mmo-hub init` without it and a passcode is generated for you,
+  or `rby-mmo-hub init --code A7K3P9` to choose your own.
+```
+
+Exit code `2`, and nothing is written. `init` overrules a passcode-less
+configuration wherever it arrives from — file, flag or
+`RBY_MMO_AUTH_REQUIRED=false` — and says out loud that it did.
+
 Global options, valid on every command:
 
 - `--config <file>` — which config file to use.
@@ -151,8 +228,11 @@ Short spellings for the settings a host actually types: `--host`, `--port`,
 `--max` (or `--max-players`), `--auth`, `--per-ip`, `--connect-burst`,
 `--connect-per-minute`, `--handshake-timeout`, `--idle-timeout`,
 `--partial-line-timeout`, `--max-pending`, `--max-write-buffer`,
-`--chat-interval`, `--upnp`, `--upnp-lease`, `--log-level`. Any dotted config
-path is also accepted verbatim, so nothing needs a hand-written flag.
+`--chat-interval`, `--auth-failure-grace`, `--auth-failure-window`,
+`--auth-backoff-base`, `--auth-backoff-max`, `--auth-global-failures`,
+`--auth-global-window`, `--auth-lockout`, `--upnp`, `--upnp-lease`,
+`--log-level`. Any dotted config path is also accepted verbatim, so nothing
+needs a hand-written flag.
 
 **Exit codes:** `0` success, `1` runtime error, `2` wrong usage. `doctor`
 returns `1` when something would stop players connecting, `0` when only
@@ -164,6 +244,19 @@ Join codes are printed by exactly three things — `init`, `invite`, and
 screen-share or paste into a forum thread. In the container the same rule is
 why `init`'s output is redirected to a 0600 file rather than left on stdout:
 stdout there *is* the log.
+
+Masked is the default, and a masked code is six stars regardless of what is
+behind it — the mask is not a side channel about the length or shape of the
+secret. Telling two credentials apart is the `id` column's job:
+
+```
+$ rby-mmo-hub invite list
+ID        LABEL              CREATED           EXPIRES           USES  STATUS  CODE
+primary   Primary join code  2026-08-03 16:47  never             0     active  ******
+a5fa1246  For Ash            2026-08-03 16:47  2026-08-04 16:47  0/1   active  ******
+
+Codes are masked. --reveal prints them in full.
+```
 
 ---
 
@@ -195,7 +288,7 @@ end and reported, never obeyed.
 | `listen.host` | `0.0.0.0` | — | `RBY_MMO_HOST` | address to bind. `0.0.0.0` accepts on every address this machine has |
 | `listen.port` | `7788` | 1–65535 | `RBY_MMO_PORT` | TCP port to listen on |
 | `maxPlayers` | `4` | 2–64 | `RBY_MMO_MAX` | greeted players before new ones are refused |
-| `auth.required` | `true` | — | `RBY_MMO_AUTH_REQUIRED` | whether a join code is demanded. `false` means anyone who reaches the port can join |
+| `auth.required` | `true` | — | `RBY_MMO_AUTH_REQUIRED` | whether a passcode is demanded. **`false` means the hub refuses to start** — it is still settable, so a config can be scripted or a report reproduced, but `start` exits `1` and `doctor` calls it a `[fail]` |
 | `auth.credentials` | `[]` | — | — | the join codes. Managed with `invite` / `revoke` |
 | `limits.perIpConnections` | `4` | 1–64 | `RBY_MMO_PER_IP` | connections one address may hold at once |
 | `limits.connectBurst` | `10` | 1–1000 | `RBY_MMO_CONNECT_BURST` | depth of the per-address connect-rate bucket |
@@ -206,6 +299,13 @@ end and reported, never obeyed.
 | `limits.maxPending` | `8` | 1–256 | `RBY_MMO_MAX_PENDING` | connections that have not said `hello` yet, in total |
 | `limits.maxWriteBufferBytes` | `262144` | 16384–16777216 | `RBY_MMO_MAX_WRITE_BUFFER_BYTES` | queued bytes for one peer before it is dropped for not reading |
 | `limits.chatIntervalMs` | `500` | 0–60000 | `RBY_MMO_CHAT_INTERVAL_MS` | minimum gap between one sender's chat messages. `0` turns the flood gate off |
+| `limits.authFailureGrace` | `3` | 0–100 | `RBY_MMO_AUTH_FAILURE_GRACE` | wrong passcodes one address gets free before it starts backing off. `0` backs off from the first |
+| `limits.authFailureWindowMs` | `600000` | 1000–86400000 | `RBY_MMO_AUTH_FAILURE_WINDOW_MS` | how long one address's failures are remembered. A day is the ceiling: a longer grudge is a ban, and `ban` is its own verb |
+| `limits.authBackoffBaseMs` | `2000` | 100–3600000 | `RBY_MMO_AUTH_BACKOFF_BASE_MS` | the first wait imposed past the grace |
+| `limits.authBackoffMaxMs` | `300000` | 1000–86400000 | `RBY_MMO_AUTH_BACKOFF_MAX_MS` | the ceiling that wait doubles to — reached on the twelfth wrong passcode at the defaults |
+| `limits.authGlobalFailures` | `100` | 1–1000000 | `RBY_MMO_AUTH_GLOBAL_FAILURES` | wrong passcodes **hub-wide** in one window before the ceiling trips. The one limit that does not improve for an attacker who rents more addresses |
+| `limits.authGlobalWindowMs` | `60000` | 1000–3600000 | `RBY_MMO_AUTH_GLOBAL_WINDOW_MS` | the window those are counted over |
+| `limits.authLockoutMs` | `60000` | 1000–3600000 | `RBY_MMO_AUTH_LOCKOUT_MS` | how long a tripped ceiling refuses new join attempts. Players already in the world are untouched |
 | `bans` | `[]` | — | — | addresses refused outright. Managed with `ban` / `unban` |
 | `allowlist` | `[]` | — | — | when non-empty, the **only** addresses that may connect. Managed with `allow` |
 | `network.upnp.enabled` | `false` | — | `RBY_MMO_UPNP` | whether `start` asks the router to forward the port |
@@ -214,6 +314,26 @@ end and reported, never obeyed.
 
 `RBY_MMO_CONFIG` is the odd one out: it names *where the file is*, not a value
 inside it.
+
+The seven `auth*` limits are the wrong-passcode throttle, and they are the
+reason a six-character passcode is defensible online at all — the arithmetic
+is under [Security posture](#security-posture). `status`, `start` and
+`doctor` all print them in words rather than leaving them in the table:
+
+```
+Wrong-passcode throttle (configured here; the live counts belong to the
+running hub and show up in its log, not in this command):
+  per address   3 free attempt(s) per 10m, then a wait from 2s doubling to 5m
+  hub-wide      100 failures in 1m shuts new joins for 1m
+```
+
+Those are the **configured** numbers, not a live reading. How many wrong
+passcodes have actually arrived is known only to the running hub, which says
+so in its own log; `status` and `doctor` are short-lived processes that read
+a file, and there is no admin socket for them to ask through. `doctor` also
+warns about settings that would bite the host rather than an attacker — a
+`authGlobalFailures` no higher than `maxPlayers`, for instance, means a full
+house mistyping the passcode once each can shut new joins.
 
 **`config set` reaches every setting in that table but two.**
 
@@ -294,20 +414,91 @@ has nothing to re-read, and says so.
 
 Be clear-eyed about this before you expose a port.
 
-### The join code
+### The passcode: exactly 30 bits
 
 The hub sends a fresh random nonce; the client answers
-`HMAC-SHA256(joinCode, nonce)`. **The join code itself never crosses the
-wire.** Codes are sixteen characters from a 32-symbol alphabet with `I L O U`
-removed — an 80-bit *shape*, and nothing that can be misread off a screenshot.
+`HMAC-SHA256(passcode, nonce)`. **The passcode itself never crosses the
+wire.** A passcode is six characters from a 32-symbol alphabet with `I L O U`
+removed, so 32⁶ = **2³⁰ — thirty bits, exactly**, down from the eighty a
+sixteen-character code carried.
 
-**Whether it is 80 bits of secret depends on which host minted it**, and the
-difference is not small:
+That is a deliberate trade, made because sixteen characters on a d-pad was
+unusable, and it is worth stating what it costs rather than what it sounds
+like.
 
-| Minted by | Source | Honest strength |
+**Online guessing.** At the default `limits.connectPerMinute` of 60, walking
+all 2³⁰ passcodes past this hub from one address takes about **34 years** —
+even odds at about 17 — with the attacker holding a connection budget open
+the whole time, in full view of the host's log. **34 years, not 34,000**;
+that figure is easy to overstate by a factor of a thousand and this page will
+not. Raising `connectPerMinute` shrinks it in proportion: at its ceiling of
+6000, even odds arrive in about two months.
+
+**But that bucket is per address**, which is the whole problem. Divide the
+number by however many addresses an attacker can rent: a thousand of them
+brings even odds inside a fortnight, and the difference between decades and a
+fortnight is a hosting invoice.
+
+**That is why the throttle exists,** and why half of it is global. Wrong
+passcodes are limited twice:
+
+- **Per address** — `limits.authFailureGrace` (3) free failures per
+  `authFailureWindowMs` (10m), then an escalating wait from
+  `authBackoffBaseMs` (2s), doubling to `authBackoffMaxMs` (5m), which the
+  twelfth wrong passcode reaches. From there one address gets twelve guesses
+  an hour. This half is shaped for humans: a friend who fat-fingers the code
+  a fourth time waits two seconds and never notices.
+- **Hub-wide** — `limits.authGlobalFailures` (100) failures inside
+  `authGlobalWindowMs` (60s) trips a ceiling that refuses new join attempts
+  for `authLockoutMs` (60s). **This is the number that does not improve when
+  an attacker rents more hosts**, and it is the only reason a 30-bit passcode
+  is defensible online. A hundred wrong passcodes hub-wide in a minute is not
+  something a friend group produces; a four-seat hub sees a handful across an
+  evening. Held to ~100 guesses a minute, even odds on 2³⁰ sit at roughly a
+  decade, with the log saying so the whole time.
+
+**What a tripped ceiling does, exactly** — this matters, because it is the
+part that sounds worse than it is. It stops the hub issuing challenges. That
+is the entire blast radius: it does not touch the admission check, so
+connections are still accepted; it does not appear in the idle/handshake
+sweep, so nobody is disconnected for it; it reads no connection record at
+all. **Every already-authenticated player keeps playing, undisturbed and
+unthrottled, for the whole lockout.** A hub under attack goes temporarily
+closed to newcomers, not down. The accepted cost is that a player holding the
+*correct* passcode who arrives mid-attack is turned away until the cooling
+period ends — a minute by default — and the hub says so in the log:
+
+```
+WARN too many wrong join codes across this hub (100 within 60s): new join
+attempts are refused for the next 60 seconds. Players already connected are
+not affected and stay in the game.
+```
+
+(One line in the log; wrapped here to fit.)
+
+**Offline grinding, where none of that reaches.** There is no TLS on the game
+port. Anyone who can capture a single challenge/response pair off the wire —
+a shared LAN, a hostile router, a VPS neighbour — holds everything needed to
+test passcodes locally, at their hardware's speed, with **no limit of any
+kind applying**. 2³⁰ HMAC-SHA256 evaluations is seconds of work on commodity
+hardware. **A captured pair should be assumed to yield the passcode.**
+
+So, plainly: **a six-character passcode keeps strangers out, not
+eavesdroppers.** It stops internet scanners, anyone who merely finds the
+port, and anyone guessing from outside. It does not survive somebody who can
+read your traffic. If the traffic can be captured, put everyone on an overlay
+network (WireGuard, Tailscale, ZeroTier) and share the overlay address —
+that, and nothing on this page, is what closes that gap.
+
+### Where the passcode comes from
+
+Thirty bits is the ceiling either way, but only one of the two hosting paths
+reaches it from a real CSPRNG:
+
+| Minted by | Source | What it is worth |
 | --- | --- | --- |
-| `rby-mmo-hub init` / `invite` (this server) | `crypto.randomBytes`, rejection-sampled so the alphabet stays uniform | the full **80 bits** |
-| the in-game host (`START > MMO > HOST GAME`, `src/Client.lua`) | a Lua entropy pool — frame timings, `os.clock()` deltas, heap size, button-press timing, a burst of scheduling jitter at draw time, ratcheted through SHA-256 | **64 bits claimed** in practice — any game that has reached that screen has been stirring the pool for thousands of frames. The pool's input runs past 80 by then, but nothing health-tests it, so 64 is the number the code stands behind. A draw before a single frame has run would be **~35–45 bits**. |
+| `rby-mmo-hub init` / `invite` (this server) | `crypto.randomBytes`, rejection-sampled so the alphabet stays uniform | the full **30 bits** the format allows |
+| the in-game host (`START > MMO > HOST GAME`, `src/Client.lua`) | a Lua entropy pool — frame timings, `os.clock()` deltas, heap size, button-press timing, a burst of scheduling jitter at draw time, ratcheted through SHA-256 | **64 bits claimed** from a game that has been running more than a moment, which is every game that has reached that screen; **~35–45 bits** if something contrived to draw before a single frame had run. At six characters the passcode's own 30 bits are the binding constraint on the first path, and the pool is on the second. |
 
 The in-game path is not a CSPRNG and does not pretend to be: a mod that
 declares only `network` can reach nothing better — LÖVE ships no `randomBytes`,
@@ -315,16 +506,11 @@ declares only `network` can reach nothing better — LÖVE ships no `randomBytes
 filesystem permission this mod does not have. The same pool feeds `src/Hub.lua`'s
 challenge nonces.
 
-**Why that gap matters more than it looks.** None of the hub's rate limits
-apply to guessing a code this way. One captured handshake — a nonce and the
-64-hex answer to it — is enough to attack the code **offline**, at whatever
-rate the attacker's hardware manages, with nothing to notice or refuse. A
-40-bit secret does not survive that; 80 bits does.
-
-**So: a hub exposed to the open internet should be this one**, with codes from
-`invite`. The in-game host is right for a LAN, a VPN, or people in the same
-room. A player who wants better than 64 bits out of it can type their own code
-on the `HOST GAME > JOIN CODE` screen — including one this server minted.
+**So: a hub exposed to the open internet should be this one**, with passcodes
+from `invite`. The in-game host is right for a LAN, a VPN, or people in the
+same room. A player who wants a passcode this server minted can type it on
+the `HOST GAME > JOIN CODE` screen, and `invite --code` points this hub at
+one the game generated — the two are interchangeable.
 
 - A passive eavesdropper cannot recover the code (HMAC is one-way) and cannot
   replay a captured answer: the nonce is per-connection and single-use, spent
@@ -348,20 +534,28 @@ on the `HOST GAME > JOIN CODE` screen — including one this server minted.
   and starting anyway would have left the exposure in place for exactly as
   long as the hub was running, which is the whole time it matters.
   `--insecure-config` starts on one anyway, for a host with a genuinely
-  unusual setup, and prints what is being accepted.
+  unusual setup, and prints what is being accepted. **It does not waive the
+  passcode — nothing does.**
+- **Two configurations refuse to start**, both with exit `1` and both naming
+  the command that fixes them: `auth.required` false, and `auth.required` on
+  with no credential that still works. The first admits anyone who finds the
+  port; the second admits nobody, and *looks* configured. `doctor` marks
+  each `[fail]` and exits `1` on them too, so the two commands never
+  disagree.
 
-### What that buys, and what it does not
+### The link is still not encrypted
 
-It stops internet scanners and anyone who merely finds the port. That is the
-whole of what it is for, and it does it.
+Everything above is about who gets in. Nothing above is about who can read
+what happens next.
 
-**The link is not encrypted.** Gameplay traffic — names, chat, positions,
-trade and battle payloads — is readable by anyone on the path, and an active
-man-in-the-middle can proxy the entire session. There is no TLS on the game
-port because the client cannot speak it: LÖVE ships luasocket, not luasec, and
-the engine opens a plain `socket.tcp()`. Putting everyone on an encrypted
-overlay network (WireGuard, Tailscale, ZeroTier) and sharing the overlay
-address is the only thing that closes that gap.
+**Gameplay traffic — names, chat, positions, trade and battle payloads — is
+readable by anyone on the path**, and an active man-in-the-middle can proxy
+the entire session. There is no TLS on the game port because the client
+cannot speak it: LÖVE ships luasocket, not luasec, and the engine opens a
+plain `socket.tcp()`. That is also what makes the offline attack on the
+passcode possible at all. Putting everyone on an encrypted overlay network
+(WireGuard, Tailscale, ZeroTier) and sharing the overlay address is the only
+thing that closes either gap.
 
 ### Connection hardening
 
@@ -392,6 +586,14 @@ All of it is on by default under `rby-mmo-hub`, and all of it is tunable.
   and an IPv6 host cannot slip past one by respelling itself. An allowlist with
   entries is exclusive. Neither takes effect on a running hub until it is
   reloaded or restarted.
+- **A wrong-passcode throttle, per address and hub-wide** (the seven
+  `limits.auth*` settings, and
+  [The passcode: exactly 30 bits](#the-passcode-exactly-30-bits) for why).
+  Two limiters, two budgets: a refused passcode does **not** spend a connect
+  token, so one roommate's typo cannot drain a shared household's connection
+  budget, and `connectPerMinute` keeps meaning what it says. A refusal handed
+  down by the throttle itself is not recorded as a failure either — retrying
+  into a closed door must not extend an honest player's own backoff.
 - A rejection that is a flood signal (banned, rate-limited) costs the sender
   nothing but the SYN; one an honest player could plausibly hit gets a
   sentence, because the game renders it.
@@ -422,8 +624,9 @@ and a ban stored in a spelling the kernel never emits reports success and then
 never fires. Anything that does not parse as an address is stored exactly as it
 arrived — nothing on the accept path throws.
 
-**The connection cap and the connect-rate bucket count per `/64` for IPv6**,
-and per exact address for IPv4. `limits.perIpConnections` exists to bound one
+**The connection cap, the connect-rate bucket and the per-address passcode
+backoff all count per `/64` for IPv6**, and per exact address for IPv4.
+`limits.perIpConnections` exists to bound one
 household, and a household is a `/64` — the smallest block a residential IPv6
 assignment hands out. Keyed by the full address it would not be a cap at all: a
 client with a normal `/64` has 2^64 source addresses to open one connection
@@ -455,16 +658,23 @@ member of. Exact for policy, per-block for counting.
 
 ### The in-game host is not the hardened one
 
-`src/Hub.lua` can ask for a join code too, and the exchange is byte-compatible
-with this one. What differs is where the randomness comes from: both its
-challenge nonces and the code the `HOST GAME` screen offers are drawn from the
-Lua entropy pool described above, not from a CSPRNG — roughly 35–45 bits cold,
-64 bits claimed once the game has been running a few seconds, against this
-server's 80. It also has none of the connection hardening below: no per-address
-cap, no connect-rate bucket, no ban list, no allowlist.
+`src/Hub.lua` requires a passcode too — `HostServer:start` refuses to open the
+port without one, the `HOST GAME` screen mints one on arrival and shows it in
+the `JOIN CODE` row, and there is no longer any way to host an open game. The
+exchange is byte-compatible with this one, so a joining client cannot tell the
+two apart.
+
+What differs is everything around it. Both its challenge nonces and the
+passcode the `HOST GAME` screen offers come from the Lua entropy pool
+described above rather than a CSPRNG — ~35–45 bits cold, 64 bits claimed once
+the game has been running more than a moment. It also has none of the
+hardening listed above: no per-address cap, no connect-rate bucket, no
+wrong-passcode throttle, no ban list, no allowlist. Nothing slows a guesser
+down there but the handshake itself.
 
 That is fine for a LAN game among people in the same room, and it is the normal
-way to play.
+way to play. A host who wants a passcode with a CSPRNG behind it can type one
+this server minted into `HOST GAME > JOIN CODE`.
 
 **A hub exposed to the open internet should be this one.**
 
@@ -613,8 +823,13 @@ and the same three environment variables (`RBY_MMO_PORT`, `RBY_MMO_HOST`,
 `RBY_MMO_MAX`, the last clamped to 2–64). Every command that ever worked here
 still works.
 
-It is **unauthenticated and has no per-address or connection-rate limits**,
-and it now says so at startup:
+**This is the one exception to "a passcode is required", and it is a
+deliberate one.** There is no config file here to keep a passcode in, so this
+shim is the single caller allowed past the refusal — it asks for that in as
+many words (`allowUnauthenticated: true`), rather than reaching it by
+accident, and `lib/server.js` refuses every other caller that would admit
+anybody. It is **unauthenticated and has no per-address or connection-rate
+limits**, and it says so at startup:
 
 ```
 2026-08-03T03:02:39.208Z INFO RBY MMO hub listening on 0.0.0.0:7992 (protocol 2)
@@ -651,7 +866,7 @@ on a relay connection.
 
 | Type | Payload |
 | --- | --- |
-| `mmo.challenge` | `nonce` — 32 lowercase hex chars, per-connection, single-use. **Only sent when a join code is required** |
+| `mmo.challenge` | `nonce` — 32 lowercase hex chars, per-connection, single-use. Sent by every hub that requires a passcode, which is every hub but the `node hub.js` shim |
 | `mmo.welcome` | `id, players[]` |
 | `mmo.join` / `mmo.part` | `player` / `id` |
 | `mmo.move` | a presence record |
@@ -667,13 +882,21 @@ The handshake, in full:
 
 ```
 client → hub    mmo.hello      { proto: 2, name, sprite, profile, map, x, y, facing }
-hub    → client mmo.challenge  { nonce }        ← only when a code is required
-client → hub    mmo.auth       { response }
+hub    → client mmo.challenge  { nonce }        ← only when a passcode is required
+client → hub    mmo.auth       { response }     ← HMAC-SHA256(passcode, nonce), 64 hex
 hub    → client mmo.welcome    { id, players[] }   ← or mmo.error, which the game shows
 ```
 
-When no code is required the exchange is byte-identical to what it has always
-been: `hello`, then `welcome`.
+The whole exchange has one ten-second budget, measured from when the socket
+landed and **not** extended for the challenge leg — `limits.handshakeTimeoutMs`
+here, `Config.HANDSHAKE_TIMEOUT` in the mod, deliberately the same number so
+one client dialling the two hosting paths meets one deadline. A client with no
+passcode to answer with hangs up rather than holding the socket open behind a
+screen someone is still typing on.
+
+On the one path where no passcode is required — the `node hub.js` shim — the
+exchange is byte-identical to what it has always been: `hello`, then
+`welcome`.
 
 **`PROTOCOL` is 2**, and it lives in **`lib/relay.js`** (not `hub.js` any
 more) and in **`src/Config.lua`**. Bump both together on any incompatible

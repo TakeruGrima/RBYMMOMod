@@ -65,11 +65,12 @@ return function(game)
   -- start gun. This side still dials the default 127.0.0.1:7788, because
   -- both instances are on one machine.
   --
-  -- Its second line is the join code, when the host set one. Whether this
-  -- run exercises the code is therefore decided by what the host actually
-  -- did, not by this side's own copy of an env flag -- two drivers reading
-  -- the same switch and disagreeing about it is a whole class of confusing
-  -- failure that never has to exist.
+  -- Its second line is the join code, which the host always has: hosting
+  -- without one is refused at the socket. Taking it off the file rather than
+  -- off an env flag of this side's own is still the right shape -- two
+  -- drivers reading the same switch and disagreeing about it is a whole
+  -- class of confusing failure that never has to exist -- and it now doubles
+  -- as the check that the host really did publish one.
   local hostAddress, joinCode
   local ready = H.waitSeconds(game, function()
     local handle = io.open(ADDR_FILE, "r")
@@ -86,7 +87,7 @@ return function(game)
     return
   end
   log("host published", tostring(hostAddress),
-      joinCode and ("code " .. H.formatCode(joinCode)) or "with no code")
+      joinCode and ("code " .. H.formatCode(joinCode)) or "with NO CODE")
 
   -- ------- join, through the real menus
 
@@ -106,41 +107,55 @@ return function(game)
   check(H.classify(H.top(game)) == "menu", "character creation opened")
   check(H.selectLabel(game, "JOIN"), "confirmed the trainer and moved on")
 
-  -- The naming screen opens prefilled with the saved address, so START
-  -- confirms it as-is. That the field is prefilled at all is the point:
-  -- the vanilla grid has no digits, so a default that already reads
-  -- 127.0.0.1:7788 is what makes this reachable without typing.
+  -- The naming screen carries the saved address as its `default`, and START
+  -- submits that when nothing has been typed. That it has a default at all
+  -- is the point: the vanilla grid has no digits, so a default that already
+  -- reads 127.0.0.1:7788 is what makes this reachable without typing.
+  --
+  -- Identified by title, not merely by "a grid is up": the code screen is
+  -- also a naming screen and is one keypress away, so the two have to be
+  -- told apart or a run could type its address into the wrong one.
   U.wait(20)
-  local naming = H.top(game)
-  if naming and naming.glyphs then
-    log("address field reads", '"' .. table.concat(naming.glyphs) .. '"')
+  local naming = H.addressGrid(game)
+  if naming then
+    log("address screen: typed", '"' .. table.concat(naming.glyphs) .. '"',
+        "default", '"' .. tostring(naming.default) .. '"')
   else
-    log("WARN the top state is not a naming screen:",
-        tostring(naming and naming.title))
+    log("WARN the top state is not the address screen:",
+        tostring(H.top(game) and (H.top(game).title or "?")))
   end
+  check(naming ~= nil, "the address screen opened")
   U.shot(game, SHOT_DIR .. "/join-address.png")
   U.tap(game, "start")
   U.wait(60)
 
-  -- ------- the join code, asked for by a running game
+  -- ------- the join code, asked for before anything is dialled
   --
   -- The one path no other suite can reach. tests/rby_mmo_test.lua drives Hub
   -- with fake peers, so it can prove the HMAC is checked but never that a
-  -- player can answer a challenge: the code arrives as a nonce mid-connect,
-  -- the answer has to be typed on a d-pad grid with no digits on its first
-  -- page, and every part of that is UI.
+  -- player can answer a challenge: the answer has to be typed on a d-pad
+  -- grid with no digits on its first page, and every part of that is UI.
   --
-  -- The wrong code goes first, on the same connection budget, because the
-  -- refusal path is where a player ends up when they mistype -- and a
-  -- refusal that leaves them staring at a dead screen with no way back is
-  -- worse than one that never came.
+  -- The order changed with the six-character passcode. It used to be
+  -- address, dial, and then a challenge from the hub pushing a text box over
+  -- a handshake that was already spending its ten-second budget; now the
+  -- address screen hands straight over to the code grid and the socket is
+  -- not opened until both have been answered. The challenge path still
+  -- exists and is still driven below -- it is what a *wrong* code lands back
+  -- on, which is why the wrong one goes first: that is where a player ends
+  -- up when they mistype, and a refusal that leaves them staring at a dead
+  -- screen with no way back is worse than one that never came.
+  check(joinCode ~= nil, "the host published a join code with its address")
   if joinCode then
-    local asked = H.waitSeconds(game, function()
-      local top = H.top(game)
-      return top ~= nil and H.textOf(top):find("join code", 1, true) ~= nil
-    end, 60, "the game to ask for a join code")
-    check(asked, "a locked game asks for a code instead of letting us in")
-    check(exports.isConnected() == false, "and does not admit us without one")
+    -- Frames, and only here: the grid is pushed by the address screen's own
+    -- onDone, inside this process, with nothing yet on the wire -- which is
+    -- exactly what the assertion under it says.
+    local asked = H.waitFor(game, function()
+      return H.codeGrid(game) ~= nil
+    end, 240, "the join-code grid")
+    check(asked, "the address screen hands straight over to the code grid")
+    check(exports.isConnected() == false,
+          "and nothing is dialled until the code is answered")
     U.shot(game, SHOT_DIR .. "/join-code-asked.png")
 
     local wrong = H.wrongCode(joinCode)

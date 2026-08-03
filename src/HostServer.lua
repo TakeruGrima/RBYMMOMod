@@ -97,22 +97,33 @@ end
 
 -- ------- lifecycle
 
--- joinCode is optional and off unless the host chose one.  It arrives
--- normalised, and is checked again here rather than in Hub because this is
--- the layer that can still refuse to host: a code that will not normalise
--- would leave Hub with none, and silently opening a game the host believed
--- was locked is the one failure worth stopping for.  The code never reaches
--- self.error -- an error string is read out on screen.
+-- joinCode is required, and this is the layer that enforces it.
+--
+-- Hub is deliberately left able to run without one: it is pure logic, the
+-- suite builds it directly, and both halves of the handshake -- challenged
+-- and unchallenged -- have to stay exercisable under plain luajit.  This
+-- file is the only thing in the mod that opens a socket, so it is the only
+-- place where "no code" would mean a game a stranger can walk into.  Putting
+-- the invariant here makes it true of every hub anyone can actually reach,
+-- without making Hub untestable.
+--
+-- Absent and unusable are told apart because the remedies differ: one is
+-- "choose a code", the other "that one won't do".  Both are returned rather
+-- than raised -- the caller is inside a mod callback and has a screen to put
+-- the sentence on.  The code itself never reaches self.error and never
+-- reaches mod.log: an error string is read out on screen, and a log line
+-- outlives the game that wrote it.
 function M:start(port, maxPlayers, joinCode)
   if self.running then return false, "already hosting" end
 
-  local code
-  if type(joinCode) == "string" and joinCode ~= "" then
-    code = Wire.code(joinCode)
-    if not code then
-      self.error = "that join code can't be used; pick another"
-      return false, self.error
-    end
+  if type(joinCode) ~= "string" or joinCode == "" then
+    self.error = "hosting needs a join code; set one from HOST > JOIN CODE"
+    return false, self.error
+  end
+  local code = Wire.code(joinCode)
+  if not code then
+    self.error = "that join code can't be used; pick another"
+    return false, self.error
   end
 
   local socket = luasocket()
@@ -221,7 +232,9 @@ function M:localNet()
   -- Trusted, and only this one is: the handle above never leaves this
   -- process, so nothing off the network can obtain it -- and a join code is
   -- for keeping strangers out, not for making the host type their own code
-  -- to walk into the game they just started.
+  -- to walk into the game they just started.  This is what keeps the code
+  -- being mandatory from locking the host out of their own hub: start()
+  -- refuses to run uncoded, and the host still walks in without typing it.
   client = self.hub:accept(peer, true)
   if not client then return nil, "the game is full" end
 

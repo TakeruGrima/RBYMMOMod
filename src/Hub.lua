@@ -14,14 +14,19 @@
 -- the session pairing be tested under plain luajit, which has no luasocket
 -- and no LOVE.
 --
--- The host may put a join code on the game.  When they do, hello is
--- answered with a nonce and the peer owes an HMAC of it keyed by the code
--- (plan §3.2); the code itself never crosses the wire, and a peer that has
--- not answered is on nobody's roster.  Default is off -- two people on the
--- same couch should not have to type a secret at each other -- and the
--- exchange with no code configured is byte-identical to what it was before
--- codes existed.  server/lib/relay.js runs the same handshake message for
--- message, so a joining client cannot tell the two hosting paths apart.
+-- Every hub carries a join code.  Hello is answered with a nonce and the
+-- peer owes an HMAC of it keyed by the code (plan §3.2); the code itself
+-- never crosses the wire, and a peer that has not answered is on nobody's
+-- roster.  server/lib/relay.js runs the same handshake message for message,
+-- so a joining client cannot tell the two hosting paths apart.
+--
+-- This file will still build a hub with no code, and that is on purpose:
+-- it is pure logic, and the uncoded path is the only way the suite can
+-- exercise admit-at-hello alongside admit-after-challenge under plain
+-- luajit.  **Only the suite may make one.**  Every hub a player can reach
+-- comes from HostServer:start, which refuses outright without a code, so
+-- an uncoded hub means "a fixture", never "a LAN game left open" -- there
+-- is no longer any way for a host to ask for one.
 --
 -- Everything arriving here is untrusted -- it comes from another player's
 -- process, and a modified one is a normal thing to meet -- so every field
@@ -228,10 +233,10 @@ function M.new(opts)
   return setmetatable({
     limit = Config.clampPlayers(opts.maxPlayers),
     -- Absent is nil, never "": a hub with no code admits anyone who says
-    -- hello, which is what a LAN game wants.  Re-normalised on the way in
-    -- because a code that does not survive normalisation is a code no
-    -- player could type; Wire.code is idempotent, so a caller that already
-    -- normalised loses nothing by it.
+    -- hello, which is a fixture, not a hosting mode -- see the header.
+    -- Re-normalised on the way in because a code that does not survive
+    -- normalisation is a code no player could type; Wire.code is
+    -- idempotent, so a caller that already normalised loses nothing by it.
     joinCode = Wire.code(opts.joinCode),
     clients = {},     -- id -> client (greeted or not)
     count = 0,        -- connections
@@ -277,8 +282,11 @@ function M:pendingCount()
   return self.count - self.players
 end
 
--- Is this hub asking for a join code?  The code itself stays here: nothing
--- outside needs it, and the fewer places hold it the fewer can leak it.
+-- Is this hub asking for a join code?  Unchanged in meaning, and still
+-- asked rather than assumed, because a hub built without one is still a
+-- thing this file can be handed -- by the suite, and by nobody else.  The
+-- code itself stays here: nothing outside needs it, and the fewer places
+-- hold it the fewer can leak it.
 function M:requiresCode()
   return self.joinCode ~= nil
 end

@@ -65,6 +65,16 @@ const DEFAULTS = {
     maxPending: 8,
     maxWriteBufferBytes: 262144,
     chatIntervalMs: 500,
+    // The authentication-failure throttle. Values are limits.js's own
+    // DEFAULTS verbatim -- that module owns what its knobs mean, and a
+    // second opinion here would only be a way for the two to disagree.
+    authFailureGrace: 3,
+    authFailureWindowMs: 600000,
+    authBackoffBaseMs: 2000,
+    authBackoffMaxMs: 300000,
+    authGlobalFailures: 100,
+    authGlobalWindowMs: 60000,
+    authLockoutMs: 60000,
   },
   bans: [],
   allowlist: [],
@@ -106,12 +116,28 @@ const LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'silent'];
  *                                            longest a stale mapping should
  *                                            outlive the process
  *
- * Every range above is a subset of the matching range in limits.js:55-64, so
- * a value this module accepts is never re-clamped downstream -- one wall
- * sits inside the other rather than beside it. partialLineTimeoutMs is the
- * one knob taken verbatim from limits.js instead of tightened: that module
- * owns the slowloris sweep and is the authority on what its own budget
- * means, and two clamps that disagree would be worse than one loose one.
+ * And the authentication-failure throttle, every range of it taken verbatim
+ * from limits.js for the reason in the paragraph below:
+ *
+ *   authFailureGrace          0 .. 100       free wrong codes before an
+ *                                            address starts backing off
+ *   authFailureWindowMs    1000 .. 86400000  how long one address's failures
+ *                                            are remembered
+ *   authBackoffBaseMs       100 .. 3600000   the first delay past the grace
+ *   authBackoffMaxMs       1000 .. 86400000  the ceiling it escalates to
+ *   authGlobalFailures        1 .. 1000000   hub-wide failures per window
+ *                                            before the ceiling trips
+ *   authGlobalWindowMs     1000 .. 3600000   the window they are counted over
+ *   authLockoutMs          1000 .. 3600000   how long the ceiling stays
+ *                                            tripped
+ *
+ * Every range above is a subset of the matching range in limits.js, so a
+ * value this module accepts is never re-clamped downstream -- one wall sits
+ * inside the other rather than beside it. partialLineTimeoutMs and the seven
+ * auth* knobs are the ones taken verbatim from limits.js instead of
+ * tightened: that module owns the slowloris sweep and the guess-rate
+ * throttle and is the authority on what its own budgets mean, and two clamps
+ * that disagree would be worse than one loose one.
  */
 const BOUNDS = {
   'listen.port': [1, 65535],
@@ -125,6 +151,13 @@ const BOUNDS = {
   'limits.maxPending': [1, 256],
   'limits.maxWriteBufferBytes': [16384, 16777216],
   'limits.chatIntervalMs': [0, 60000],
+  'limits.authFailureGrace': [0, 100],
+  'limits.authFailureWindowMs': [1000, 86400000],
+  'limits.authBackoffBaseMs': [100, 3600000],
+  'limits.authBackoffMaxMs': [1000, 86400000],
+  'limits.authGlobalFailures': [1, 1000000],
+  'limits.authGlobalWindowMs': [1000, 3600000],
+  'limits.authLockoutMs': [1000, 3600000],
   'network.upnp.leaseSeconds': [60, 604800],
 };
 
@@ -155,6 +188,13 @@ const ENV_MAP = {
   RBY_MMO_MAX_PENDING: 'limits.maxPending',
   RBY_MMO_MAX_WRITE_BUFFER_BYTES: 'limits.maxWriteBufferBytes',
   RBY_MMO_CHAT_INTERVAL_MS: 'limits.chatIntervalMs',
+  RBY_MMO_AUTH_FAILURE_GRACE: 'limits.authFailureGrace',
+  RBY_MMO_AUTH_FAILURE_WINDOW_MS: 'limits.authFailureWindowMs',
+  RBY_MMO_AUTH_BACKOFF_BASE_MS: 'limits.authBackoffBaseMs',
+  RBY_MMO_AUTH_BACKOFF_MAX_MS: 'limits.authBackoffMaxMs',
+  RBY_MMO_AUTH_GLOBAL_FAILURES: 'limits.authGlobalFailures',
+  RBY_MMO_AUTH_GLOBAL_WINDOW_MS: 'limits.authGlobalWindowMs',
+  RBY_MMO_AUTH_LOCKOUT_MS: 'limits.authLockoutMs',
   RBY_MMO_UPNP: 'network.upnp.enabled',
   RBY_MMO_UPNP_LEASE_SECONDS: 'network.upnp.leaseSeconds',
   RBY_MMO_LOG_LEVEL: 'log.level',
@@ -182,6 +222,16 @@ const FLAG_MAP = {
   maxPending: 'limits.maxPending',
   maxWriteBuffer: 'limits.maxWriteBufferBytes',
   chatInterval: 'limits.chatIntervalMs',
+  // The `Ms` is dropped from the flag spelling the way handshakeTimeout and
+  // partialLineTimeout already drop theirs; `authFailureGrace` and
+  // `authGlobalFailures` are counts, so they keep their full names.
+  authFailureGrace: 'limits.authFailureGrace',
+  authFailureWindow: 'limits.authFailureWindowMs',
+  authBackoffBase: 'limits.authBackoffBaseMs',
+  authBackoffMax: 'limits.authBackoffMaxMs',
+  authGlobalFailures: 'limits.authGlobalFailures',
+  authGlobalWindow: 'limits.authGlobalWindowMs',
+  authLockout: 'limits.authLockoutMs',
   upnp: 'network.upnp.enabled',
   upnpLease: 'network.upnp.leaseSeconds',
   logLevel: 'log.level',
@@ -772,15 +822,17 @@ function checkPermissions(file) {
 }
 
 /**
- * A copy safe to print. Join codes are masked whole -- every group, no
- * prefix -- because the outputs this feeds (`status`, `config list`,
+ * A copy safe to print. Join codes are masked whole -- all six characters,
+ * no prefix -- because the outputs this feeds (`status`, `config list`,
  * `invite list` without --reveal) are the ones documented as safe to
  * screen-share and safe to paste into a thread when asking for help.
  *
  * Telling two credentials apart is the `id` column's job. It is printed
  * beside the masked code in the same table, is not a secret, and is what
- * `revoke <id>` already takes -- so showing a quarter of the join code bought
- * nothing that id does not, at the price of 20 of its 80 bits.
+ * `revoke <id>` already takes -- so showing any part of the join code bought
+ * nothing that id does not. That argument only got stronger when the code
+ * shrank to 6 characters of a 32-symbol alphabet (2^30, lib/auth.js): there
+ * is far less entropy left to spend on a prefix than there was.
  *
  * The mask is spelled out locally rather than imported from auth.js on
  * purpose; see the header note on keeping that dependency one-directional.
@@ -804,12 +856,14 @@ function redact(config) {
 }
 
 // Deliberately independent of its argument: the printed shape is the same
-// ****-****-****-**** whether the secret is well formed, malformed or absent,
-// so the mask itself never becomes a side channel about what it hides.
+// ****** whether the secret is well formed, malformed or absent, so the mask
+// itself never becomes a side channel about what it hides. Fixed at
+// CODE_LEN (auth.js) rather than derived from the secret's own length --
+// deriving it would leak that length, and at a fixed six characters there is
+// nothing to learn from doing so anyway.
 function maskSecret(secret) {
-  const groups = 4;
-  const groupLen = 4;
-  return new Array(groups).fill('*'.repeat(groupLen)).join('-');
+  const CODE_LEN = 6;
+  return '*'.repeat(CODE_LEN);
 }
 
 module.exports = {

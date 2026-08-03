@@ -4,42 +4,75 @@ All notable changes to this mod are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 here must match `manifest.version`.
 
-## [0.2.0] - 2026-08-02
+## [0.2.0] - 2026-08-03
 
-Hosting software for the standalone hub, and a join code that keeps strangers
-out of it. **The protocol moved from 1 to 2, so this mod and its hub have to
-ship together** — an older copy of the mod cannot join a 0.2.0 hub, and is
-told so in a sentence the game already renders rather than failing silently.
+Hosting software for the standalone hub, and a **six-character passcode**,
+required on both hosting paths, that keeps strangers out of either.
+**The protocol moved from 1 to 2, so this mod and its hub have to ship
+together** — an older copy of the mod cannot join a 0.2.0 hub, and is told so
+in a sentence the game already renders rather than failing silently.
 
 ### Added
 
+- **`--code CODE` on `init` and `invite`**, so a host can supply a passcode
+  instead of taking a generated one — the way to make the hub answer to the
+  same passcode as an in-game LAN game, or to pick something friends can
+  remember. Normalised on the way in (`a7k3-p9` is `A7K3P9`), refused without
+  echoing what was typed when it is not six usable characters, and refused
+  outright when another credential already holds it.
 - **A hosting CLI, `server/bin/rby-mmo-hub.js`** — the one place a host
   configures anything. `init` is a four-question wizard that writes
-  `config.json` at mode 0600 and prints a join code once; `start`, `status`,
+  `config.json` at mode 0600 and prints a passcode once; `start`, `status`,
   `config list|get|set`, `invite`, `invite list`, `revoke`, `ban`, `unban`,
   `allow`, `doctor` and `upnp enable|disable|status` cover the rest. Every
   setting is reachable from a verb — nothing requires hand-editing JSON —
   and the two that are not (`auth.credentials`, `version`) have verbs of
   their own for a reason. Exit codes: 0 success, 1 error, 2 usage.
-- **A join code, and the handshake that proves one.** The hub sends a
-  per-connection nonce; the client answers `HMAC-SHA256(joinCode, nonce)`, so
-  the code never crosses the wire and a captured answer cannot be replayed.
-  Codes are 16 characters of a 32-symbol alphabet (80 bits) with `I L O U`
-  dropped, every one of them typeable on the mod's own naming grid. Codes are
-  a list, not a single secret: invites carry an optional expiry, a use budget
-  and a revocation, so withdrawing one does not rotate everybody's.
-- **Join-code entry in game** — `START > MMO > JOIN CODE`, or offered
-  automatically when a hub asks for one this copy does not have. Stored per
-  hub address.
+- **A passcode, and the handshake that proves one.** The hub sends a
+  per-connection nonce; the client answers `HMAC-SHA256(passcode, nonce)`, so
+  the passcode never crosses the wire and a captured answer cannot be
+  replayed. A passcode is **6 characters of a 32-symbol alphabet — 32⁶ = 2³⁰,
+  exactly 30 bits** — with `I L O U` dropped so nothing is misread off a
+  screenshot or misheard over voice, and every character on the mod's own
+  naming grid. No grouping and no dashes: `A7K3P9` is the whole of it.
+  Passcodes are a list, not a single secret: invites carry an optional
+  expiry, a use budget and a revocation, so withdrawing one does not rotate
+  everybody's.
+- **A wrong-passcode throttle**, without which 30 bits would not be
+  defensible online at all. Seven new settings
+  (`limits.authFailureGrace` 3, `authFailureWindowMs` 10m,
+  `authBackoffBaseMs` 2s, `authBackoffMaxMs` 5m, `authGlobalFailures` 100,
+  `authGlobalWindowMs` 60s, `authLockoutMs` 60s) limit failures **per address
+  and hub-wide**. The per-address half is an escalating backoff past a small
+  grace, shaped so a friend who fat-fingers the code never notices it; the
+  hub-wide ceiling is the half that does not improve when an attacker rents
+  more addresses. A tripped ceiling stops the hub issuing challenges and
+  nothing else — **players already in the world keep playing, undisturbed and
+  unthrottled**, for the whole cooling period. `status`, `start` and `doctor`
+  print the configured throttle in words.
+- **Passcode entry in game, asked before anything is dialled.** `JOIN GAME`
+  now asks for the address and then the passcode, in one straight line,
+  rather than dialling and letting the hub's challenge interrupt a handshake
+  that is already spending its ten-second budget. The address field takes 32
+  characters and accepts an IP or a hostname, filling in port 7788 when none
+  is given. `START > MMO > JOIN CODE` remains for changing a saved passcode,
+  and is where a refused one lands. Stored per hub address, with a `JOIN
+  CODE` option row as the fallback for a player who only plays on one hub.
 - **`src/Sha256.lua`**, a pure-Lua SHA-256 / HMAC-SHA256 with a constant-time
   compare, written because `love.data.hash` is not available to the headless
   suite — so the game and the suite run byte-identical code. It uses LuaJIT's
   `bit` library when present and arithmetic peeling when it is not.
-- **The in-game hub can require a join code too** — `src/Hub.lua` issues the
-  same challenge and `HostServer:start` takes an optional code, byte-compatible
-  with the standalone hub. It is off by default, and the `HOST GAME` screen
-  does not yet offer one, so hosting from inside the game is still open on the
-  LAN exactly as it was.
+- **The in-game host requires a passcode too.** `src/Hub.lua` issues the same
+  challenge, byte-compatible with the standalone hub, and `HostServer:start`
+  refuses to open the port without a passcode. The `HOST GAME` screen mints
+  one on arrival and shows it in the `JOIN CODE` row, so the common path is
+  zero typing; the screen behind that row is for choosing your own. **There
+  is no way to host an open game.** Those bytes come from a session entropy
+  pool — frame timings, clock deltas, heap size, the player's own button
+  presses, ratcheted through SHA-256 — which is **not a CSPRNG** and does not
+  claim to be: ~35–45 bits drawn cold, 64 bits claimed from a game that has
+  been running more than a moment. A hub facing the open internet should be
+  the dedicated one, whose codes come from `crypto.randomBytes`.
 - **Docker as a first-class path.** `docker compose up` in `server/` builds a
   `node:24-alpine` image running as UID 10001 on a read-only rootfs with all
   capabilities dropped, persists `config.json` on a named volume at `/data`,
@@ -71,6 +104,20 @@ told so in a sentence the game already renders rather than failing silently.
 - **`node hub.js` warns at startup** that it is unauthenticated and has no
   per-address or connection-rate limits, and names the CLI that has both. It
   is still the right thing for a LAN game or a quick test.
+- **A hub that would admit anybody does not start.** `auth.required: false`
+  now means *the hub refuses to run*, not "anyone who reaches the port can
+  join": `start` exits `1` naming the command that fixes it, `doctor` marks
+  it `[fail]`, and `config set auth.required false` warns as it writes. Same
+  refusal for `auth.required` on with every credential revoked, expired or
+  used up — the configuration that *looks* configured and admits nobody. The
+  one deliberate exception is the legacy `node hub.js` shim, which has no
+  config file to keep a passcode in and asks for the exemption by name.
+- **`--no-auth` is gone**, along with the wizard question that could decline
+  a passcode. The flag is still recognised — as are `--auth false` and
+  `--auth=off` — only so it can be answered with a sentence pointing at
+  `--code` instead of falling through to "unknown option" and quietly writing
+  an open hub. `init` overrules a passcode-less configuration from any
+  source, including `RBY_MMO_AUTH_REQUIRED=false`, and says that it did.
 - **Connection hardening, on by default under the CLI**: per-address
   connection caps, a token-bucket connect-rate limit, a handshake timeout
   separate from the idle timeout, a slowloris sweep for a peer that never
@@ -82,7 +129,9 @@ told so in a sentence the game already renders rather than failing silently.
   can no longer write into the host's terminal.
 - `server/README.md` rewritten around the host who is not a developer: quick
   start, CLI reference, the full configuration table, the security posture
-  including what the join code does *not* protect, connectivity, and Docker.
+  including what the passcode does *not* protect, connectivity, and Docker.
+  The security section states the 30-bit arithmetic outright rather than
+  implying a number the format does not carry.
 
 ### Fixed
 
@@ -101,13 +150,22 @@ told so in a sentence the game already renders rather than failing silently.
 
 ### Notes
 
-- The join code protects against scanners and anyone who merely finds the
-  port, and a passive eavesdropper can recover neither the code nor a reusable
-  answer. It does **not** encrypt anything: gameplay traffic is readable on the
-  path and an active man-in-the-middle can proxy a whole session. There is no
-  TLS because the client cannot speak it — LÖVE ships luasocket, not luasec.
-  An encrypted overlay network is the only thing that closes that gap, and
-  `server/README.md` says so in those words.
+- **What 30 bits buys, stated plainly.** Online it is not the weak link: at
+  the default `connectPerMinute` of 60, exhausting 2³⁰ from one address takes
+  about 34 years — even odds around 17 — and that bucket is per address, so a
+  distributed attacker divides it; a thousand addresses brings even odds
+  inside a fortnight. The hub-wide failure ceiling is what answers that, and
+  it does not improve when the attacker rents more hosts. **Offline it is the
+  weak link.** There is no TLS on the game port, so anyone who can capture one
+  challenge/response pair grinds it locally where no limit applies at all, and
+  2³⁰ HMAC-SHA256 evaluations is seconds on commodity hardware. A captured
+  pair should be assumed to yield the passcode. A six-character passcode keeps
+  *strangers* out, not *eavesdroppers* — a deliberate trade for a code a
+  person can read aloud once.
+- Gameplay traffic is readable on the path and an active man-in-the-middle can
+  proxy a whole session. There is no TLS because the client cannot speak it —
+  LÖVE ships luasocket, not luasec. An encrypted overlay network is the only
+  thing that closes that gap, and `server/README.md` says so in those words.
 - `affects_link` stays `false`; no link registry is touched, so two players
   running this mod still fingerprint as vanilla.
 

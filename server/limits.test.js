@@ -970,6 +970,34 @@ function testClamping() {
     'partialLineTimeoutMs bounds match the documented table');
   ok(BOUNDS.maxWriteBufferBytes[0] === 4096 && BOUNDS.maxWriteBufferBytes[1] === 67108864,
     'maxWriteBufferBytes bounds match the documented table');
+  ok(BOUNDS.authFailureGrace[0] === 0 && BOUNDS.authFailureGrace[1] === 100,
+    'authFailureGrace bounds match the documented table');
+  ok(BOUNDS.authFailureWindowMs[0] === 1000 && BOUNDS.authFailureWindowMs[1] === 86400000,
+    'authFailureWindowMs bounds match the documented table');
+  ok(BOUNDS.authBackoffBaseMs[0] === 100 && BOUNDS.authBackoffBaseMs[1] === 3600000,
+    'authBackoffBaseMs bounds match the documented table');
+  ok(BOUNDS.authBackoffMaxMs[0] === 1000 && BOUNDS.authBackoffMaxMs[1] === 86400000,
+    'authBackoffMaxMs bounds match the documented table');
+  ok(BOUNDS.authGlobalFailures[0] === 1 && BOUNDS.authGlobalFailures[1] === 1000000,
+    'authGlobalFailures bounds match the documented table');
+  ok(BOUNDS.authGlobalWindowMs[0] === 1000 && BOUNDS.authGlobalWindowMs[1] === 3600000,
+    'authGlobalWindowMs bounds match the documented table');
+  ok(BOUNDS.authLockoutMs[0] === 1000 && BOUNDS.authLockoutMs[1] === 3600000,
+    'authLockoutMs bounds match the documented table');
+
+  // The defaults are a security posture, not an implementation detail: a
+  // silent change to any of them changes how fast a 30-bit join code can be
+  // guessed, so each one is pinned with the reason it holds.
+  ok(DEFAULTS.authFailureGrace === 3,
+    'three wrong codes are free -- a typo, a stale invite, and one more');
+  ok(DEFAULTS.authFailureWindowMs === 600000,
+    'one address\'s failures are remembered for ten minutes');
+  ok(DEFAULTS.authBackoffBaseMs === 2000 && DEFAULTS.authBackoffMaxMs === 300000,
+    'backoff runs 2s, doubling, to a five-minute ceiling');
+  ok(DEFAULTS.authGlobalFailures === 100 && DEFAULTS.authGlobalWindowMs === 60000,
+    'the hub-wide ceiling is 100 failures a minute -- far above honest traffic');
+  ok(DEFAULTS.authLockoutMs === 60000,
+    'and a trip closes authentication for one minute');
 }
 
 // --------------------------------------------------------- verdict objects
@@ -1132,6 +1160,567 @@ function testMemoryBoundsProxy() {
     'see the comment above this test for why a direct assertion is not possible');
 }
 
+// ------------------------------------------------- authentication failures
+//
+// The join code is 6 characters from a 32-symbol alphabet -- 2^30 exactly
+// (lib/auth.js). Per-IP limiting alone does not bound the guess rate: it
+// only prices it in rented addresses. Everything below drives the two
+// throttles that do bound it, on the injected clock, with no timer anywhere.
+
+function testAuthPerIpBackoff() {
+  const clock = makeClock();
+  const limits = freshLimits({
+    authFailureGrace: 3,
+    authBackoffBaseMs: 2000,
+    authBackoffMaxMs: 300000,
+    authFailureWindowMs: 600000,
+    // out of the way: this test is about one address, not the ceiling
+    authGlobalFailures: 1000000,
+  }, clock);
+
+  const ip = '203.0.113.10';
+
+  ok(limits.authAllowed(ip).ok,
+    'an address with no history may authenticate');
+
+  // The grace. A friend reading the code off a phone photo gets three
+  // attempts with no delay at all -- this is the "not collateral" half.
+  for (let i = 1; i <= 3; i += 1) {
+    ok(limits.noteAuthFailure(ip) === false,
+      `wrong code ${i} of the grace does not trip the hub-wide ceiling`);
+    ok(limits.authAllowed(ip).ok,
+      `after ${i} wrong codes (grace 3) the address may still try immediately`);
+    ok(limits.authRetryAfterMs(ip) === 0,
+      `and owes no wait after ${i}`);
+  }
+
+  // The fourth is the first that costs anything.
+  limits.noteAuthFailure(ip);
+  const backoff = limits.authAllowed(ip);
+  ok(backoff.ok === false && backoff.reason === 'auth_backoff',
+    'the first failure past the grace puts the address into backoff');
+  ok(limits.authRetryAfterMs(ip) === 2000,
+    'and the first backoff step is authBackoffBaseMs (2s)');
+
+  // Retrying into a closed door must not extend it. An honest player who
+  // hammers retry during their own two-second wait would otherwise be
+  // locked out for the evening.
+  limits.authAllowed(ip);
+  limits.authAllowed(ip);
+  limits.authAllowed(ip);
+  ok(limits.authRetryAfterMs(ip) === 2000,
+    'refused attempts are not failures: retrying during backoff does not extend it');
+
+  clock.advance(1999);
+  ok(limits.authAllowed(ip).reason === 'auth_backoff',
+    'one millisecond short of the backoff, the address is still refused');
+  ok(limits.authRetryAfterMs(ip) === 1,
+    'and is told exactly how much longer it owes');
+  clock.advance(1);
+  ok(limits.authAllowed(ip).ok,
+    'once the backoff elapses the address may try again');
+
+  // Escalation: each further failure doubles the wait.
+  limits.noteAuthFailure(ip); // 5th
+  ok(limits.authRetryAfterMs(ip) === 4000,
+    'the second failure past the grace doubles the wait to 4s');
+  clock.advance(4000);
+  limits.noteAuthFailure(ip); // 6th
+  ok(limits.authRetryAfterMs(ip) === 8000,
+    'the third doubles again to 8s');
+
+  // The ceiling. Doubling from 2s reaches 300000 on the ninth excess
+  // failure (2^8 * 2000 = 512000, capped), i.e. the twelfth wrong code.
+  clock.advance(8000);
+  for (let i = 0; i < 6; i += 1) {
+    limits.noteAuthFailure(ip);
+    clock.advance(limits.authRetryAfterMs(ip));
+  }
+  limits.noteAuthFailure(ip);
+  ok(limits.authRetryAfterMs(ip) === 300000,
+    'the backoff caps at authBackoffMaxMs rather than doubling forever');
+
+  // Recovery. This is what keeps the fat-fingering friend from being locked
+  // out permanently: silence for authFailureWindowMs forgets the history
+  // entirely, and the next wrong code starts again from the grace.
+  clock.advance(300000);            // serve out the last backoff
+  clock.advance(600000);            // then a full window of silence
+  ok(limits.authAllowed(ip).ok, 'after the window the address is allowed again');
+  limits.noteAuthFailure(ip);
+  ok(limits.authAllowed(ip).ok,
+    'and its next wrong code is free again: the failure count reset, not just the delay');
+  ok(limits.authRetryAfterMs(ip) === 0,
+    'so an honest player is never locked out permanently');
+
+  // Success wipes the slate.
+  limits.noteAuthFailure(ip);
+  limits.noteAuthFailure(ip);
+  limits.noteAuthFailure(ip);
+  ok(limits.authAllowed(ip).reason === 'auth_backoff',
+    'four failures inside the window put it back into backoff');
+  ok(limits.noteAuthSuccess(ip) === true,
+    'noteAuthSuccess reports that it cleared a record');
+  ok(limits.authAllowed(ip).ok,
+    'a correct code clears the address\'s failure history outright');
+  ok(limits.noteAuthSuccess(ip) === false,
+    'and clearing an address with no record reports so rather than throwing');
+
+  // Grace 0 is a legal setting and means what it says.
+  const strict = freshLimits(
+    { authFailureGrace: 0, authBackoffBaseMs: 1000, authGlobalFailures: 1000000 },
+    makeClock());
+  strict.noteAuthFailure('203.0.113.11');
+  ok(strict.authAllowed('203.0.113.11').reason === 'auth_backoff',
+    'authFailureGrace: 0 backs an address off from its very first wrong code');
+}
+
+function testAuthPerIpIsPerPrefix() {
+  const clock = makeClock();
+  const limits = freshLimits(
+    { authFailureGrace: 1, authBackoffBaseMs: 5000, authGlobalFailures: 1000000 },
+    clock);
+
+  // Same /64, different /128. A per-address backoff would be no backoff at
+  // all here: the peer has 2^64 spellings of itself to spend one failure
+  // from. See "/64 keying" in limits.js.
+  limits.noteAuthFailure('2001:db8::1');
+  limits.noteAuthFailure('2001:db8::2');
+  ok(limits.authAllowed('2001:db8::dead').reason === 'auth_backoff',
+    'failures from one /64 accumulate against the whole block, not one address');
+
+  ok(limits.authAllowed('2001:db8:1::1').ok,
+    'a genuinely different /64 is unaffected by its neighbour\'s failures');
+
+  // IPv4 keeps counting per exact address -- an IPv4 host is one address.
+  limits.noteAuthFailure('198.51.100.1');
+  limits.noteAuthFailure('198.51.100.1');
+  ok(limits.authAllowed('198.51.100.1').reason === 'auth_backoff',
+    'an IPv4 address accumulates against itself');
+  ok(limits.authAllowed('198.51.100.2').ok,
+    'and its neighbour is untouched');
+
+  // Spellings fold, exactly as they do for bans and the connection cap.
+  limits.noteAuthFailure('::ffff:198.51.100.9');
+  limits.noteAuthFailure('198.51.100.9');
+  ok(limits.authAllowed('[::ffff:198.51.100.9]').reason === 'auth_backoff',
+    'the mapped and bare spellings of one address share one failure record');
+
+  // Garbage in must not throw on the authentication path.
+  ok(limits.authAllowed(undefined).ok,
+    'authAllowed on a non-string address answers rather than throwing');
+  ok(limits.noteAuthFailure(undefined) === false,
+    'and noteAuthFailure absorbs one too');
+}
+
+function testAuthGlobalCeiling() {
+  const clock = makeClock();
+  const limits = freshLimits({
+    authGlobalFailures: 5,
+    authGlobalWindowMs: 60000,
+    authLockoutMs: 30000,
+    // grace above the failure count, so nothing below is per-IP backoff
+    authFailureGrace: 100,
+  }, clock);
+
+  const ipFor = (i) => `192.0.2.${i}`;
+
+  for (let i = 1; i <= 4; i += 1) {
+    ok(limits.noteAuthFailure(ipFor(i)) === false,
+      `failure ${i} of 5 does not trip the ceiling`);
+    ok(limits.authLockdown === false, `and the hub is not in lockdown after ${i}`);
+    ok(limits.authAllowed(ipFor(99)).ok,
+      `an unrelated address may still authenticate after ${i} hub-wide failures`);
+  }
+
+  ok(limits.noteAuthFailure(ipFor(5)) === true,
+    'the failure that reaches the threshold reports the trip, once');
+  ok(limits.authLockdown === true, 'and the hub-wide ceiling is now tripped');
+
+  const refused = limits.authAllowed(ipFor(99));
+  ok(refused.ok === false && refused.reason === 'auth_lockdown',
+    'while tripped, a brand-new address is refused authentication');
+  ok(limits.authRetryAfterMs(ipFor(99)) === 30000,
+    'and is told the whole cooling period is left to run');
+
+  ok(limits.noteAuthFailure(ipFor(6)) === false,
+    'a further failure while tripped does not re-report the trip (edge, not level)');
+
+  clock.advance(29999);
+  ok(limits.authAllowed(ipFor(99)).reason === 'auth_lockdown',
+    'one millisecond short of the cooling period, authentication is still refused');
+  clock.advance(1);
+  ok(limits.authAllowed(ipFor(99)).ok,
+    'once the cooling period elapses, authentication reopens on its own');
+  ok(limits.authLockdown === false, 'and the lockdown flag clears with it');
+  ok(limits.stats().auth.recentFailures === 0,
+    'the counter is zeroed on release, so one stray failure cannot re-trip instantly');
+
+  // A second, independent trip: the mechanism rearms.
+  for (let i = 1; i <= 4; i += 1) limits.noteAuthFailure(ipFor(i));
+  ok(limits.authLockdown === false, 'four fresh failures are under the ceiling again');
+  ok(limits.noteAuthFailure(ipFor(5)) === true, 'and the fifth trips it a second time');
+
+  // Failures age out of the window rather than accumulating forever, so a
+  // hub that sees a few wrong codes an hour never trips.
+  const slowClock = makeClock();
+  const drip = freshLimits(
+    { authGlobalFailures: 5, authGlobalWindowMs: 60000, authFailureGrace: 100 },
+    slowClock);
+  for (let i = 0; i < 20; i += 1) {
+    drip.noteAuthFailure('192.0.2.200');
+    slowClock.advance(60000); // one whole window between each
+  }
+  ok(drip.authLockdown === false,
+    'four-times-the-threshold failures spread one per window never trip the ceiling');
+  ok(drip.stats().auth.recentFailures <= 1,
+    'because the window forgets them as fast as they arrive');
+}
+
+function testAuthDistributedAttack() {
+  // The scenario the global ceiling exists for, and the one per-IP limiting
+  // cannot see: a thousand addresses, each politely under the per-IP
+  // threshold, adding up to a grind that would otherwise run unimpeded.
+  const clock = makeClock();
+  const limits = freshLimits({
+    authFailureGrace: 3,        // the honest default
+    authGlobalFailures: 100,
+    authGlobalWindowMs: 60000,
+    authLockoutMs: 60000,
+  }, clock);
+
+  const ipFor = (i) => `10.${(i >> 8) & 255}.${i & 255}.1`;
+
+  let tripped = false;
+  let attempts = 0;
+  // 50 addresses x 2 failures each = 100. Two apiece is *under* the grace of
+  // three, so not one of them is ever individually backed off.
+  for (let round = 0; round < 2 && !tripped; round += 1) {
+    for (let i = 0; i < 50 && !tripped; i += 1) {
+      attempts += 1;
+      tripped = limits.noteAuthFailure(ipFor(i));
+    }
+  }
+
+  ok(tripped, 'fifty addresses at two failures each trip the hub-wide ceiling');
+  ok(attempts === 100,
+    'and they trip it at exactly the configured threshold, not before or after');
+
+  const stats = limits.stats();
+  ok(stats.auth.throttledAddresses === 0,
+    'not one of those addresses is in per-IP backoff -- each stayed under the ' +
+    'grace, which is precisely why the per-IP throttle alone would have seen ' +
+    'nothing wrong');
+  ok(stats.auth.lockdown === true, 'yet the hub as a whole is closed to new attempts');
+
+  // Rotating to a completely fresh address buys the attacker nothing. This
+  // is the property that makes renting more hosts stop working.
+  ok(limits.authAllowed('10.9.9.9').reason === 'auth_lockdown',
+    'a never-before-seen address gains nothing from being fresh while tripped');
+}
+
+function testAuthCollateralBoundary() {
+  // The assertion that matters most: a tripped ceiling closes the *door*,
+  // not the hub. Everyone already inside keeps playing.
+  const clock = makeClock();
+  const limits = freshLimits({
+    authGlobalFailures: 3,
+    authGlobalWindowMs: 60000,
+    authLockoutMs: 60000,
+    authFailureGrace: 100,
+    perIpConnections: 10,
+    maxPending: 10,
+    connectBurst: 100,
+    idleTimeoutMs: 45000,
+    // Longer than the lockout on purpose: this test needs a newcomer who is
+    // still mid-handshake when the ceiling lifts, so the handshake budget
+    // does not become the thing that closed her connection.
+    handshakeTimeoutMs: 120000,
+  }, clock);
+
+  // Two players who authenticated before the attack started.
+  limits.register('alice', '198.51.100.20');
+  limits.markGreeted('alice');
+  limits.noteAuthSuccess('198.51.100.20');
+  limits.register('bob', '198.51.100.21');
+  limits.markGreeted('bob');
+  limits.noteAuthSuccess('198.51.100.21');
+  ok(limits.stats().connections === 2, 'two players are in the world');
+
+  // The attack.
+  limits.noteAuthFailure('192.0.2.1');
+  limits.noteAuthFailure('192.0.2.2');
+  ok(limits.noteAuthFailure('192.0.2.3') === true, 'the ceiling trips');
+  ok(limits.authLockdown === true, 'and the hub is refusing new authentication');
+
+  // Nothing about the two players changed.
+  ok(limits.sweep().length === 0,
+    'a tripped ceiling dooms nobody: sweep() reports no connection to close');
+  ok(limits.stats().connections === 2,
+    'both authenticated players are still counted as connected');
+  ok(limits.noteActivity('alice', { bytes: 40, completedLine: true }) === true,
+    'an authenticated player\'s traffic is still accepted and tracked');
+  ok(limits.writeAllowed('alice', 1024) === true,
+    'and the hub will still write to them');
+  ok(limits.connectionsFrom('198.51.100.20') === 1,
+    'their connection is still charged to them, unchanged');
+
+  // Time passes inside the lockout; the ordinary clocks still govern, and
+  // only the ordinary clocks. Alice and Bob are playing, so they keep
+  // producing traffic exactly as they would with no attack in progress.
+  clock.advance(30000);
+  limits.noteActivity('alice', { bytes: 40, completedLine: true });
+  limits.noteActivity('bob', { bytes: 40, completedLine: true });
+  ok(limits.sweep().length === 0,
+    'half a minute into the lockout the players are still not swept');
+  ok(limits.authLockdown === true, 'even though the ceiling is still tripped');
+
+  // New *connections* are still accepted. The ceiling refuses authentication,
+  // not TCP: a player who is mid-reconnect, or a hub with auth switched off,
+  // must not be shut out of the front door by an attack on the passcode.
+  ok(limits.admit('198.51.100.30').ok,
+    'admit() is untouched by a tripped ceiling: connections are still admitted');
+  limits.register('carol', '198.51.100.30');
+  ok(limits.stats().connections === 3,
+    'and a new connection can still be registered while the ceiling is tripped');
+
+  // What it *does* cost, stated honestly: carol cannot prove her code yet.
+  ok(limits.authAllowed('198.51.100.30').reason === 'auth_lockdown',
+    'the one thing a newcomer cannot do while tripped is authenticate -- ' +
+    'including a newcomer holding the correct code');
+
+  // And when it lifts, she can, with no residue anywhere.
+  clock.advance(30000);
+  limits.noteActivity('alice', { bytes: 40, completedLine: true });
+  limits.noteActivity('bob', { bytes: 40, completedLine: true });
+  ok(limits.authAllowed('198.51.100.30').ok,
+    'once the cooling period ends the newcomer authenticates normally');
+  limits.markGreeted('carol');
+  ok(limits.sweep().length === 0,
+    'and nobody was ever swept on account of the attack');
+
+  // The ordinary sweep still works afterwards, so the lockout did not
+  // quietly disarm the connection clocks it must not touch.
+  clock.advance(46000);
+  const doomed = limits.sweep();
+  ok(doomed.length === 3,
+    'idle connections are still reaped normally after the lockout -- the ' +
+    'ceiling suspended nothing');
+  ok(doomed.every((d) => d.reason === 'idle_timeout' || d.reason === 'handshake_timeout'),
+    'and for the ordinary reasons, never an auth one');
+}
+
+function testAuthDoesNotSpendConnectTokens() {
+  // The judgement call, pinned. A refused authentication does NOT charge the
+  // connect bucket: the connection it arrived on already spent a token in
+  // admit(), and double-charging would drain a shared household's whole
+  // connection budget over one roommate's typo while making
+  // `connectPerMinute` mean something other than what it says. The auth
+  // throttle is what stops the grinder; the bucket stays a connection
+  // budget.
+  const clock = makeClock();
+  const limits = freshLimits({
+    connectBurst: 3,
+    connectPerMinute: 60,
+    perIpConnections: 1000,
+    maxPending: 1000,
+    authFailureGrace: 100,
+    authGlobalFailures: 1000000,
+  }, clock);
+
+  const ip = '203.0.113.50';
+  ok(limits.admit(ip).ok, 'connect token 1 of 3 is spent by admit()');
+
+  for (let i = 0; i < 25; i += 1) limits.noteAuthFailure(ip);
+
+  ok(limits.admit(ip).ok, 'token 2 of 3 is still available after 25 auth failures');
+  ok(limits.admit(ip).ok, 'and token 3 of 3');
+  ok(limits.admit(ip).reason === 'rate',
+    'the fourth is refused as rate -- exactly three tokens were spent, all by ' +
+    'admit(): auth failures never charged the connect bucket');
+
+  // The converse, and the reason the above is safe: an address deep in auth
+  // backoff can still open sockets, and gets nowhere.
+  const clock2 = makeClock();
+  const back = freshLimits({
+    authFailureGrace: 1,
+    authBackoffBaseMs: 60000,
+    authGlobalFailures: 1000000,
+    connectBurst: 100,
+    perIpConnections: 1000,
+    maxPending: 1000,
+  }, clock2);
+
+  back.noteAuthFailure('203.0.113.51');
+  back.noteAuthFailure('203.0.113.51');
+  ok(back.authAllowed('203.0.113.51').reason === 'auth_backoff',
+    'the address is in backoff');
+  ok(back.admit('203.0.113.51').ok,
+    'and may still connect -- the two limiters keep separate budgets');
+  ok(back.authAllowed('203.0.113.51').reason === 'auth_backoff',
+    'but reconnecting buys it nothing: the backoff is on the address, not the socket');
+
+  // And a lockdown does not reach the connect bucket either.
+  const clock3 = makeClock();
+  const down = freshLimits(
+    { authGlobalFailures: 1, authLockoutMs: 60000, authFailureGrace: 100 }, clock3);
+  down.noteAuthFailure('192.0.2.77');
+  ok(down.authLockdown === true, 'the ceiling is tripped');
+  ok(down.admit('192.0.2.88').ok,
+    'and an unrelated address is still admitted at its normal connect rate');
+}
+
+function testAuthStats() {
+  const clock = makeClock();
+  const limits = freshLimits({
+    authGlobalFailures: 10,
+    authGlobalWindowMs: 60000,
+    authLockoutMs: 45000,
+    authFailureGrace: 1,
+    authBackoffBaseMs: 1000,
+  }, clock);
+
+  const quiet = limits.stats();
+  ok(quiet.connections === 0 && quiet.pending === 0 && quiet.perIp &&
+     typeof quiet.auth === 'object',
+    'stats() keeps its existing shape and grows an auth section');
+  ok(quiet.auth.recentFailures === 0 && quiet.auth.lockdown === false &&
+     quiet.auth.lockdownMs === 0 && quiet.auth.throttledAddresses === 0 &&
+     quiet.auth.trackedAddresses === 0,
+    'a hub nobody is attacking reports nothing to worry about');
+  ok(quiet.auth.failureThreshold === 10 && quiet.auth.windowMs === 60000,
+    'and reports the threshold and window, so the count has a scale to read against');
+
+  // Two addresses, two failures each: enough to back both off (grace 1).
+  limits.noteAuthFailure('192.0.2.10');
+  limits.noteAuthFailure('192.0.2.10');
+  limits.noteAuthFailure('192.0.2.11');
+  limits.noteAuthFailure('192.0.2.11');
+
+  const hammered = limits.stats();
+  ok(hammered.auth.recentFailures === 4,
+    'stats() reports how many wrong passcodes arrived recently');
+  ok(hammered.auth.throttledAddresses === 2,
+    'and how many addresses are currently backed off -- one grinder or a fleet');
+  ok(hammered.auth.trackedAddresses === 2,
+    'and how many it is remembering at all');
+  ok(hammered.auth.lockdown === false,
+    'four of ten is under the ceiling, so no lockdown is reported');
+
+  for (let i = 0; i < 6; i += 1) limits.noteAuthFailure(`192.0.2.${20 + i}`);
+  const tripped = limits.stats();
+  ok(tripped.auth.lockdown === true, 'stats() says plainly when the ceiling is tripped');
+  ok(tripped.auth.lockdownMs === 45000,
+    'and how long the hub will stay closed to new authentication');
+
+  clock.advance(20000);
+  ok(limits.stats().auth.lockdownMs === 25000,
+    'the remaining lockout counts down on the injected clock');
+  clock.advance(25000);
+  const released = limits.stats();
+  ok(released.auth.lockdown === false && released.auth.lockdownMs === 0,
+    'and reads clear once it lifts');
+
+  // The failure count decays with the window rather than accumulating for
+  // the life of the process.
+  clock.advance(120000);
+  ok(limits.stats().auth.recentFailures === 0,
+    'two windows of quiet leaves nothing in the recent-failure count');
+  ok(limits.stats().auth.throttledAddresses === 0,
+    'and no address is still serving a backoff');
+}
+
+function testAuthClockRunsBackwards() {
+  // The injected clock can go backwards, and so can the real one across an
+  // NTP step. Neither may leave the hub permanently closed.
+  const clock = makeClock(1000000);
+  const limits = freshLimits(
+    { authGlobalFailures: 1, authLockoutMs: 30000, authFailureGrace: 100 }, clock);
+
+  limits.noteAuthFailure('192.0.2.90');
+  ok(limits.authLockdown === true, 'the ceiling trips');
+
+  clock.set(0); // a step backwards past the whole lockout
+  ok(limits.authRetryAfterMs('192.0.2.90') <= 30000,
+    'a backwards clock cannot strand the lockout arbitrarily far in the future');
+  clock.advance(30001);
+  ok(limits.authLockdown === false,
+    'and the hub reopens one configured lockout later, not never');
+}
+
+function testAuthVerdictSingletons() {
+  const clock = makeClock();
+  const limits = freshLimits(
+    { authFailureGrace: 0, authBackoffBaseMs: 10000, authGlobalFailures: 1000000 },
+    clock);
+
+  limits.noteAuthFailure('192.0.2.100');
+  limits.noteAuthFailure('192.0.2.101');
+  const a = limits.authAllowed('192.0.2.100');
+  const b = limits.authAllowed('192.0.2.101');
+  ok(a === b, 'two backoff refusals are the same frozen singleton by reference');
+  ok(Object.isFrozen(a), 'the auth_backoff verdict is frozen');
+
+  const down = freshLimits(
+    { authGlobalFailures: 1, authLockoutMs: 60000, authFailureGrace: 100 },
+    makeClock());
+  down.noteAuthFailure('192.0.2.110');
+  const c = down.authAllowed('192.0.2.111');
+  const d = down.authAllowed('192.0.2.112');
+  ok(c === d && Object.isFrozen(c),
+    'so are lockdown refusals -- a hub under attack allocates nothing per refusal');
+  ok(c !== a, 'and the two refusals are distinguishable objects');
+}
+
+// ------------------------------------------- auth memory bounds
+//
+// Same problem as the bucket map, same shape of answer: an attacker cycling
+// addresses must not grow the failure map without limit. Unlike the bucket
+// map there *is* a defensible direct assertion here -- the map is pruned to
+// a hard internal cap (MAX_AUTH_RECORDS, 4096) rather than only on the
+// "carries no information" rule -- so this test reads the private
+// `_authFails` field the way the pruning test above reads `_prunedAt`, and
+// for the same reason: the decision has no other observable.
+
+function testAuthMemoryBounds() {
+  const clock = makeClock(0); // frozen: nothing ages out, so only the cap can save us
+  const limits = freshLimits({
+    authFailureGrace: 100,       // nobody is backed off; every record is "fresh"
+    authGlobalFailures: 1000000, // and the ceiling never trips to end the loop early
+    authFailureWindowMs: 600000,
+  }, clock);
+
+  const ADDRESSES = 20000; // comfortably past the internal cap (4096)
+  const ipFor = (i) => `${10 + (i >> 16)}.${(i >> 8) & 255}.${i & 255}.7`;
+
+  for (let i = 0; i < ADDRESSES; i += 1) limits.noteAuthFailure(ipFor(i));
+
+  ok(limits._authFails.size <= 4097,
+    `${ADDRESSES} distinct addresses leave at most the internal cap (4096, ` +
+    `plus the record being written) in the failure map, not ${ADDRESSES}`);
+
+  // Bounded is only useful if it is still correct. A fresh address gets a
+  // clean judgement however many came before it.
+  ok(limits.authAllowed('172.16.0.1').ok,
+    'a fresh address is still judged correctly after the map has been evicted from');
+
+  // And the address the attacker is *currently* on keeps its history: the
+  // eviction drops the least-throttled records, not the most.
+  const victim = '172.16.0.2';
+  const throttled = freshLimits({
+    authFailureGrace: 3,
+    authBackoffBaseMs: 300000,
+    authBackoffMaxMs: 300000,
+    authGlobalFailures: 1000000,
+  }, clock);
+  // One grinder, past the grace and deep in backoff, then a flood of
+  // single-failure addresses trying to push it out of the map.
+  for (let i = 0; i < 4; i += 1) throttled.noteAuthFailure(victim);
+  for (let i = 0; i < 6000; i += 1) throttled.noteAuthFailure(ipFor(i));
+  ok(throttled.authAllowed(victim).reason === 'auth_backoff',
+    'a deeply backed-off address survives an eviction storm: the least-throttled ' +
+    'records go first, so cycling addresses cannot flush a grinder\'s own penalty');
+}
+
 // ------------------------------------------------------------------- main
 
 function main() {
@@ -1158,6 +1747,16 @@ function main() {
   testBansAndAllowlistAcceptNonArray();
   testBucketPruningIntervalGated();
   testMemoryBoundsProxy();
+  testAuthPerIpBackoff();
+  testAuthPerIpIsPerPrefix();
+  testAuthGlobalCeiling();
+  testAuthDistributedAttack();
+  testAuthCollateralBoundary();
+  testAuthDoesNotSpendConnectTokens();
+  testAuthStats();
+  testAuthClockRunsBackwards();
+  testAuthVerdictSingletons();
+  testAuthMemoryBounds();
 
   console.log(`\n  ${passed}/${passed} checks passed  (limits)\n`);
 }

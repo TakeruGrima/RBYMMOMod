@@ -21,6 +21,11 @@ tests/drivers/mmo_util.lua
 tests/drivers/mmo_host.lua
 tests/drivers/mmo_join.lua
 tests/drivers/run-mmo-e2e.sh
+# The dedicated-hub scenario: the same two reasons, plus a wrapper that shells
+# out to node. Listed by name because a bare tests/drivers/ line would do
+# nothing -- see the note at the top of this file.
+tests/drivers/mmo_guest.lua
+tests/drivers/run-hub-e2e.sh
 
 # Working notes for whoever picks this up next; not mod content. The two
 # machine-readable ones describe how coding agents are driven in this

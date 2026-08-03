@@ -121,13 +121,14 @@ end
 --
 -- Normalisation is total and symmetric with normalizeCode in
 -- server/lib/auth.js: upper-case first, then drop every character outside
--- the alphabet.  Dashes, spaces, lower case off a chat message and whatever
--- punctuation came with it all fall away, so both ends key the HMAC off the
--- same bytes however the code was entered.  Asymmetry here would lock a
--- player out with nothing to read but "wrong code".
+-- the alphabet.  Spaces, lower case off a chat message, a dash someone
+-- added out of habit and whatever punctuation came with it all fall away,
+-- so both ends key the HMAC off the same bytes however the code was
+-- entered.  Asymmetry here would lock a player out with nothing to read but
+-- "wrong code".
 --
--- Returns the *undashed* form, because that -- not the display form -- is
--- the key.
+-- Exactly Config.CODE_LEN symbols survive or nothing does: a short code is
+-- a typo, not a shorter key.
 function M.code(value)
   if type(value) ~= "string" then return nil end
   local upper = value:upper()
@@ -141,15 +142,16 @@ function M.code(value)
   return code
 end
 
--- The display form of a normalised code, so the host screen and the join
--- screen cannot disagree about where the dashes go.
+-- The display form of a normalised code.
+--
+-- At six characters there is nothing to group -- A7K3P9 is already the way
+-- it is read out -- so this is a passthrough.  It is kept rather than
+-- deleted because the screens and the e2e drivers call it, and because it
+-- is still the one place that decides how a code is shown: if a display
+-- form ever comes back, it comes back here and every caller follows.
 function M.formatCode(normalized)
   if type(normalized) ~= "string" then return nil end
-  local groups, step = {}, Config.CODE_GROUP_LEN
-  for i = 1, #normalized, step do
-    groups[#groups + 1] = normalized:sub(i, i + step - 1)
-  end
-  return table.concat(groups, "-")
+  return normalized
 end
 
 function M.int(value, min, max)

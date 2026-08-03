@@ -111,17 +111,33 @@ function M.setMaxPlayers(a, b)
   return limit
 end
 
+-- An address with its port filled in.
+--
+-- An IP and a hostname both reach the socket untouched -- Net:connectTCP
+-- splits a trailing ":<digits>" off and hands the rest to luasocket, which
+-- resolves a name -- so the only half this mod has to supply is the port a
+-- bare "mybox" does not carry. It matters which: Net's own fallback is
+-- 7778, the *pokeserver relay's*, and a player who typed the name they were
+-- read out would dial a port nothing is listening on and be told the relay
+-- was unreachable. Applied on every read and every write, so the string
+-- that is dialled is also the string a join code is filed under.
+local function withPort(address)
+  if type(address) ~= "string" or address == "" then return nil end
+  if address:match(":%d+$") then return address end
+  return ("%s:%d"):format(address, Config.DEFAULT_PORT)
+end
+
 function M.joinAddress()
-  local stored = mod.save:get("hub")
-  if type(stored) == "string" and stored ~= "" then return stored end
-  local option = mod.options:get("hub")
-  if type(option) == "string" and option ~= "" then return option end
+  local stored = withPort(mod.save:get("hub"))
+  if stored then return stored end
+  local option = withPort(mod.options:get("hub"))
+  if option then return option end
   return Config.DEFAULT_HUB
 end
 
 function M.setJoinAddress(a, b)
-  local address = arg1(a, b)
-  if type(address) ~= "string" or address == "" then return nil end
+  local address = withPort(arg1(a, b))
+  if not address then return nil end
   mod.save:set("hub", address)
   return address
 end
@@ -170,17 +186,19 @@ end
 -- The code this copy asks for when it hosts.
 --
 -- One key, not one per address: there is only ever one game this copy is
--- running. Absent means off, and off is the default -- two people on the
--- same couch should not have to type sixteen characters at each other,
--- while a hub left on the internet should (plan section 3.9).
+-- running. A code is required now rather than optional, so absent is not a
+-- setting -- it is a game that cannot start, and the host screen mints one
+-- on the way in so the usual answer is six characters nobody had to invent.
 function M.hostJoinCode()
   return Wire.code(mod.save:get("hostcode"))
 end
 
--- nil or "" turns it off; anything else is stored normalised or refused.
--- Refused, never stored half-formed: a host who believes their game is
--- locked and finds it open is the failure this whole feature exists to
--- prevent.
+-- nil or "" clears the stored code; anything else is stored normalised or
+-- refused. No screen clears it any more, but the path stays: a code left by
+-- an older build that will not normalise has to be droppable, and clearing
+-- it stops a game rather than opening one. Refused, never stored
+-- half-formed: a host who believes their game is locked and finds it open
+-- is the failure this whole feature exists to prevent.
 function M.setHostJoinCode(a, b)
   local value = arg1(a, b)
   if value == nil or value == "" then
@@ -204,12 +222,15 @@ end
 -- timings, clock deltas, heap size and the player's own button presses --
 -- and not from one instantaneous sample the way they used to.
 --
--- **It is still not a CSPRNG**, and the honest number is in Hub.lua's pool
--- header rather than here so there is one copy of it: about 35-45 bits if
+-- **It is still not a CSPRNG**, and the honest numbers are in Hub.lua's pool
+-- header rather than here so there is one copy of them: about 35-45 bits if
 -- something contrives to draw before a single frame has run, and a claimed
--- 64 -- not the 80 the ABCD-EFGH-JKMN-PQRS format implies -- from a game
--- that has been playing for more than a moment, which is every game that has
--- reached this screen. A host who wants better than that types their own.
+-- 64 from a game that has been playing for more than a moment, which is
+-- every game that has reached this screen. At six characters the code
+-- itself carries 30 bits (Config.CODE_LEN), so on that second path the
+-- length is the binding constraint and not the pool -- what a code is worth
+-- is argued out in Config, next to the number that decides it. A host who
+-- wants a code they chose types their own.
 function M.newJoinCode()
   local code, why = Hub.Entropy.shared:code()
   -- The pool answers nil plus a reason rather than raising. `why` never
@@ -226,9 +247,11 @@ end
 
 -- Put the player in front of the code screen.
 --
--- Reached when a hub asks for a code we do not have, and when it refuses the
--- one we do. Either way the alternative is a connection that simply stops,
--- with nothing on screen to act on.
+-- The fallback, not the main road: JOIN GAME now asks for a code straight
+-- after the address, so this is what a mistyped one lands on -- a hub asking
+-- for a code this copy does not have, or refusing the one it does. Either
+-- way the alternative is a connection that simply stops, with nothing on
+-- screen to act on.
 function M.askJoinCode(game, address, reconnect)
   game = game or ctx.game
   if not game then return false end
@@ -396,9 +419,12 @@ function M.host(a, b)
   local limit = M.maxPlayers()
   -- The code goes in at start, so the hub is locked from its first accept
   -- rather than from whenever the host got round to it. HostServer refuses
-  -- to open the port at all on a code it cannot use, which is the right
-  -- answer -- a game the host believes is locked and is not would be worse
-  -- than one that did not start -- so its sentence is shown like any other.
+  -- to open the port at all on a code that is missing or unusable, which is
+  -- the right answer -- a game the host believes is locked and is not would
+  -- be worse than one that did not start -- so its sentence is read out on
+  -- screen like any other refusal rather than failing silently. The host
+  -- screen mints a code before START is reachable, so a player only meets
+  -- that sentence when the entropy pool could not produce one.
   local ok, err = server:start(Config.DEFAULT_PORT, limit, M.hostJoinCode())
   if not ok then
     ui:say(tostring(err or "Couldn't start hosting."))
@@ -537,8 +563,11 @@ local handlers = {}
 -- code as ASCII, message is the nonce as its lowercase-hex *string*, and a
 -- drift in either reaches the player as nothing but "wrong join code".
 --
--- A hub with no code configured never sends this, so an unauthenticated
--- game is the exchange it always was.
+-- Every hub this mod ships now requires a code, and the join flow asks for
+-- one before it dials, so in the ordinary case this arrives with an answer
+-- already in hand and the player never sees it. What it still handles is
+-- the case that made it: a stored code that is absent or wrong, and a
+-- third-party hub that runs without one and never sends this at all.
 handlers[Wire.CHALLENGE] = function(game, msg)
   -- the hub is a stranger's process like every other peer, so its framing
   -- is checked exactly as hard as a player's
@@ -557,7 +586,7 @@ handlers[Wire.CHALLENGE] = function(game, msg)
     -- landed and not extended for the challenge -- both hosting paths, the
     -- one in src/Hub.lua and the one in server/lib/limits.js, hold to that
     -- same budget. Some of it is already spent by the time this arrives, and
-    -- typing sixteen characters on a d-pad is not ten seconds anyway, so
+    -- even six characters on a d-pad is not reliably under what is left, so
     -- holding the socket open only buys the player a connection that dies
     -- behind the screen they are still typing on.
     M.disconnect()
@@ -772,8 +801,9 @@ function M.install()
     -- rather than only when a hub happens to ask for it. A code typed for a
     -- particular hub is stored against that hub (see M.joinCode); this row
     -- is the fallback, and the one a player who only ever plays on one hub
-    -- ever needs. maxLen so the manager's own naming screen accepts a
-    -- dashed code instead of cutting it at seven characters.
+    -- ever needs. maxLen so the manager's own naming screen -- which
+    -- defaults to seven -- takes a whole code plus whatever punctuation a
+    -- pasted one brings, rather than cutting it short.
     { key = "code", label = "JOIN CODE", type = "text", default = "",
       maxLen = Config.CODE_ENTRY_MAX },
     { key = "sprite", label = "MY SPRITE", type = "choice",

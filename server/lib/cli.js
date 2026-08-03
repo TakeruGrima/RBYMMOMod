@@ -30,8 +30,17 @@
  * `invite`, and `invite list --reveal`. It never goes through the logger (log
  * lines get piped into files, journals and, in a container, into whatever the
  * orchestrator collects), never appears in `status` or `doctor`, and never
- * appears in an error message. `status` and `invite list` mask through
- * config.redact so a host can screen-share either one.
+ * appears in an error message -- not even the one that refuses a mistyped
+ * `--code`, which names the alphabet rather than echoing what was typed.
+ * `status` and `invite list` mask through config.redact so a host can
+ * screen-share either one.
+ *
+ * A passcode is not optional. The owner's rule is that both halves of this
+ * software -- the in-game LAN host and this one -- require one, so there is no
+ * `--no-auth`, no wizard question that can turn it off, and `start` refuses a
+ * configuration that would admit anybody. The old flag is still *recognised*,
+ * because people paste old commands out of their shell history, but only so it
+ * can be answered with a sentence instead of "unknown option".
  *
  * Exit codes: 0 success, 1 runtime error, 2 usage error.
  *
@@ -181,6 +190,68 @@ function parseDuration(text) {
   return amount * ms;
 }
 
+/** A duration a host can read at a glance. Exact, never rounded. */
+function humanMs(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return String(value);
+  if (ms === 0) return '0ms';
+  if (ms % 86400000 === 0) return `${ms / 86400000}d`;
+  if (ms % 3600000 === 0) return `${ms / 3600000}h`;
+  if (ms % 60000 === 0) return `${ms / 60000}m`;
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${ms}ms`;
+}
+
+/*
+ * The same false-ish spellings config.js accepts, recognised here so that
+ * `--no-auth`, `--auth false` and `--auth=off` all reach the one sentence that
+ * explains the flag is gone -- rather than three different outcomes, one of
+ * which would quietly write an open hub.
+ */
+function saysNo(value) {
+  if (value === false) return true;
+  if (typeof value !== 'string') return false;
+  return ['false', '0', 'no', 'off', 'n', ''].includes(value.trim().toLowerCase());
+}
+
+/**
+ * A passcode a host supplied on the command line, normalised, or an error to
+ * print. `--code` is the documented spelling; `--passcode` is accepted because
+ * it is the word the in-game screen uses and half the people who reach for the
+ * flag will type it.
+ *
+ * The refusal never echoes what was typed: a mistyped passcode is still very
+ * nearly a passcode, and this text can end up in a terminal recording or a
+ * pasted bug report.
+ */
+function suppliedCode(flags) {
+  const raw = flags.code !== undefined ? flags.code : flags.passcode;
+  const flag = flags.code !== undefined ? '--code' : '--passcode';
+  if (raw === undefined) return { given: false, code: null, error: null };
+  if (raw === true || raw === false || String(raw).trim() === '') {
+    return {
+      given: true,
+      code: null,
+      error: [`${flag} needs a passcode after it, e.g. \`${flag} A7K3P9\`.`],
+    };
+  }
+  const normalized = auth.normalizeCode(String(raw));
+  if (normalized === null) {
+    return {
+      given: true,
+      code: null,
+      error: [
+        `${flag}: that is not a passcode this hub can use.`,
+        `A passcode is ${auth.CODE_LEN} characters from ${auth.ALPHABET}`,
+        '-- the digits and the capital letters except I, L, O and U, which are',
+        'left out so nothing is mistyped off a screenshot. Dashes, spaces and',
+        'lower case are fine; they are normalised away.',
+      ],
+    };
+  }
+  return { given: true, code: normalized, error: null };
+}
+
 // ------------------------------------------------------------------- output
 
 /*
@@ -279,7 +350,7 @@ const HELP = {
     '',
     'Getting started',
     '  init                        first-run wizard: writes the config file and',
-    '                              prints a join code (once)',
+    '                              prints the passcode (once)',
     '  start                       run the hub',
     '  doctor                      check the configuration and report who can',
     '                              reach this machine',
@@ -300,6 +371,10 @@ const HELP = {
     '  allow [<ip>|--clear]        allowlist: when it has entries, ONLY those',
     '                              addresses may connect',
     '',
+    `  A passcode is always required -- ${auth.CODE_LEN} characters, e.g. A7K3P9. Nothing`,
+    '  turns it off; `start` refuses a config that would admit anybody. Both',
+    '  `init` and `invite` take --code CODE if you would rather choose it.',
+    '',
     'Router',
     '  upnp enable|disable|status  ask the router to forward the port (off by',
     '                              default; read the warning first)',
@@ -318,17 +393,23 @@ const HELP = {
     'Exit codes: 0 success, 1 error, 2 wrong usage.',
   ],
   init: [
-    `Usage: ${PROGRAM} init [--force] [--yes] [--port N] [--max N] [--no-auth]`,
+    `Usage: ${PROGRAM} init [--force] [--yes] [--port N] [--max N] [--code CODE]`,
     '                       [--log-level debug|info|warn|error|silent]',
     '',
-    'Asks four questions, writes the config file with mode 0600, and prints a',
-    'join code once. Refuses to overwrite an existing config without --force.',
+    'Asks four questions, writes the config file with mode 0600, and prints the',
+    'passcode once. Refuses to overwrite an existing config without --force.',
     '',
     '  --yes         do not ask; take the flags and the defaults. This is the',
     '                path a Dockerfile or a test suite uses.',
     '  --force       replace an existing config file.',
-    '  --no-auth     do not require a join code (anyone who reaches the port',
-    '                can join). Authentication is on by default.',
+    '  --code CODE   use this passcode instead of a generated one.',
+    `                ${auth.CODE_LEN} characters from ${auth.ALPHABET}`,
+    '                -- no I, L, O or U. Dashes, spaces and lower case are',
+    '                normalised away, so a code copied out of a chat message',
+    '                works. This is how you make the hub answer to the same',
+    '                passcode as your in-game LAN game.',
+    '',
+    'There is no --no-auth. A passcode is required, here and in game.',
   ],
   start: [
     `Usage: ${PROGRAM} start [--port N] [--host ADDR] [--max N] [...]`,
@@ -338,19 +419,25 @@ const HELP = {
     'hub until it is stopped. Any config path may be overridden for this run',
     'with a flag -- `--limits.maxPending 12` works as well as `--max 8`.',
     '',
-    'The config file holds every join code in plaintext, so `start` refuses to',
-    'run when it is readable by the group or by everyone else on the machine.',
-    'The fix it prints is `chmod 600 <file>`.',
+    'Two things stop it before it binds anything:',
+    '',
+    '  - a config file readable by the group or by everyone else on this',
+    '    machine. It holds every passcode in plaintext; the fix it prints is',
+    '    `chmod 600 <file>`.',
+    '  - a configuration that would admit anybody: auth.required off, or no',
+    `    usable passcode. The fix it prints is \`${PROGRAM} invite\`.`,
     '',
     '  --insecure-config   start anyway on a group- or world-readable config.',
     '                      For a host who genuinely has an unusual setup; it',
-    '                      prints exactly what is being accepted.',
+    '                      prints exactly what is being accepted. It does not',
+    '                      waive the passcode -- nothing does.',
   ],
   status: [
     `Usage: ${PROGRAM} status`,
     '',
     'Prints every setting with the value in force and where it came from, so',
-    '"why is it still 4 players" has an answer. Join codes are masked.',
+    '"why is it still 4 players" has an answer, then the wrong-passcode',
+    'throttle in plain words. Passcodes are masked.',
   ],
   config: [
     `Usage: ${PROGRAM} config list`,
@@ -366,6 +453,7 @@ const HELP = {
   ],
   invite: [
     `Usage: ${PROGRAM} invite [--label TEXT] [--expires 30m|24h|7d] [--uses N]`,
+    '                         [--code CODE]',
     `       ${PROGRAM} invite list [--reveal]`,
     '',
     'Mints a join code and prints it once. Codes are masked in `invite list`',
@@ -373,6 +461,11 @@ const HELP = {
     '',
     '  --expires   30m, 24h, 7d -- minutes, hours or days. Nothing else.',
     '  --uses N    how many times it may be used before it stops working.',
+    '  --code CODE use this passcode rather than a generated one:',
+    `              ${auth.CODE_LEN} characters from ${auth.ALPHABET}.`,
+    '              Dashes, spaces and lower case are normalised away. Use it',
+    '              to reuse the passcode from your in-game LAN game, or to',
+    '              pick one your friends can remember.',
   ],
   revoke: [
     `Usage: ${PROGRAM} revoke <id>`,
@@ -487,15 +580,100 @@ function maskedCredentials(credentials) {
   return (copy && copy.auth && copy.auth.credentials) || [];
 }
 
+function limitOf(cfg, key) {
+  const value = cfg && cfg.limits ? cfg.limits[key] : undefined;
+  return value === undefined || value === null ? config.DEFAULTS.limits[key] : value;
+}
+
+/*
+ * The wrong-passcode throttle, in words a host can act on.
+ *
+ * Honest about what it is: **the configured policy, not a live reading.**
+ * limits.js does keep the live picture -- `stats().auth` carries
+ * recentFailures, lockdown, throttledAddresses and the rest -- but that object
+ * lives inside the running hub's process, reached only through the handle
+ * `server.start()` resolves. `status` and `doctor` are separate short-lived
+ * processes that read a config file; there is no admin socket, no status file
+ * and no signal that answers, so they have nothing to read those counters
+ * from. Inventing a number here would be worse than not printing one.
+ *
+ * What a host who is being hammered actually sees is the hub's own log, which
+ * is where limits.js's decisions surface. These lines tell them what those
+ * decisions will be, which is the part that is knowable from here -- and the
+ * part they can change.
+ *
+ * A 30-bit passcode (auth.js) is only as safe as this throttle, so the numbers
+ * belong somewhere a host reads without being told to go looking.
+ */
+function throttleLines(cfg) {
+  const grace = limitOf(cfg, 'authFailureGrace');
+  return [
+    'Wrong-passcode throttle (configured here; the live counts belong to the',
+    'running hub and show up in its log, not in this command):',
+    `  per address   ${grace === 0 ? 'no free attempts' : `${grace} free attempt(s)`} ` +
+      `per ${humanMs(limitOf(cfg, 'authFailureWindowMs'))}, then a wait from ` +
+      `${humanMs(limitOf(cfg, 'authBackoffBaseMs'))} doubling to ` +
+      `${humanMs(limitOf(cfg, 'authBackoffMaxMs'))}`,
+    `  hub-wide      ${limitOf(cfg, 'authGlobalFailures')} failures in ` +
+      `${humanMs(limitOf(cfg, 'authGlobalWindowMs'))} shuts new joins for ` +
+      `${humanMs(limitOf(cfg, 'authLockoutMs'))}`,
+  ];
+}
+
+/**
+ * Throttle settings that will bite the host rather than an attacker. Each one
+ * is a comparison between two knobs that individually look reasonable, which
+ * is exactly the kind of thing nobody spots by reading a table of numbers.
+ *
+ * Deliberately not here: anything derived from limits.connectPerMinute. That
+ * bucket is charged per address (limits.js:492-495), so it says nothing about
+ * how many wrong passcodes the *hub* can be shown by a roomful of addresses --
+ * which is the number the hub-wide ceiling is about.
+ */
+function throttleConcerns(cfg) {
+  const out = [];
+  const grace = limitOf(cfg, 'authFailureGrace');
+  const ceiling = limitOf(cfg, 'authGlobalFailures');
+  const base = limitOf(cfg, 'authBackoffBaseMs');
+  const max = limitOf(cfg, 'authBackoffMaxMs');
+  const maxPlayers = cfg && cfg.maxPlayers !== undefined ? cfg.maxPlayers : config.DEFAULTS.maxPlayers;
+
+  if (grace >= 50) {
+    out.push(`limits.authFailureGrace is ${grace}: one address gets that many ` +
+      'wrong passcodes per window before anything slows it down');
+  }
+  if (ceiling <= maxPlayers) {
+    out.push(`limits.authGlobalFailures (${ceiling}) is no higher than maxPlayers ` +
+      `(${maxPlayers}), so a full house mistyping the passcode once each would ` +
+      `shut new joins for ${humanMs(limitOf(cfg, 'authLockoutMs'))}`);
+  }
+  if (max <= base) {
+    out.push(`limits.authBackoffMaxMs (${humanMs(max)}) is not above ` +
+      `limits.authBackoffBaseMs (${humanMs(base)}), so the per-address wait ` +
+      'never escalates past its first step');
+  }
+  return out;
+}
+
 // -------------------------------------------------------------------- init
 
+/*
+ * The passcode, framed.
+ *
+ * This used to be a 60-column rule above and below a lone code, which was
+ * sized for the 19-character grouped form and leaves a 6-character passcode
+ * looking like a stray character in an empty field -- the one line on the page
+ * a host must copy correctly, and the least emphatic thing on it. The box is
+ * drawn to the code instead, so it stays deliberate at any length the format
+ * ever takes.
+ */
 function joinCodeBlock(ctx, code, extra) {
+  const inner = `   ${String(code)}   `;
+  const rule = `+${'-'.repeat(inner.length)}+`;
   ctx.say('');
-  ctx.say('  ------------------------------------------------------------');
-  ctx.say('');
-  ctx.say(`      ${code}`);
-  ctx.say('');
-  ctx.say('  ------------------------------------------------------------');
+  ctx.say(`      ${rule}`);
+  ctx.say(`      |${inner}|`);
+  ctx.say(`      ${rule}`);
   ctx.say('');
   ctx.say('  Give that to the friends you want in your world. They type it once,');
   ctx.say('  in game, on the screen where they enter this hub\'s address. Anyone');
@@ -547,7 +725,39 @@ function makePrompter(rl) {
   return ask;
 }
 
+/*
+ * `--no-auth` was a real flag, and a host who used it once has it in their
+ * shell history and in whatever notes they wrote for themselves. Letting it
+ * fall through to config.js would be worse than an unknown-option error: it
+ * maps to auth.required and would write exactly the open hub this software no
+ * longer supports. So it is caught here, by name, and answered.
+ *
+ * Every false-ish spelling counts -- `--no-auth`, `--auth false`, `--auth=off`
+ * -- because they all mean the same thing to config.js.
+ */
+function refuseNoAuth(ctx, verb) {
+  if (!('auth' in ctx.flags) || !saysNo(ctx.flags.auth)) return false;
+  ctx.warn('A passcode is required, so there is no way to turn it off.');
+  ctx.warn('');
+  ctx.warn('  --no-auth (and --auth false) used to write a hub anyone who found the');
+  ctx.warn('  port could join. Both halves of this software now require a passcode:');
+  ctx.warn('  the in-game LAN host asks for one, and this hub refuses to start');
+  ctx.warn('  without one.');
+  ctx.warn('');
+  ctx.warn(`  Run \`${PROGRAM} ${verb}\` without it and a passcode is generated for you,`);
+  ctx.warn(`  or \`${PROGRAM} ${verb} --code A7K3P9\` to choose your own.`);
+  return true;
+}
+
 async function verbInit(ctx) {
+  if (refuseNoAuth(ctx, 'init')) return USAGE;
+
+  const supplied = suppliedCode(ctx.flags);
+  if (supplied.error) {
+    for (const line of supplied.error) ctx.warn(line);
+    return USAGE;
+  }
+
   if (fs.existsSync(ctx.file) && ctx.flags.force !== true) {
     ctx.warn(`There is already a configuration at ${ctx.file}.`);
     ctx.warn('Re-run with --force to replace it -- that writes a new join code and');
@@ -563,7 +773,11 @@ async function verbInit(ctx) {
   const cfg = loaded.config;
   reportWarnings(ctx, loaded.warnings, 'config');
 
-  let requireAuth = cfg.auth.required;
+  // Not a question any more, and not a setting init will write either way: the
+  // wizard's third question used to be "require a join code?", and a host who
+  // answered n got a hub anyone could walk into. What it asks now is *which*
+  // passcode, which is the choice that was actually missing.
+  let chosen = supplied.code;
 
   if (ctx.flags.yes !== true) {
     ctx.say(`${PROGRAM} -- first-run setup`);
@@ -574,15 +788,14 @@ async function verbInit(ctx) {
 
     const rl = readline.createInterface({ input: ctx.stdin, output: ctx.stdout });
     const ask = makePrompter(rl);
+    let typed = null;
     try {
       cfg.listen.port = await ask(`  Port to listen on [${cfg.listen.port}]: `, cfg.listen.port);
       cfg.maxPlayers = await ask(`  How many players at once, 2-64 [${cfg.maxPlayers}]: `, cfg.maxPlayers);
 
-      const authDefault = requireAuth ? 'Y/n' : 'y/N';
-      const answer = await ask(`  Require a join code to connect? [${authDefault}]: `,
-        requireAuth ? 'y' : 'n');
-      requireAuth = /^(y|yes|true|1|on)$/i.test(String(answer).trim());
-      cfg.auth.required = requireAuth;
+      typed = await ask(
+        `  Passcode friends will type, ${auth.CODE_LEN} characters ` +
+        `[${chosen || 'make one up for me'}]: `, chosen || '');
 
       cfg.log.level = await ask(
         `  Log level -- debug, info, warn, error, silent [${cfg.log.level}]: `, cfg.log.level);
@@ -596,6 +809,18 @@ async function verbInit(ctx) {
     }
     ctx.say('');
 
+    if (typeof typed === 'string' && typed.trim() !== '' && typed !== chosen) {
+      const normalized = auth.normalizeCode(typed);
+      if (normalized === null) {
+        ctx.warn('That is not a passcode this hub can use, so nothing has been');
+        ctx.warn(`written. A passcode is ${auth.CODE_LEN} characters from`);
+        ctx.warn(`${auth.ALPHABET} -- the digits and the capitals`);
+        ctx.warn('except I, L, O and U. Run init again, or pass `--code CODE`.');
+        return USAGE;
+      }
+      chosen = normalized;
+    }
+
     if (ask.state.truncated) {
       // Node's readline throws away whatever else was buffered once the input
       // stream ends, so piping four answers in one go answers one question and
@@ -603,26 +828,45 @@ async function verbInit(ctx) {
       // took input it did not.
       ctx.warn('note: the input ended before every question was answered, so the');
       ctx.warn('      rest took their defaults. For a scripted run use the flags:');
-      ctx.warn(`      ${PROGRAM} init --yes --port N --max N [--no-auth] [--log-level L]`);
+      ctx.warn(`      ${PROGRAM} init --yes --port N --max N [--code CODE] [--log-level L]`);
     }
   }
+
+  /*
+   * The passcode is not negotiable, so init writes `auth.required: true` no
+   * matter what arrived from the file, the environment or a flag. Anything
+   * that said otherwise is overruled out loud rather than silently: a host who
+   * exported RBY_MMO_AUTH_REQUIRED=false has a reason to believe it did
+   * something, and deserves to be told it no longer does.
+   */
+  const askedForOpen = cfg.auth.required === false;
+  cfg.auth.required = true;
 
   const checked = config.validate(cfg);
   reportWarnings(ctx, checked.warnings, 'adjusted');
   const final = checked.config;
-  requireAuth = final.auth.required;
+  final.auth.required = true;
 
-  let credential = null;
-  if (requireAuth) {
-    credential = auth.newCredential({ label: 'Primary join code' });
-    // A stable, memorable id for the one credential a host will most often
-    // name, matching the shape the plan documents (§3.5). Invites get random
-    // ids; there is only ever one primary.
-    credential.id = 'primary';
-    final.auth.credentials = [credential];
-  } else {
-    final.auth.credentials = [];
+  if (askedForOpen) {
+    ctx.warn('note: something in this environment asked for a hub with no passcode');
+    ctx.warn('      (auth.required false). It is required now, so that was ignored.');
   }
+
+  let credential;
+  try {
+    credential = auth.newCredential({ label: 'Primary join code', secret: chosen });
+  } catch (err) {
+    // suppliedCode() and the wizard both normalise first, so reaching here
+    // means auth.js rejected something they accepted -- report it, do not
+    // write a config with no way in.
+    ctx.warn(`Could not use that passcode: ${err.message}`);
+    return ERROR;
+  }
+  // A stable, memorable id for the one credential a host will most often
+  // name, matching the shape the plan documents (§3.5). Invites get random
+  // ids; there is only ever one primary.
+  credential.id = 'primary';
+  final.auth.credentials = [credential];
 
   if (!saveConfig(ctx, final)) return ERROR;
 
@@ -630,20 +874,12 @@ async function verbInit(ctx) {
   ctx.say('');
   ctx.say(`  listening on   ${final.listen.host}:${final.listen.port}`);
   ctx.say(`  players        up to ${final.maxPlayers}`);
-  ctx.say(`  join code      ${requireAuth ? 'required' : 'NOT required'}`);
+  ctx.say('  join code      required (always -- there is no open-hub setting)');
   ctx.say(`  log level      ${final.log.level}`);
 
-  if (credential) {
-    ctx.say('');
-    ctx.say('Your join code');
-    joinCodeBlock(ctx, credential.secret);
-  } else {
-    ctx.say('');
-    ctx.say('This hub does not require a join code, so anyone who can reach the');
-    ctx.say('port can join it. That is fine on a LAN and a bad idea on the open');
-    ctx.say(`internet. Turn it on later with \`${PROGRAM} config set auth.required true\``);
-    ctx.say(`followed by \`${PROGRAM} invite\`.`);
-  }
+  ctx.say('');
+  ctx.say(chosen ? 'Your join code, the one you chose' : 'Your join code');
+  joinCodeBlock(ctx, credential.secret);
 
   ctx.say('Next:');
   ctx.say(`  ${PROGRAM} doctor      -- check the configuration and who can reach you`);
@@ -701,23 +937,56 @@ async function verbStart(ctx) {
     ctx.warn('');
   }
 
+  /*
+   * The passcode gate, checked here rather than left to server.js.
+   *
+   * server.js has its own refusal and keeps it -- an embedder that calls
+   * start() directly must not be able to bypass this. But a host never reads
+   * that one: they read whatever this command printed before it exited, so
+   * this is where the sentence with the fix in it belongs. Both are refusals,
+   * not warnings, because the two failure modes here are "anyone can walk in"
+   * and "nobody can get in", and a hub that runs in either state is a hub
+   * whose symptoms show up hours later, on someone else's screen.
+   */
   const active = auth.activeCredentials(cfg.auth.credentials);
-  if (cfg.auth.required && active.length === 0) {
-    // Worth stopping for a moment: this configuration cannot admit anybody,
-    // and the symptom a host would otherwise see is every friend being refused
-    // for no visible reason.
-    ctx.warn('');
-    ctx.warn('warning: this hub requires a join code and has no usable one, so');
-    ctx.warn(`         nobody can join it. Run \`${PROGRAM} invite\` to mint one, or`);
-    ctx.warn(`         \`${PROGRAM} config set auth.required false\` to drop the requirement.`);
-    ctx.warn('');
-  }
   if (!cfg.auth.required) {
-    ctx.warn('warning: authentication is off -- anyone who can reach this port can join.');
+    ctx.warn('');
+    ctx.warn('Refusing to start: auth.required is false, and a passcode is required.');
+    ctx.warn('');
+    ctx.warn(`      ${PROGRAM} config set auth.required true`);
+    ctx.warn(`      ${PROGRAM} invite`);
+    ctx.warn('');
+    ctx.warn('  A hub with no passcode admits anyone who finds the port, which is');
+    ctx.warn('  not something this software supports any more -- in game or here.');
+    ctx.warn(`  \`${PROGRAM} invite\` prints a code to hand to your friends;`);
+    ctx.warn(`  \`${PROGRAM} invite --code A7K3P9\` sets one you choose.`);
+    ctx.warn('');
+    return ERROR;
   }
+  if (active.length === 0) {
+    ctx.warn('');
+    ctx.warn('Refusing to start: this hub has no usable passcode, so nobody could');
+    ctx.warn('join it.');
+    ctx.warn('');
+    ctx.warn(`      ${PROGRAM} invite`);
+    ctx.warn('');
+    const total = Array.isArray(cfg.auth.credentials) ? cfg.auth.credentials.length : 0;
+    if (total > 0) {
+      ctx.warn(`  ${total} code(s) are configured and every one of them is revoked,`);
+      ctx.warn(`  expired or used up. \`${PROGRAM} invite list\` says which is which.`);
+    } else {
+      ctx.warn(`  There are no codes configured at all. \`${PROGRAM} invite\` mints one,`);
+      ctx.warn(`  or \`${PROGRAM} invite --code A7K3P9\` sets one you choose.`);
+    }
+    ctx.warn('');
+    return ERROR;
+  }
+
   if (Array.isArray(cfg.allowlist) && cfg.allowlist.length > 0) {
     ctx.say(`Allowlist is active: only ${cfg.allowlist.length} address(es) may connect.`);
   }
+  printLines(ctx, throttleLines(cfg));
+  ctx.say('');
 
   printLines(ctx, reachability.summary({
     port: cfg.listen.port,
@@ -895,6 +1164,10 @@ function verbStatus(ctx) {
   ctx.say('FROM: flag = this command line, env = an RBY_MMO_* variable,');
   ctx.say('      file = the configuration file, default = built in.');
   ctx.say('Join codes are masked here. `invite list --reveal` prints them.');
+
+  ctx.say('');
+  printLines(ctx, throttleLines(loaded.config));
+  for (const concern of throttleConcerns(loaded.config)) ctx.say(`  note: ${concern}`);
   return OK;
 }
 
@@ -998,6 +1271,17 @@ function verbConfig(ctx, rest) {
     if (JSON.stringify(after) === before) {
       ctx.say('(unchanged -- it was already that)');
     }
+    /*
+     * Still settable -- a config file is a config file, and a host who is
+     * scripting one, or reproducing a report, should not be fought by their
+     * own tool. But it is a configuration the hub will not run, so it is
+     * answered here rather than half an hour later at `start`.
+     */
+    if (dotted === 'auth.required' && after === false) {
+      ctx.warn('warning: a passcode is required, so this is a configuration the hub');
+      ctx.warn(`         will not run -- \`${PROGRAM} start\` refuses it and says so.`);
+      ctx.warn(`         \`${PROGRAM} config set auth.required true\` puts it back.`);
+    }
     if (config.ENV_MAP && Object.values(config.ENV_MAP).includes(dotted)) {
       const name = Object.keys(config.ENV_MAP).find((key) => config.ENV_MAP[key] === dotted);
       if (ctx.env && ctx.env[name] !== undefined && ctx.env[name] !== '') {
@@ -1091,6 +1375,14 @@ function verbInvite(ctx, rest) {
     return USAGE;
   }
 
+  if (refuseNoAuth(ctx, 'invite')) return USAGE;
+
+  const supplied = suppliedCode(ctx.flags);
+  if (supplied.error) {
+    for (const line of supplied.error) ctx.warn(line);
+    return USAGE;
+  }
+
   let expiresAt = null;
   if (ctx.flags.expires !== undefined && ctx.flags.expires !== false) {
     const ms = parseDuration(ctx.flags.expires);
@@ -1120,9 +1412,30 @@ function verbInvite(ctx, rest) {
   if (!loaded) return ERROR;
   const cfg = loaded.config;
 
+  /*
+   * Two credentials holding the same passcode is a state with no good
+   * behaviour: verify() matches whichever comes first, so the second one's
+   * expiry and use budget are quietly never spent, and revoking "the" code
+   * leaves the other one letting people in. Refused rather than merged --
+   * merging would mean silently choosing which of the two sets of limits the
+   * host meant.
+   */
+  if (supplied.code) {
+    const clash = cfg.auth.credentials.find((credential) =>
+      auth.normalizeCode(credential.secret) === supplied.code);
+    if (clash) {
+      ctx.warn(`That passcode is already configured, as ${clash.id} (${clash.label}).`);
+      ctx.warn(`\`${PROGRAM} invite list\` shows it${clash.revoked ? '; it is revoked' : ''}. ` +
+        `Revoke it with \`${PROGRAM} revoke ${clash.id}\` before reusing the code,`);
+      ctx.warn('or pick another one -- two entries with the same code cannot both');
+      ctx.warn('carry their own expiry and use count.');
+      return ERROR;
+    }
+  }
+
   let credential;
   try {
-    credential = auth.newCredential({ label, expiresAt, maxUses });
+    credential = auth.newCredential({ label, expiresAt, maxUses, secret: supplied.code });
   } catch (err) {
     ctx.warn(`Could not mint a join code: ${err.message}`);
     return ERROR;
@@ -1139,9 +1452,9 @@ function verbInvite(ctx, rest) {
   joinCodeBlock(ctx, credential.secret, notes);
 
   if (!cfg.auth.required) {
-    ctx.say('note: this hub does not currently require a join code, so this one');
-    ctx.say(`      is not needed to join. \`${PROGRAM} config set auth.required true\``);
-    ctx.say('      makes it matter.');
+    ctx.warn('warning: auth.required is false in this config, and a passcode is');
+    ctx.warn(`         required -- \`${PROGRAM} start\` refuses to run like this.`);
+    ctx.warn(`         \`${PROGRAM} config set auth.required true\` fixes it.`);
   }
   ctx.say('Restart the hub for this code to be accepted.');
   return OK;
@@ -1363,7 +1676,13 @@ async function verbDoctor(ctx) {
   const credentials = cfg.auth.credentials;
   const active = auth.activeCredentials(credentials);
   if (!cfg.auth.required) {
-    mark(ctx, 'warn', 'auth.required is false: anyone who reaches the port can join');
+    // A [fail], not a [warn]: `start` refuses this configuration outright, so
+    // doctor saying "warning" about it would be the gentler of two answers
+    // that disagree.
+    failed = true;
+    mark(ctx, 'fail', 'auth.required is false: a passcode is required, and `start` ' +
+      `will refuse this config -- run \`${PROGRAM} config set auth.required true\` ` +
+      `then \`${PROGRAM} invite\``);
   } else if (active.length === 0) {
     failed = true;
     mark(ctx, 'fail', 'a join code is required and none is usable, so nobody can ' +
@@ -1381,6 +1700,25 @@ async function verbDoctor(ctx) {
     mark(ctx, 'warn', `${stale.length} join code(s) no longer work ` +
       `(${stale.map((credential) => `${credential.id}: ${credentialState(credential, now)}`).join(', ')})`);
   }
+
+  /*
+   * The guess-rate throttle. Configured values only -- see throttleLines():
+   * the live counters (`stats().auth`) exist only inside a running hub, and
+   * this process is not it. That is stated in the output rather than papered
+   * over, because "doctor said nothing about it" must not read as "nobody is
+   * trying".
+   */
+  mark(ctx, 'ok', 'wrong passcodes are throttled: ' +
+    `${limitOf(cfg, 'authFailureGrace')} free per address per ` +
+    `${humanMs(limitOf(cfg, 'authFailureWindowMs'))}, backing off from ` +
+    `${humanMs(limitOf(cfg, 'authBackoffBaseMs'))} to ` +
+    `${humanMs(limitOf(cfg, 'authBackoffMaxMs'))}; ` +
+    `${limitOf(cfg, 'authGlobalFailures')} hub-wide in ` +
+    `${humanMs(limitOf(cfg, 'authGlobalWindowMs'))} shuts new joins for ` +
+    `${humanMs(limitOf(cfg, 'authLockoutMs'))}`);
+  for (const concern of throttleConcerns(cfg)) mark(ctx, 'warn', concern);
+  mark(ctx, 'ok', 'those are the configured limits -- how many wrong passcodes have ' +
+    'actually arrived is known only to the hub while it runs, and shows up in its log');
 
   // Port and bind address.
   const port = cfg.listen.port;

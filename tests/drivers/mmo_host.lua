@@ -26,10 +26,11 @@ return function(game)
   local ADDR_FILE = os.getenv("MMO_ADDR_FILE") or "/tmp/rby_mmo_addr.txt"
   local SHOT_DIR = os.getenv("SHOT_DIR") or "/tmp/rby_mmo_shots"
   local LIMIT = tonumber(os.getenv("MMO_LIMIT") or "") or 2
-  -- On by default, because the join code is this build's headline feature
-  -- and nothing else in the suite can reach it in a running game. Off is for
-  -- someone who wants the plain smoke test back.
-  local WANT_CODE = (os.getenv("MMO_JOIN_CODE") or "1") ~= "0"
+  -- There is no switch for the join code, and there deliberately is not one
+  -- any more: HostServer:start refuses to bind a port without one, so a run
+  -- with the code turned off would be testing a game that cannot be hosted.
+  -- MMO_JOIN_CODE=0 used to select exactly that, and selecting an impossible
+  -- configuration is worse than having no switch at all.
 
   local function log(...) U.log(TAG, ...) end
   local events = H.captureEvents({ "battle.started", "battle.ended", "link.desync" })
@@ -110,10 +111,10 @@ return function(game)
 
   check(H.selectLabel(game, "HOST"), "confirmed the trainer and moved on")
 
-  -- HOST GAME no longer opens the size list. The optional join code needed
-  -- somewhere to live and a bare number box had no room for it, so both
-  -- settings sit on a setup menu with START under them, and hosting begins
-  -- when the host says so rather than the moment a size is picked.
+  -- HOST GAME no longer opens the size list. The join code needed somewhere
+  -- to live and a bare number box had no room for it, so both sit on a setup
+  -- menu with START under them, and hosting begins when the host says so
+  -- rather than the moment a size is picked.
   U.wait(20)
   check(H.classify(H.top(game)) == "menu", "the host setup menu opened")
   U.shot(game, SHOT_DIR .. "/host-setup.png")
@@ -129,47 +130,77 @@ return function(game)
   -- picking a size is a setting, not a start: it comes back here
   check(H.classify(H.top(game)) == "menu", "and came back to the setup menu")
 
-  -- ------- the join code, set before anyone can knock
+  -- ------- the join code, already set before anyone can knock
   --
   -- Read back off the screen rather than out of the mod: the code is
   -- deliberately absent from every log and every export, and a host who
   -- cannot read theirs has a game nobody can join -- so what the screen
   -- prints IS the feature.
+  --
+  -- Nothing here turns the code on any more. It is a requirement, so the
+  -- setup screen mints one on the way in and the JOIN CODE row reads it out
+  -- -- six characters a host can say down a phone, where that row used to
+  -- say ON and send them somewhere else to find out what "on" meant. The run
+  -- asserts the row arrives carrying a code, then changes it deliberately
+  -- and asserts the row followed.
 
-  local joinCode = nil
-  if WANT_CODE then
-    if check(H.selectLabel(game, "JOIN CODE"), "JOIN CODE opens the lock menu") then
-      U.wait(20)
-      check(H.classify(H.top(game)) == "menu", "the lock menu opened")
-      U.shot(game, SHOT_DIR .. "/host-codemenu.png")
-      check(H.selectLabel(game, "NEW CODE"), "asked the game to make one")
-      U.wait(30)
-      local shown = H.textOf(H.top(game))
-      joinCode = H.codeFrom(shown)
-      check(joinCode ~= nil,
-            "the screen reads out a code a friend could type: "
-              .. H.formatCode(joinCode or ""))
-      U.shot(game, SHOT_DIR .. "/host-newcode.png")
-      -- The box's onDone puts the setup menu back. Frames: this is a local
-      -- text box being dismissed by local button presses, with nothing on
-      -- the wire and no second process involved.
-      local back = H.waitFor(game, function()
-        local top = H.top(game)
-        if top and type(top.items) == "table" then return true end
-        U.tap(game, "a")
-        return false
-      end, 240, "the setup menu after setting a code")
-      check(back, "and setting one returns to the setup menu")
-      -- the row says so too, which is the only place a host can see the
-      -- game is locked without opening the code screen again
-      local onRow = false
-      for _, item in ipairs((H.top(game) or {}).items or {}) do
-        if item.label == "JOIN CODE" then onRow = tostring(item.right) == "ON" end
-      end
-      check(onRow, "the JOIN CODE row now reads ON")
+  local minted = H.menuRow(game, "JOIN CODE")
+  local mintedCode = minted and H.codeFrom(tostring(minted.right))
+  check(mintedCode ~= nil,
+        "the setup screen arrives with a code on its JOIN CODE row: "
+          .. tostring(minted and minted.right))
+
+  local joinCode = mintedCode
+  if check(H.selectLabel(game, "JOIN CODE"), "JOIN CODE opens the lock menu") then
+    U.wait(20)
+    check(H.classify(H.top(game)) == "menu", "the lock menu opened")
+    U.shot(game, SHOT_DIR .. "/host-codemenu.png")
+
+    -- The row that is gone. A game with no code is one any stranger who can
+    -- reach the port walks into, and HostServer will not open a port without
+    -- one -- so an escape hatch here would lead nowhere but a refusal at
+    -- START, which is a worse way to learn it than not being offered.
+    local labels = H.menuLabels(game)
+    log("lock menu:", table.concat(labels, ","))
+    local hasNoCode = false
+    for _, label in ipairs(labels) do
+      if label == "NO CODE" then hasNoCode = true end
     end
-  else
-    log("MMO_JOIN_CODE=0; hosting without a code")
+    check(not hasNoCode, "and offers no way to host without a code")
+
+    check(H.selectLabel(game, "NEW CODE"), "asked the game to make one")
+    U.wait(30)
+    local shown = H.textOf(H.top(game))
+    local fresh = H.codeFrom(shown)
+    check(fresh ~= nil,
+          "the screen reads out a code a friend could type: "
+            .. H.formatCode(fresh or ""))
+    -- and it is genuinely a new one: at 30 bits the odds of drawing the
+    -- minted code again are about one in a billion, so a match here means
+    -- NEW CODE showed the old one rather than minting anything
+    check(fresh ~= nil and fresh ~= mintedCode,
+          "and it is a different code from the one already set")
+    U.shot(game, SHOT_DIR .. "/host-newcode.png")
+    joinCode = fresh or mintedCode
+
+    -- The box's onDone puts the setup menu back. Frames: this is a local
+    -- text box being dismissed by local button presses, with nothing on
+    -- the wire and no second process involved.
+    local back = H.waitFor(game, function()
+      local top = H.top(game)
+      if top and type(top.items) == "table" then return true end
+      U.tap(game, "a")
+      return false
+    end, 240, "the setup menu after setting a code")
+    check(back, "and setting one returns to the setup menu")
+
+    -- the row carries the code itself, which is where a host reads it back
+    -- without opening the code screen again
+    local row = H.menuRow(game, "JOIN CODE")
+    check(joinCode ~= nil and row ~= nil
+          and tostring(row.right) == H.formatCode(joinCode),
+          "the JOIN CODE row reads the code back: "
+            .. tostring(row and row.right))
   end
 
   check(H.selectLabel(game, "START"), "START begins the game")
@@ -224,10 +255,11 @@ return function(game)
   -- The guest connects to 127.0.0.1; the LAN address is what a human would
   -- read aloud, so publish both and let the joiner pick.
   --
-  -- Second line: the join code, or empty when the game is open. This is the
-  -- channel the two processes already have -- the address travels it -- and
-  -- a code is the other half of the same sentence a host reads out, so it
-  -- belongs here rather than in a second file with its own race.
+  -- Second line: the join code, which is always there now -- a hosted game
+  -- without one cannot exist. This is the channel the two processes already
+  -- have -- the address travels it -- and a code is the other half of the
+  -- same sentence a host reads out, so it belongs here rather than in a
+  -- second file with its own race.
   --
   -- Written and renamed rather than written in place: the wrapper script and
   -- the guest both watch for this path to exist, and a two-line file caught
@@ -239,7 +271,7 @@ return function(game)
     os.rename(ADDR_FILE .. ".tmp", ADDR_FILE)
   end
   log("hosting", tostring(address), "limit", LIMIT,
-      joinCode and ("code " .. H.formatCode(joinCode)) or "open to anyone")
+      "code " .. H.formatCode(joinCode))
 
   -- ------- a real remote player shows up
 
@@ -529,11 +561,10 @@ return function(game)
             "the address can be re-viewed from the MMO menu")
       -- and the code with it: they are read out in the same breath, and a
       -- host who set one and cannot find it again has a locked game nobody
-      -- can get into
-      if joinCode then
-        check(H.codeFrom(shown) == joinCode,
-              "and the join code is on the same screen")
-      end
+      -- can get into. Unconditional -- every hosted game has a code, so a
+      -- screen without one on it is a fault rather than a configuration.
+      check(joinCode ~= nil and H.codeFrom(shown) == joinCode,
+            "and the join code is on the same screen")
       U.shot(game, SHOT_DIR .. "/host-address-recheck.png")
     else
       check(false, "no ADDRESS row while hosting")
