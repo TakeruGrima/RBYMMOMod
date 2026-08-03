@@ -134,8 +134,12 @@ end-to-end suite.
 ### 🏠 YOU ARE THE SERVER
 `HOST GAME`, pick a room size (**2–64**), done. You're a normal player who
 happens to be the relay — you walk, chat, trade and fight like everyone else.
-Want a box that stays up 24/7 instead? There's a standalone hub, same
-protocol, and joiners can't tell the difference.
+
+The catch is in that sentence: the relay is running inside *your* copy, so
+when you quit, everyone's game ends. Fine for an evening on the sofa. If you'd
+rather nobody's exit could do that — including yours — run the standalone hub
+instead: same protocol, joiners can't tell the difference, and it has no host
+to lose.
 
 ### 🔑 EVERY GAME HAS A DOOR ON IT
 **A six-character passcode is required, both ways.** Hosting from the game
@@ -253,12 +257,21 @@ Pick by how long you want the world to outlive the session.
 | --- | --- | --- |
 | Configured with | the HOST screen | `rby-mmo-hub`, or `docker compose` |
 | Needs a terminal | no | yes, once |
-| Stays up when you stop playing | no | yes |
-| Host is also a player | yes | no — nobody has to be |
+| Who is the host | one of the players | **nobody** |
+| **If the host quits** | **the game ends for everyone** | n/a — there isn't one |
+| **If any other player quits** | everyone else carries on | everyone else carries on |
+| World survives an empty room | no — it ends with the host | yes, it just sits there |
 | Passcode | minted on the HOST screen | minted by `init`, or you pick it |
 | Passcode entropy | the game's own pool, **not** a CSPRNG | `crypto.randomBytes` |
 | Bans, allowlist, per-address limits | — | yes |
 | Good for | the same Wi-Fi, an evening | friends across the internet, 24/7 |
+
+The two bold rows are the whole difference. Hosting from the game puts the
+relay **inside one player's copy**, so that player is a single point of
+failure for everybody: their phone rings, they quit, and the world goes with
+them. A dedicated hub has no such player — every seat is equal, anyone can
+come and go, and the world is still there tomorrow. Nothing else in this
+table is worth switching for; that is.
 
 Everything below is *configuration*. For the five-minute version, see
 [Get in](#-get-in).
