@@ -180,7 +180,12 @@ return function(game)
     -- NEW CODE showed the old one rather than minting anything
     check(fresh ~= nil and fresh ~= mintedCode,
           "and it is a different code from the one already set")
-    U.shot(game, SHOT_DIR .. "/host-newcode.png")
+    -- printed, not merely open: the six characters are the entire content of
+    -- this screen, and a capture taken while the typewriter is still on
+    -- "Players will" shows none of them. H.shotPrinted waits for the box to
+    -- say it has stopped typing rather than sleeping a guessed number of
+    -- frames -- see M.printed in mmo_util.
+    H.shotPrinted(game, SHOT_DIR .. "/host-newcode.png")
     joinCode = fresh or mintedCode
 
     -- The box's onDone puts the setup menu back. Frames: this is a local
@@ -218,7 +223,11 @@ return function(game)
     log("RESULT " .. failures .. " failure(s)")
     return
   end
-  U.shot(game, SHOT_DIR .. "/host-address.png")
+  -- Same again, and the reason is sharper here: this box is three lines --
+  -- "Tell your friends:", the address, then CODE: -- so the two lines that
+  -- matter are the two that are only on screen once it has finished printing
+  -- and scrolled.
+  H.shotPrinted(game, SHOT_DIR .. "/host-address.png")
 
   local address = exports.hostAddress and exports.hostAddress() or nil
   check(type(address) == "string" and address:find(":"),
@@ -565,7 +574,7 @@ return function(game)
       -- screen without one on it is a fault rather than a configuration.
       check(joinCode ~= nil and H.codeFrom(shown) == joinCode,
             "and the join code is on the same screen")
-      U.shot(game, SHOT_DIR .. "/host-address-recheck.png")
+      H.shotPrinted(game, SHOT_DIR .. "/host-address-recheck.png")
     else
       check(false, "no ADDRESS row while hosting")
     end

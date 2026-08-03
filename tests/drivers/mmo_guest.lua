@@ -246,6 +246,10 @@ return function(game)
     check(refused,
           "a wrong join code is refused by the Node hub, in words the game shows")
     check(exports.isConnected() == false, "and leaves us outside")
+    -- printed rather than merely open: what makes this capture worth having
+    -- is the Node hub's own sentence, and a frame taken as the box opens
+    -- carries three words of it (see H.printed)
+    H.awaitPrinted(game)
     shot("code-refused")
   end
 

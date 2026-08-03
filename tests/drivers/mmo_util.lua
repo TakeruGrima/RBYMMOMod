@@ -786,6 +786,74 @@ function M.textOf(top)
   return table.concat(out, " ")
 end
 
+-- ------- capturing a text box that has finished saying its piece
+--
+-- textOf above reads `pages`, which is the whole script the box was built
+-- with -- it is true from the frame the box is constructed, which is why the
+-- assertions around these captures were always right. What is on the *screen*
+-- is `shown`, filled one glyph every few frames by the typewriter in
+-- TextBox:update, and a capture taken right after a box opens photographs
+-- three words of a sentence. Two of the screenshots this project ships
+-- (host-newcode, host-address) read "Players will" and "Tell your fri" for
+-- exactly that reason: they were correct tests attached to useless pictures.
+--
+-- The widget already says when it has stopped typing, so nothing here needs
+-- to guess at a delay. There are two ways it stops, and both mean the frame
+-- is settled:
+--
+--   done    -- the last line of the last page is out; it is waiting for A to
+--              close (src/render/TextBox.lua, `self.done = true`)
+--   waiting -- the between-pages pause, blinking arrow and all
+--
+-- Note what `done` means for a three-line page like the address screen's:
+-- the box holds two lines at a time and scrolls, so once it is done the
+-- visible pair is the *last* two lines -- the address and the CODE row --
+-- which is precisely the half a friend has to be told.
+function M.printed(top)
+  if not (top and type(top.pages) == "table") then return false end
+  return top.done == true or top.waiting == true
+end
+
+-- Frames, and rightly: printing is a fixed number of characters at a fixed
+-- cadence (the OPTION text speed) inside this process, with nothing on the
+-- wire and no second process involved. 300 frames is five seconds at 60fps
+-- against the longest box in the mod, which is about 60 characters.
+function M.awaitPrinted(game, frames)
+  return M.waitFor(game, function() return M.printed(M.top(game)) end,
+                   frames or 300, "the text box to finish printing")
+end
+
+-- Capture, but only once the box has finished printing.
+--
+-- Deliberately still captures on a timeout: a box that never finished is
+-- worth having a picture of, and a helper that silently skipped the shot
+-- would leave the reader with no artefact and no explanation. waitFor has
+-- already logged TIMEOUT by then.
+function M.shotPrinted(game, path, frames)
+  M.awaitPrinted(game, frames)
+  return U.shot(game, path)
+end
+
+-- Erase a naming grid back to an empty line, one B at a time.
+--
+-- Bounded by what is actually on the line, and it has to be: this mod's
+-- escape hatch makes B on an *empty* line leave the screen (src/Ui.lua,
+-- `escapable`), so one press too many is not a no-op -- it pops the grid and
+-- answers whatever was behind it. Returns whether the line ended up empty,
+-- which is the state START's submit-the-default path needs.
+function M.clearGrid(game, screen)
+  screen = screen or M.top(game)
+  if not (screen and type(screen.glyphs) == "table") then return false end
+  for _ = 1, (tonumber(screen.maxLen) or 32) + 1 do
+    if #screen.glyphs == 0 then return true end
+    U.tap(game, "b")
+    U.wait(2)
+  end
+  U.log("WARN could not clear the naming grid; it still holds",
+        table.concat(screen.glyphs))
+  return false
+end
+
 -- open the START menu and step into MMO
 function M.openMmo(game)
   U.tap(game, "start")

@@ -77,6 +77,9 @@ forward port **7788** — or nobody forwards anything and you all join a
 standalone hub on a box that already has a public address instead
 ([server/README.md](server/README.md)).
 
+That's the five-minute version. **[Setting a game up — both ways](#-setting-a-game-up--both-ways)**
+walks the full configuration of each path, screen by screen.
+
 ---
 
 ## ⚡ Features
@@ -240,6 +243,199 @@ Typing an address uses the number page described above — **SELECT** flips
 
 ---
 
+## 📡 Setting a game up — both ways
+
+There are two ways to put a world on the network, and **a joining player
+cannot tell them apart**: same protocol, same handshake, same passcode rules.
+Pick by how long you want the world to outlive the session.
+
+| | Hosting from the game | A dedicated hub |
+| --- | --- | --- |
+| Configured with | the HOST screen | `rby-mmo-hub`, or `docker compose` |
+| Needs a terminal | no | yes, once |
+| Stays up when you stop playing | no | yes |
+| Host is also a player | yes | no — nobody has to be |
+| Passcode | minted on the HOST screen | minted by `init`, or you pick it |
+| Passcode entropy | the game's own pool, **not** a CSPRNG | `crypto.randomBytes` |
+| Bans, allowlist, per-address limits | — | yes |
+| Good for | the same Wi-Fi, an evening | friends across the internet, 24/7 |
+
+Everything below is *configuration*. For the five-minute version, see
+[Get in](#-get-in).
+
+### 🏠 Local LAN — configured entirely in-game
+
+No files and no terminal. `START → MMO → HOST GAME`, make a trainer, and
+every setting a hosted game has is on one screen:
+
+<p align="center">
+  <img src="docs/screenshots/host-setup.png" width="270" alt="The HOST screen: PLAYERS 4, JOIN CODE ZY2GX1, START">
+  <img src="docs/screenshots/host-passcode-menu.png" width="270" alt="The passcode menu: NEW CODE and TYPE ONE">
+  <img src="docs/screenshots/host-passcode-shown.png" width="270" alt="A text box reading: Players will need: JSDZRM">
+</p>
+
+- **`PLAYERS`** — the room size, **2–64**, you included. Change it as often as
+  you like before starting; it is fixed for the life of the game once you do.
+- **`JOIN CODE`** — already filled in. The screen mints one on the way in, so
+  the common case is that you read it out and never touch this row.
+  **`NEW CODE`** rerolls it — that is why the code above changes from `ZY2GX1`
+  to `JSDZRM` between the first screenshot and the third. **`TYPE ONE`** lets
+  you choose your own on the naming grid.
+- **`START`** — opens the port. There is no way past this screen without a
+  passcode; if you clear one, `START` sends you back here rather than opening
+  an unprotected world.
+
+Once you're live, the menu's **`ADDRESS`** row is what you read out. The
+address and the passcode are shown in one box because they're always said in
+one breath:
+
+<p align="center">
+  <img src="docs/screenshots/host-address.png" width="320" alt="A text box reading 192.168.1.125:7788 with CODE: JSDZRM underneath">
+</p>
+
+Everyone on the same Wi-Fi can use that address as-is. From outside your
+network, someone has to forward port **7788** to your machine — or you skip
+that entirely and use a dedicated hub on a box that already has a public
+address.
+
+> **A passcode minted in-game is not from a CSPRNG.** LÖVE ships no such
+> source, so the game stirs its own entropy pool from frame and input timings.
+> It claims 64 bits of pool, which is well past the 30 bits a six-character
+> code can carry — fine for a LAN game. A hub facing the open internet should
+> be the dedicated one below, whose codes come from `crypto.randomBytes`.
+
+### 🖥️ A dedicated hub — configured entirely through one command
+
+Lives in [`server/`](server/README.md). Node 22+, **zero dependencies**, or a
+container. Every setting is reachable from the CLI — nothing requires editing
+a file by hand.
+
+**First run** writes a config at mode `0600` and prints the passcode once:
+
+```console
+$ node server/bin/rby-mmo-hub.js init --yes --port 7788 --max 8
+Configuration written to /srv/rby-mmo/config.json (mode 0600, readable only by you).
+
+  listening on   0.0.0.0:7788
+  players        up to 8
+  join code      required (always -- there is no open-hub setting)
+  log level      info
+
+Your join code
+
+      +------------+
+      |   214FYC   |
+      +------------+
+
+  Give that to the friends you want in your world. They type it once,
+  in game, on the screen where they enter this hub's address. Anyone
+  without it is refused, in one sentence, and cannot get in.
+
+  This is the only time it is printed in full. To see it again:
+      rby-mmo-hub invite list --reveal
+```
+
+**Or choose the passcode yourself** — including the same one you use for your
+in-game LAN games, so friends only ever learn one:
+
+```console
+$ node server/bin/rby-mmo-hub.js init --yes --code gengar
+  join code      required (always -- there is no open-hub setting)
+
+Your join code, the one you chose
+
+      +------------+
+      |   GENGAR   |
+      +------------+
+```
+
+Mind the alphabet — `I`, `L`, `O` and `U` are not in it, so plenty of words
+don't survive. `--code kanto1` is refused, because `KANTO1` without the `O` is
+five characters, and it tells you so:
+
+```console
+$ node server/bin/rby-mmo-hub.js init --yes --code kanto1
+--code: that is not a passcode this hub can use.
+A passcode is 6 characters from 0123456789ABCDEFGHJKMNPQRSTVWXYZ
+-- the digits and the capital letters except I, L, O and U, which are
+left out so nothing is mistyped off a screenshot. Dashes, spaces and
+lower case are fine; they are normalised away.
+```
+
+**Everything else** is a verb. Codes are masked unless you ask, so the listing
+is safe to screen-share:
+
+```console
+$ rby-mmo-hub invite list
+ID       LABEL              CREATED           EXPIRES  USES  STATUS  CODE
+primary  Primary join code  2026-08-03 17:48  never    0     active  ******
+
+Codes are masked. --reveal prints them in full.
+```
+
+| Want to | Run |
+| --- | --- |
+| run it | `rby-mmo-hub start`, or `docker compose up -d` |
+| hand out a second code | `rby-mmo-hub invite --label ash --expires 24h --uses 1` |
+| take one back | `rby-mmo-hub revoke <id>` |
+| change any setting | `rby-mmo-hub config set maxPlayers 8` |
+| see where a value came from | `rby-mmo-hub status` |
+| throw somebody out | `rby-mmo-hub ban 203.0.113.7` |
+| check it's actually reachable | `rby-mmo-hub doctor` |
+
+`doctor` is the one to run before you tell anyone the address — it checks the
+configuration, then says plainly whether friends outside your network will
+reach the port at all:
+
+```console
+$ rby-mmo-hub doctor
+Configuration
+  [ ok ] a join code is required; 1 usable of 1
+  [ ok ] wrong passcodes are throttled: 3 free per address per 10m, backing
+         off from 2s to 5m; 100 hub-wide in 1m shuts new joins for 1m
+  [ ok ] port 7788 is in the unprivileged range
+  [warn] limits.perIpConnections (4) is not below maxPlayers (4), so one
+         address could take every seat
+
+Reachability
+  Addresses on this machine:
+    en0     198.51.100.24    public address
+    en0     192.168.1.125    private network
+    lo0     127.0.0.1        loopback (this machine only)
+```
+
+Credentials, bans and the allowlist reload on `SIGHUP`, so revoking a leaked
+passcode doesn't interrupt the people already playing. The full config table —
+every key, default and bound, including the seven that tune the wrong-passcode
+throttle — is in [server/README.md](server/README.md).
+
+### 🚪 Joining — identical either way
+
+Address first, then passcode, both **before anything is dialled**. An IP or a
+hostname both work, and leaving the port off fills in `7788`:
+
+<p align="center">
+  <img src="docs/screenshots/join-address.png" width="270" alt="The JOIN grid with MYPC.LAN:7788 typed, on the digits page">
+  <img src="docs/screenshots/join-passcode.png" width="270" alt="The JOIN CODE grid mid-entry, showing B ERASES">
+  <img src="docs/screenshots/join-passcode-refused.png" width="270" alt="A text box reading: That join code was not accepted.">
+</p>
+
+**SELECT** flips the keyboard between letters and digits — the vanilla one has
+no numbers at all, which is why this mod ships its own. Dashes, spaces and
+lower case are normalised away, so a passcode pasted out of a chat message
+works exactly as typed.
+
+Get it wrong and the hub says so in one sentence and leaves you outside; the
+grid comes back with what you typed still on it, so a single wrong character
+costs one press to fix. **`B` erases, and on an empty line it backs out** —
+the screen says which, depending on what you've typed, because there is
+otherwise no way to tell.
+
+Both codes are stored **per hub address**, so playing on two of them means
+typing neither of them twice.
+
+---
+
 ## 🧩 Plays nice with other mods
 
 Tested against
@@ -388,6 +584,13 @@ you:
   where the camera stops scrolling; that explanation doesn't survive a look
   at the engine's `Camera:follow`, which does no clamping at all. So the
   offset is real and reproducible, and the cause is still open.
+- **The address field shows only thirteen characters.** You can type up to 32
+  and the whole thing is used — but the engine's naming screen draws a fixed
+  thirteen cells, so `127.0.0.1:7788` renders as `127.0.0.1:778` with the last
+  character off the right edge. The value is correct; you just can't see the
+  tail of it while you type. Hostnames of thirteen characters or fewer
+  (`MYPC.LAN:7788`) fit exactly. The fix is in the engine's `NamingScreen`,
+  which is upstream of this mod.
 - **Only ever tested over loopback**, two instances on one desk. Real latency
   and packet loss are still an unknown.
 - **No accounts, and no encryption anywhere.** A passcode is required both

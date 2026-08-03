@@ -93,3 +93,17 @@ docs/screenshots/chat-log.png
 docs/screenshots/interact-menu.png
 docs/screenshots/link-battle.png
 docs/screenshots/trainer-card.png
+#
+# The in-game hosting and joining flows, captured by
+# tests/drivers/run-mmo-e2e.sh. Four of these are pure UI -- a list menu and
+# two naming grids, drawn by the engine's widgets and this mod, with no map
+# under them -- and the other three are text boxes over the overworld, which
+# is the same composite overworld-presence.png above already is. Either way
+# the rule is the file's, not the linter's, so each one is listed by name.
+docs/screenshots/host-setup.png
+docs/screenshots/host-passcode-menu.png
+docs/screenshots/host-passcode-shown.png
+docs/screenshots/host-address.png
+docs/screenshots/join-address.png
+docs/screenshots/join-passcode.png
+docs/screenshots/join-passcode-refused.png

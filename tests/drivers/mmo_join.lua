@@ -125,7 +125,59 @@ return function(game)
         tostring(H.top(game) and (H.top(game).title or "?")))
   end
   check(naming ~= nil, "the address screen opened")
-  U.shot(game, SHOT_DIR .. "/join-address.png")
+
+  -- Type the address out on the grid, and then take it back off again.
+  --
+  -- Two things come out of this that nothing else covers. The first is the
+  -- claim src/Ui.lua makes for this screen and never checks: that an address
+  -- is *typeable* at all. The vanilla grid has no digits, so "127.0.0.1:7788"
+  -- is untypeable on it; the mod's digits page is what makes this screen
+  -- answerable by somebody whose friend read them a number, and the only
+  -- proof of that is putting one in through the d-pad. The second is B as an
+  -- eraser, which is the other half of the rule the screen prints under
+  -- itself ("B ERASES" with a character on the line, "B GOES BACK" without).
+  --
+  -- Then it is cleared, deliberately, so what follows is unchanged: START on
+  -- an *empty* line is what submits the stored default, and that is the path
+  -- a player who was never told an address takes. Erasing to empty rather
+  -- than submitting the typed copy keeps that path the one this run drives.
+  if naming and type(naming.default) == "string" and naming.default ~= "" then
+    local typed = H.typeOnGrid(game, naming.default)
+    check(typed, "the address grid takes a full address: " .. naming.default)
+    check(typed and table.concat(naming.glyphs) == naming.default,
+          "and the line reads back what was typed: "
+            .. table.concat(naming.glyphs))
+    -- What is on the line is not always what is on the screen. NamingScreen
+    -- draws the field from x=56 in 8px cells, so 13 of them fit across a
+    -- 160px screen while this screen's maxLen is 32 -- "127.0.0.1:7788" is
+    -- 14 characters and loses its last one off the right edge. Logged rather
+    -- than asserted: it is a drawing bug in a screen this file does not own,
+    -- and turning it into a failure here would stop the run reporting on the
+    -- things it does own.
+    local VISIBLE_CELLS = 13
+    if #naming.default > VISIBLE_CELLS then
+      log(("WARN the address field draws %d cells but holds %d characters, so "
+        .. "%q shows as %q"):format(VISIBLE_CELLS, #naming.default,
+        naming.default, naming.default:sub(1, VISIBLE_CELLS)))
+    end
+    check(H.clearGrid(game, naming), "B erases it back to an empty line")
+
+    -- The other thing this field takes, and the one that fits: a hostname.
+    -- src/Ui.lua sizes the field for "mybox.example.com:7788" precisely
+    -- because a name is what somebody on a LAN reads out, and no other test
+    -- puts a letter on this grid. It is typed, photographed and erased -- the
+    -- run still dials the default below, untouched.
+    local HOSTNAME = "MYPC.LAN:7788"
+    check(H.typeOnGrid(game, HOSTNAME) and
+          table.concat(naming.glyphs) == HOSTNAME,
+          "and a hostname, across both pages, just as well: " .. HOSTNAME)
+    U.shot(game, SHOT_DIR .. "/join-address.png")
+    check(H.clearGrid(game, naming), "erased again, so START submits the default")
+  else
+    check(false, "the address screen carries a default to dial")
+    U.shot(game, SHOT_DIR .. "/join-address.png")
+  end
+
   U.tap(game, "start")
   U.wait(60)
 
@@ -158,6 +210,19 @@ return function(game)
           "and nothing is dialled until the code is answered")
     U.shot(game, SHOT_DIR .. "/join-code-asked.png")
 
+    -- The same screen with something on its line, which is what it looks like
+    -- to somebody halfway through reading a code off a phone -- and the one
+    -- frame where the hint under the grid reads B ERASES rather than B GOES
+    -- BACK. Erased again straight after, so the entry below still starts from
+    -- an empty line the way a real attempt does.
+    local codeScreen = H.codeGrid(game)
+    if codeScreen then
+      check(H.typeOnGrid(game, joinCode:sub(1, 3)),
+            "the code grid takes characters mid-entry")
+      U.shot(game, SHOT_DIR .. "/join-code-typing.png")
+      check(H.clearGrid(game, codeScreen), "and B erases them again")
+    end
+
     local wrong = H.wrongCode(joinCode)
     check(H.enterJoinCode(game, wrong),
           "a wrong code can be typed on the grid")
@@ -167,7 +232,9 @@ return function(game)
     end, 60, "the refusal")
     check(refused, "a wrong join code is refused, and says so on screen")
     check(exports.isConnected() == false, "and leaves us outside")
-    U.shot(game, SHOT_DIR .. "/join-code-refused.png")
+    -- printed: the refusal's whole value as a picture is the sentence the
+    -- hub sent, and the frame after the box opens carries three words of it
+    H.shotPrinted(game, SHOT_DIR .. "/join-code-refused.png")
 
     check(H.enterJoinCode(game, joinCode),
           "and the host's code can be typed on the same grid")
