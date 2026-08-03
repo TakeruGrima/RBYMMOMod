@@ -33,6 +33,8 @@ local SCREEN = {
   COMPOSE  = "RbyMmoCompose",
   PICK     = "RbyMmoPick",
   HOSTSET  = "RbyMmoHostSetup",
+  HOSTSIZE = "RbyMmoHostSize",
+  HOSTCODE = "RbyMmoHostCode",
   HOSTINFO = "RbyMmoHostInfo",
   JOINADDR = "RbyMmoJoinAddress",
   JOINCODE = "RbyMmoJoinCode",
@@ -233,6 +235,17 @@ function M:install()
   -- A join code is half digits, so the JOIN CODE option row would be
   -- untypeable there. Claiming that title too is the whole fix.
   ownTitle("JOIN CODE?")
+
+  -- The dashed form is 19 characters and a text box is 18 columns, so a code
+  -- is shown two groups to a line rather than left to wrap wherever the box
+  -- runs out: a code broken after 18 characters reads as a typo. Every
+  -- screen that shows one goes through here, so the host reading it out and
+  -- the guest typing it in are looking at the same thing.
+  local function codeLines(code)
+    local shown = Wire.formatCode(code) or ""
+    local half = Config.CODE_GROUP_LEN * 2 + 1        -- "ABCD-EFGH"
+    return shown:sub(1, half) .. "\n" .. shown:sub(half + 2)
+  end
 
   screens:register(SCREEN.TEXT, { new = function(game, opts)
     opts = opts or {}
@@ -443,7 +456,91 @@ function M:install()
   -- choice like this anyway.
   local SIZES = { 2, 4, 8, 16, 32, 64 }
 
+  -- What the game will be before it starts: how many people, and whether
+  -- strangers can walk in.
+  --
+  -- Hosting used to start the moment a size was chosen, which left the join
+  -- code with nowhere to live but the options pane -- and a lock nobody
+  -- finds is not a lock. Both settings sit on one screen with START under
+  -- them, so turning the code on is one obvious step and leaving it off is
+  -- still the default it was.
   screens:register(SCREEN.HOSTSET, { new = function(game)
+    local client = ctx.client
+    local code = client:hostJoinCode()
+    local items = {
+      { label = "PLAYERS", right = tostring(client:maxPlayers()), key = "players" },
+      -- ON rather than the code itself: a list row is one line and the
+      -- dashed form is 19 characters wide. HOSTCODE is where it is read.
+      { label = "JOIN CODE", right = code and "ON" or "OFF", key = "code" },
+      { label = "START", key = "go" },
+    }
+    return mod.ui.ListMenu.new(game, "HOST", items, {
+      onChoose = function(item, menu)
+        menu:close()
+        if item.key == "players" then
+          mod.ui.push(game, SCREEN.HOSTSIZE)
+        elseif item.key == "code" then
+          mod.ui.push(game, SCREEN.HOSTCODE)
+        elseif client:host(game) then
+          -- and on failure client:host has already said why, in the same
+          -- box every other refusal uses
+          mod.ui.push(game, SCREEN.HOSTINFO)
+        end
+      end,
+      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
+    })
+  end })
+
+  -- Locked, or open to anyone who can reach the port.
+  --
+  -- Generating is offered first because inventing sixteen characters on a
+  -- d-pad is the reason a host would skip the code altogether; typing one is
+  -- there for a host who wants a code they chose.
+  screens:register(SCREEN.HOSTCODE, { new = function(game)
+    local client = ctx.client
+    local items = {
+      {
+        label = "NEW CODE",
+        onSelect = function()
+          local code = client:setHostJoinCode(client:newJoinCode())
+          if not code then
+            -- newJoinCode already warned with a remediation; the player gets
+            -- the short version and the other two rows still work
+            return mod.ui.push(game, SCREEN.TEXT, {
+              text = "Couldn't make a\ncode. Type one\ninstead.",
+              onDone = function() mod.ui.push(game, SCREEN.HOSTCODE) end,
+            })
+          end
+          mod.ui.push(game, SCREEN.TEXT, {
+            text = ("Players will need:\n%s"):format(codeLines(code)),
+            onDone = function() mod.ui.push(game, SCREEN.HOSTSET) end,
+          })
+        end,
+      },
+      {
+        label = "TYPE ONE",
+        onSelect = function()
+          mod.ui.push(game, SCREEN.JOINCODE, { host = true })
+        end,
+      },
+      {
+        label = "NO CODE",
+        onSelect = function()
+          client:setHostJoinCode(nil)
+          mod.ui.push(game, SCREEN.TEXT, {
+            text = "Anyone who can\nreach you can join.",
+            onDone = function() mod.ui.push(game, SCREEN.HOSTSET) end,
+          })
+        end,
+      },
+    }
+    return mod.ui.Menu.new(game, items, {
+      tx = 8, ty = 0, tw = 12,
+      onCancel = function() mod.ui.push(game, SCREEN.HOSTSET) end,
+    })
+  end })
+
+  screens:register(SCREEN.HOSTSIZE, { new = function(game)
     local client = ctx.client
     local current = client:maxPlayers()
 
@@ -465,16 +562,14 @@ function M:install()
         label = ("%d PLAYERS"):format(n),
         onSelect = function()
           client:setMaxPlayers(n)
-          if client:host(game) then
-            mod.ui.push(game, SCREEN.HOSTINFO)
-          end
+          mod.ui.push(game, SCREEN.HOSTSET)
         end,
       }
     end
 
     local menu = mod.ui.Menu.new(game, items, {
       tx = 8, ty = 0, tw = 12, maxVisible = 8,
-      onCancel = function() mod.ui.push(game, SCREEN.MAIN) end,
+      onCancel = function() mod.ui.push(game, SCREEN.HOSTSET) end,
     })
     -- open on what is already configured, so confirming is one button
     menu.index = start
@@ -488,14 +583,21 @@ function M:install()
       return mod.ui.TextBox.new(game, "You aren't hosting.")
     end
     local address = client:hostAddress()
+    -- The code belongs with the address, because they are read out in the
+    -- same breath: a friend needs both to get in, and a host who set one and
+    -- cannot find it again has a game nobody can join.
+    local code = client:hostJoinCode()
+    local codeText = code and ("\nCODE:\n" .. codeLines(code)) or ""
     -- Net.lanIP() answers nil when it cannot work out which interface faces
     -- the network, and "?:7788" tells a player nothing they can act on.
     -- Name the port instead -- it is the half they need to forward anyway.
     if type(address) ~= "string" or address:find("^%?") then
       return mod.ui.TextBox.new(game, ("Hosting on port %d.\nYour IP is "
-        .. "hidden -- check\nyour network settings."):format(Config.DEFAULT_PORT))
+        .. "hidden -- check\nyour network settings.%s")
+        :format(Config.DEFAULT_PORT, codeText))
     end
-    return mod.ui.TextBox.new(game, ("Tell your friends:\n%s"):format(address))
+    return mod.ui.TextBox.new(game,
+      ("Tell your friends:\n%s%s"):format(address, codeText))
   end })
 
   -- ------- joining: type an address, then connect
@@ -516,20 +618,13 @@ function M:install()
 
   -- ------- joining: the code that gets you past the door
 
-  -- The dashed form is 19 characters and a text box is 18 columns, so the
-  -- code is shown two groups to a line rather than left to wrap wherever the
-  -- box runs out: a code broken after 18 characters reads as a typo.
-  local function codeLines(code)
-    local shown = Wire.formatCode(code) or ""
-    local half = Config.CODE_GROUP_LEN * 2 + 1        -- "ABCD-EFGH"
-    return shown:sub(1, half) .. "\n" .. shown:sub(half + 2)
-  end
-
-  -- Reached two ways: deliberately, from the MMO menu, and automatically
-  -- when a hub asks for a code this copy does not have. opts.connect is the
-  -- only difference between them -- it says whether a connection is waiting
-  -- on the answer, in which case saving the code dials again rather than
-  -- leaving the player to walk back through the menu.
+  -- Reached three ways: deliberately, from the MMO menu; automatically, when
+  -- a hub asks for a code this copy does not have; and from the host setup,
+  -- to choose the code this copy will ask *for*. One grid either way -- the
+  -- glyphs and the length are the same question -- and opts says where the
+  -- answer goes: opts.host stores it as this copy's own code, opts.connect
+  -- says a connection is waiting on it and dials again rather than leaving
+  -- the player to walk back through the menu.
   screens:register(SCREEN.JOINCODE, { new = function(game, opts)
     opts = opts or {}
     local client = ctx.client
@@ -553,6 +648,13 @@ function M:install()
             text = ("That isn't a join\ncode. It's %d\nletters and digits."):
               format(Config.CODE_LEN),
             onDone = function() mod.ui.push(game, SCREEN.JOINCODE, opts) end,
+          })
+        end
+        if opts.host then
+          client:setHostJoinCode(code)
+          return mod.ui.push(game, SCREEN.TEXT, {
+            text = ("Players will need:\n%s"):format(codeLines(code)),
+            onDone = function() mod.ui.push(game, SCREEN.HOSTSET) end,
           })
         end
         client:setJoinCode(address, code)

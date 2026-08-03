@@ -57,6 +57,7 @@ const DEFAULTS = {
     connectPerMinute: 60,
     handshakeTimeoutMs: 10000,
     idleTimeoutMs: 45000,
+    partialLineTimeoutMs: 10000,
     maxPending: 8,
     maxWriteBufferBytes: 262144,
     chatIntervalMs: 500,
@@ -88,6 +89,9 @@ const LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'silent'];
  *   idleTimeoutMs          5000 .. 600000    the client has no auto-reconnect
  *                                            (src/Transport.lua:163), so a
  *                                            short idle timeout is a bug
+ *   partialLineTimeoutMs   1000 .. 300000    limits.js's own range, adopted
+ *                                            rather than re-derived -- see
+ *                                            the note below
  *   maxPending                1 .. 256       ungreeted sockets, §3.6
  *   maxWriteBufferBytes   16384 .. 16777216  16 KiB holds a roster;
  *                                            16 MiB x maxPlayers is the worst
@@ -97,6 +101,13 @@ const LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'silent'];
  *                                            expires mid-game; a week is the
  *                                            longest a stale mapping should
  *                                            outlive the process
+ *
+ * Every range above is a subset of the matching range in limits.js:55-64, so
+ * a value this module accepts is never re-clamped downstream -- one wall
+ * sits inside the other rather than beside it. partialLineTimeoutMs is the
+ * one knob taken verbatim from limits.js instead of tightened: that module
+ * owns the slowloris sweep and is the authority on what its own budget
+ * means, and two clamps that disagree would be worse than one loose one.
  */
 const BOUNDS = {
   'listen.port': [1, 65535],
@@ -106,6 +117,7 @@ const BOUNDS = {
   'limits.connectPerMinute': [1, 6000],
   'limits.handshakeTimeoutMs': [1000, 120000],
   'limits.idleTimeoutMs': [5000, 600000],
+  'limits.partialLineTimeoutMs': [1000, 300000],
   'limits.maxPending': [1, 256],
   'limits.maxWriteBufferBytes': [16384, 16777216],
   'limits.chatIntervalMs': [0, 60000],
@@ -135,6 +147,7 @@ const ENV_MAP = {
   RBY_MMO_CONNECT_PER_MINUTE: 'limits.connectPerMinute',
   RBY_MMO_HANDSHAKE_TIMEOUT_MS: 'limits.handshakeTimeoutMs',
   RBY_MMO_IDLE_TIMEOUT_MS: 'limits.idleTimeoutMs',
+  RBY_MMO_PARTIAL_LINE_TIMEOUT_MS: 'limits.partialLineTimeoutMs',
   RBY_MMO_MAX_PENDING: 'limits.maxPending',
   RBY_MMO_MAX_WRITE_BUFFER_BYTES: 'limits.maxWriteBufferBytes',
   RBY_MMO_CHAT_INTERVAL_MS: 'limits.chatIntervalMs',
@@ -161,6 +174,7 @@ const FLAG_MAP = {
   connectPerMinute: 'limits.connectPerMinute',
   handshakeTimeout: 'limits.handshakeTimeoutMs',
   idleTimeout: 'limits.idleTimeoutMs',
+  partialLineTimeout: 'limits.partialLineTimeoutMs',
   maxPending: 'limits.maxPending',
   maxWriteBuffer: 'limits.maxWriteBufferBytes',
   chatInterval: 'limits.chatIntervalMs',

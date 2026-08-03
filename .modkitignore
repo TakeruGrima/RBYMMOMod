@@ -15,11 +15,38 @@ tests/drivers/mmo_host.lua
 tests/drivers/mmo_join.lua
 tests/drivers/run-mmo-e2e.sh
 
-# Working notes for whoever picks this up next; not mod content.
+# Working notes for whoever picks this up next; not mod content. The two
+# machine-readable ones describe how coding agents are driven in this
+# checkout -- they configure a tool, not a game, and a player who unpacks the
+# archive has no use for either.
 CLAUDE.md
+AGENTS_CONFIG.yml
+skills-lock.json
 
 # server/ is deliberately NOT ignored: hub.js is plain node with no engine
 # imports, and someone who installs the package should be able to host.
+#
+# That reasoning now covers more files, and it still holds for all of them.
+# server/bin/, server/lib/, server/package.json, server/Dockerfile and
+# server/compose.yml stay in the archive for exactly the reason hub.js does:
+# the person who unpacks this should be able to host a world without going
+# back to GitHub for the missing half. `docker compose up` is only a complete
+# answer if the compose file, the Dockerfile it builds and the package.json
+# they describe all travel together -- ignoring any one of them would ship a
+# compose file that cannot build. They are inert to the game client, which
+# never opens anything under server/, and they carry no ROM-derived bytes, so
+# neither `lint` nor the fatal-warning `pack` gate has anything to say about
+# them.
+#
+# server/.dockerignore needs no entry and must not get one: modkit skips every
+# dot-prefixed file when it walks the tree (tools/modkit.py:174-176), so it
+# cannot be packed in the first place. The same is true of the .env and
+# .github entries below, which are kept only as documentation of intent.
+#
+# server/hub.test.js is likewise left shipping, unchanged from before: it is
+# self-contained node that drives the hub over real sockets, so it is a way a
+# host can check their own copy works. It requires nothing from the engine,
+# which is what earns `tests/rby_mmo_test.lua` its entry above and not this.
 
 # tools/play.sh and tools/env.sh assume the engine checkout layout, and
 # .env is machine-specific -- neither belongs in a distributed archive.
@@ -29,8 +56,12 @@ tools/play.sh
 .env.example
 
 # Repo furniture, not mod content: the release pipeline and its notes.
+# Implementation plans are working notes for contributors, on the same footing
+# as CLAUDE.md above; each new one belongs on this list by name, because a
+# bare docs/plans/ line would do nothing.
 .github/workflows/release.yml
 docs/plans/in-game-hosting.md
+docs/plans/self-hosting-server-app.md
 
 # Screenshots of a running game are composited from tiles, sprites and font
 # glyphs decoded from the player's own ROM. They illustrate a GitHub page

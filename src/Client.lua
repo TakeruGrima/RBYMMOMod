@@ -161,6 +161,76 @@ function M.setJoinCode(a, b, c)
   return code
 end
 
+-- The code this copy asks for when it hosts.
+--
+-- One key, not one per address: there is only ever one game this copy is
+-- running. Absent means off, and off is the default -- two people on the
+-- same couch should not have to type sixteen characters at each other,
+-- while a hub left on the internet should (plan section 3.9).
+function M.hostJoinCode()
+  return Wire.code(mod.save:get("hostcode"))
+end
+
+-- nil or "" turns it off; anything else is stored normalised or refused.
+-- Refused, never stored half-formed: a host who believes their game is
+-- locked and finds it open is the failure this whole feature exists to
+-- prevent.
+function M.setHostJoinCode(a, b)
+  local value = arg1(a, b)
+  if value == nil or value == "" then
+    mod.save:set("hostcode", nil)
+    return nil
+  end
+  local code = Wire.code(value)
+  if not code then return nil end
+  mod.save:set("hostcode", code)
+  return code
+end
+
+-- A fresh code for the host to read out, so nobody has to invent one on a
+-- d-pad.
+--
+-- **This is not a cryptographic random source**, and says so for the same
+-- reason Hub:newNonce does: there is none reachable from a mod that declares
+-- only `network`. LOVE ships no randomBytes, love.math.random is a seeded
+-- xorshift, and /dev/urandom would mean a filesystem permission this mod
+-- does not have. What this does instead is hash the least predictable sample
+-- this process can take -- live heap, where a fresh table landed, wall and
+-- CPU clock, and a per-call counter so two codes made in the same
+-- millisecond still differ -- and fold the digest into the alphabet. 256 is
+-- exactly 8 * 32, so the fold is even and no character is likelier than
+-- another.
+--
+-- What that buys: a code that is not derivable from anything on the wire and
+-- never repeats within a run. What it does not buy: a full 80 bits against
+-- someone who can pin down when this host started and what its heap looked
+-- like. A host who wants more than that types their own.
+local codeSerial = 0
+
+function M.newJoinCode()
+  codeSerial = codeSerial + 1
+  local digest = Sha256.bytes(table.concat({
+    tostring(collectgarbage("count")),
+    tostring({}),
+    tostring(os and os.time and os.time() or 0),
+    tostring(os and os.clock and os.clock() or 0),
+    tostring(codeSerial),
+  }, "|"))
+  -- Sha256 answers nil plus a reason rather than raising; the argument above
+  -- is a string, so this guards a future edit rather than a reachable path
+  if type(digest) ~= "string" or #digest < Config.CODE_LEN then
+    mod.log:warn("could not generate a join code -- type one instead from "
+      .. "START > MMO > HOST GAME > JOIN CODE")
+    return nil
+  end
+  local alphabet, out = Config.CODE_ALPHABET, {}
+  for i = 1, Config.CODE_LEN do
+    local index = digest:byte(i) % #alphabet
+    out[i] = alphabet:sub(index + 1, index + 1)
+  end
+  return table.concat(out)
+end
+
 -- Put the player in front of the code screen.
 --
 -- Reached when a hub asks for a code we do not have, and when it refuses the
@@ -331,7 +401,12 @@ function M.host(a, b)
   end
 
   local limit = M.maxPlayers()
-  local ok, err = server:start(Config.DEFAULT_PORT, limit)
+  -- The code goes in at start, so the hub is locked from its first accept
+  -- rather than from whenever the host got round to it. HostServer refuses
+  -- to open the port at all on a code it cannot use, which is the right
+  -- answer -- a game the host believes is locked and is not would be worse
+  -- than one that did not start -- so its sentence is shown like any other.
+  local ok, err = server:start(Config.DEFAULT_PORT, limit, M.hostJoinCode())
   if not ok then
     ui:say(tostring(err or "Couldn't start hosting."))
     return false

@@ -38,6 +38,7 @@ const process = require('node:process');
 
 const { Relay, parseLine } = require('./relay.js');
 const { Limits, normalizeIp } = require('./limits.js');
+const { save: saveConfig } = require('./config.js');
 const auth = require('./auth.js');
 const { createLog, safe } = require('./log.js');
 
@@ -61,6 +62,12 @@ const FORCE_CLOSE_MS = 1000;
 // arriving, are both real and neither should be able to make the backstop
 // fire before the checks that produce a sentence do.
 const CONNECTION_SLACK = 8;
+
+// How long a run of successful logins is allowed to accumulate before the
+// use counts reach the disk. Long enough that a party of eight arriving at
+// once costs one write; short enough that a kill -9 loses at most a second
+// of counting.
+const CREDENTIAL_SAVE_INTERVAL_MS = 1000;
 
 // A rejection that is a flood signal costs the sender nothing but the
 // SYN. A rejection an honest player could plausibly hit gets a sentence,
@@ -92,8 +99,20 @@ function refusalFor(reason, limits) {
  * Null when auth is off, rather than a port that admits everyone -- with no
  * port at all the exchange is byte-identical to the one hub.js has always
  * spoken, so a LAN game gains no round trip it did not ask for.
+ *
+ * This is also the only place in the program that learns an authentication
+ * actually succeeded, so it is where a use count is charged. `invite --uses
+ * 1` has to mean one use: a limit that is offered and quietly does nothing is
+ * worse than one that was never offered, because the host stops watching the
+ * door on the strength of it.
+ *
+ * The count is charged against the live credential object, which is the same
+ * one auth.activeCredentials() filters on the next connection -- so a
+ * credential that has just spent its last use is already inactive by the time
+ * the next peer answers a challenge, with no separate re-check to keep in
+ * step. Persistence is somebody else's tick; see noteCredentialUse().
  */
-function authPort(config) {
+function authPort(config, onUse) {
   const settings = (config && config.auth) || {};
   if (!settings.required) return null;
   const credentials = Array.isArray(settings.credentials)
@@ -103,7 +122,16 @@ function authPort(config) {
       return auth.newNonce();
     },
     verify(nonce, response) {
-      return auth.verify(nonce, response, credentials);
+      const verdict = auth.verify(nonce, response, credentials);
+      if (!verdict || !verdict.ok) return verdict;
+
+      const used = credentials.find(
+        (credential) => credential && credential.id === verdict.credentialId);
+      if (used) {
+        used.uses = (Number(used.uses) || 0) + 1;
+        onUse(used);
+      }
+      return verdict;
     },
   };
 }
@@ -150,7 +178,7 @@ function start(options = {}) {
     maxPlayers: config.maxPlayers,
     chatIntervalMs: config.limits && config.limits.chatIntervalMs,
     protocol: config.protocol,
-    auth: authPort(config),
+    auth: authPort(config, noteCredentialUse),
     log,
   });
 
@@ -168,6 +196,60 @@ function start(options = {}) {
   const startedAt = Date.now();
   let closePromise = null;
   let stopping = false;
+  let creditTimer = null;
+  let creditsDirty = false;
+
+  // -------------------------------------------------------- use counting
+
+  /*
+   * A credential was just spent. The count is already correct in memory --
+   * that happened in authPort, on the connection's own path -- and all that
+   * is left is getting it onto the disk.
+   *
+   * Deferred and coalesced, because config.save() is a synchronous
+   * write-and-rename and a player waiting on a challenge must never be
+   * waiting on a filesystem. A party of eight arriving together costs one
+   * write, and the timer is unref'd so a use count can never be the reason
+   * the process stays up. close() flushes, so an orderly shutdown loses
+   * nothing.
+   *
+   * **While it runs, the hub is the writer of record for `uses`.** A
+   * concurrent `rby-mmo-hub invite` reads the file, adds a credential and
+   * writes the whole thing back, so it can overwrite counts the hub charged
+   * in the seconds before -- the losing direction is always *undercounting*,
+   * never admitting on a code that is spent or revoked, because the CLI's
+   * copy of a revoked credential is still revoked. That is the right trade
+   * against locking the file on the hot path; a host who wants an exact
+   * count stops the hub first.
+   */
+  function noteCredentialUse() {
+    // No file, nothing to persist to. This is the hub.js shim's world: no
+    // config, no credentials, and nothing that outlives the process.
+    if (!configPath) return;
+    creditsDirty = true;
+    if (creditTimer) return;
+    creditTimer = setTimeout(flushCredentials, CREDENTIAL_SAVE_INTERVAL_MS);
+    creditTimer.unref();
+  }
+
+  function flushCredentials() {
+    if (creditTimer) {
+      clearTimeout(creditTimer);
+      creditTimer = null;
+    }
+    if (!creditsDirty || !configPath) return;
+    creditsDirty = false;
+    try {
+      saveConfig(configPath, config);
+    } catch (err) {
+      // A full disk, a read-only mount, a volume that went away. None of
+      // those are a reason to stop letting friends in -- the in-memory count
+      // is still authoritative for this run, so the limit still holds; it
+      // just will not survive a restart.
+      log.error(`could not record credential use in ${safe(configPath)}: ` +
+        `${safe(err.message)}`);
+    }
+  }
 
   // ------------------------------------------------------------ refusals
 
@@ -325,6 +407,9 @@ function start(options = {}) {
     if (closePromise) return closePromise;
     clearInterval(sweeper);
     detach();
+    // Before anything else: a use charged in the last second is a use, and
+    // losing it on a clean shutdown would hand a spent invite back out.
+    flushCredentials();
 
     closePromise = new Promise((resolve) => {
       let forced = null;

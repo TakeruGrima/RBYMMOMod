@@ -4,6 +4,113 @@ All notable changes to this mod are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 here must match `manifest.version`.
 
+## [0.2.0] - 2026-08-02
+
+Hosting software for the standalone hub, and a join code that keeps strangers
+out of it. **The protocol moved from 1 to 2, so this mod and its hub have to
+ship together** — an older copy of the mod cannot join a 0.2.0 hub, and is
+told so in a sentence the game already renders rather than failing silently.
+
+### Added
+
+- **A hosting CLI, `server/bin/rby-mmo-hub.js`** — the one place a host
+  configures anything. `init` is a four-question wizard that writes
+  `config.json` at mode 0600 and prints a join code once; `start`, `status`,
+  `config list|get|set`, `invite`, `invite list`, `revoke`, `ban`, `unban`,
+  `allow`, `doctor` and `upnp enable|disable|status` cover the rest. Every
+  setting is reachable from a verb — nothing requires hand-editing JSON —
+  and the two that are not (`auth.credentials`, `version`) have verbs of
+  their own for a reason. Exit codes: 0 success, 1 error, 2 usage.
+- **A join code, and the handshake that proves one.** The hub sends a
+  per-connection nonce; the client answers `HMAC-SHA256(joinCode, nonce)`, so
+  the code never crosses the wire and a captured answer cannot be replayed.
+  Codes are 16 characters of a 32-symbol alphabet (80 bits) with `I L O U`
+  dropped, every one of them typeable on the mod's own naming grid. Codes are
+  a list, not a single secret: invites carry an optional expiry, a use budget
+  and a revocation, so withdrawing one does not rotate everybody's.
+- **Join-code entry in game** — `START > MMO > JOIN CODE`, or offered
+  automatically when a hub asks for one this copy does not have. Stored per
+  hub address.
+- **`src/Sha256.lua`**, a pure-Lua SHA-256 / HMAC-SHA256 with a constant-time
+  compare, written because `love.data.hash` is not available to the headless
+  suite — so the game and the suite run byte-identical code. It uses LuaJIT's
+  `bit` library when present and arithmetic peeling when it is not.
+- **The in-game hub can require a join code too** — `src/Hub.lua` issues the
+  same challenge and `HostServer:start` takes an optional code, byte-compatible
+  with the standalone hub. It is off by default, and the `HOST GAME` screen
+  does not yet offer one, so hosting from inside the game is still open on the
+  LAN exactly as it was.
+- **Docker as a first-class path.** `docker compose up` in `server/` builds a
+  `node:24-alpine` image running as UID 10001 on a read-only rootfs with all
+  capabilities dropped, persists `config.json` on a named volume at `/data`,
+  and mints a join code on the first run so an open world cannot be published
+  by forgetting a step. TCP healthcheck written against Node's own `net`; no
+  `curl` or `nc` added to the image.
+- **Configuration with one precedence order**, honoured everywhere: CLI flag >
+  `RBY_MMO_*` env var > config file > built-in default. `status` prints which
+  of the four each setting came from.
+- **Reachability reporting** in `start` and `doctor`: every interface
+  classified (loopback, private, CGNAT/overlay, public), the address to hand
+  out, or a flat statement that friends outside the network will not reach the
+  port and the three ways to fix it. No third-party network calls, ever — no
+  STUN, no "what is my IP", no port-check service.
+- **Opt-in UPnP** (`upnp enable`), off by default, leased, removed on clean
+  shutdown, and printing its full warning before a single packet: most home
+  routers accept these requests with no authentication at all.
+
+### Changed
+
+- **Protocol 1 → 2** (`server/lib/relay.js`, `src/Config.lua`), for the two
+  new message types `mmo.challenge` and `mmo.auth`. The hub's existing
+  exact-match refusal is unchanged, so a mismatched client is told which
+  version each side speaks.
+- **`PROTOCOL` moved out of `server/hub.js` into `server/lib/relay.js`**,
+  along with the whole protocol core — `hub.js` is now a thin shim over
+  `lib/server.js`. `node hub.js`, `node hub.js 9000` and
+  `RBY_MMO_MAX=8 node hub.js` behave exactly as before.
+- **`node hub.js` warns at startup** that it is unauthenticated and has no
+  per-address or connection-rate limits, and names the CLI that has both. It
+  is still the right thing for a LAN game or a quick test.
+- **Connection hardening, on by default under the CLI**: per-address
+  connection caps, a token-bucket connect-rate limit, a handshake timeout
+  separate from the idle timeout, a slowloris sweep for a peer that never
+  finishes a line, a write-backpressure ceiling, bans and an exclusive
+  allowlist. Every one of them is tunable, and the defaults are deliberately
+  generous because the client has no auto-reconnect.
+- **Log lines cannot be forged by a peer.** Every untrusted value is escaped,
+  bounded and quoted, so a trainer name carrying a newline or an ANSI escape
+  can no longer write into the host's terminal.
+- `server/README.md` rewritten around the host who is not a developer: quick
+  start, CLI reference, the full configuration table, the security posture
+  including what the join code does *not* protect, connectivity, and Docker.
+
+### Fixed
+
+- **Silent sockets could lock everyone out of the hub.** `hub.js` registered a
+  connection in its client table on accept, so the player cap counted peers
+  that had never said `hello` — four of them held a four-player hub shut for
+  45 seconds at a time. Seats are charged at `hello` now; ungreeted sockets are
+  bounded separately by `limits.maxPending` and reaped by
+  `limits.handshakeTimeoutMs`. `server/README.md` had claimed this was already
+  true; it is true now.
+- **A peer that never read grew the hub's memory without bound.** `send()`
+  discarded `socket.write()`'s backpressure signal; the queue is now judged
+  against `limits.maxWriteBufferBytes` and a peer past it is dropped.
+- **One address could take every seat.** The player cap was the only limit
+  there was.
+
+### Notes
+
+- The join code protects against scanners and anyone who merely finds the
+  port, and a passive eavesdropper can recover neither the code nor a reusable
+  answer. It does **not** encrypt anything: gameplay traffic is readable on the
+  path and an active man-in-the-middle can proxy a whole session. There is no
+  TLS because the client cannot speak it — LÖVE ships luasocket, not luasec.
+  An encrypted overlay network is the only thing that closes that gap, and
+  `server/README.md` says so in those words.
+- `affects_link` stays `false`; no link registry is touched, so two players
+  running this mod still fingerprint as vanilla.
+
 ## [0.1.0] - 2026-07-31
 
 First working version. Ships disabled (`experimental: true`) — installing it

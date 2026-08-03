@@ -120,6 +120,17 @@ happens to be the relay — you walk, chat, trade and fight like everyone else.
 Want a box that stays up 24/7 instead? There's a standalone hub, same
 protocol, and joiners can't tell the difference.
 
+### 🔑 A HUB WITH A DOOR ON IT
+The standalone hub ships as hosting software you configure entirely from one
+command — `docker compose up`, or `node server/bin/rby-mmo-hub.js init`. It
+gives a host what in-game hosting doesn't: a **join code** friends type once
+(`START → MMO → JOIN CODE`) and nobody else gets in, per-address connection
+limits, bans and an allowlist, a `doctor` that tells you who can actually
+reach your machine, and a hub that stays up when you're not playing. It is
+still not encrypted, and it says so plainly —
+[server/README.md](server/README.md) is the whole story, security posture
+included.
+
 ### 🚪 DROP OUT, KEEP PLAYING
 `LEAVE` disconnects and hands you straight back to single-player. Save,
 world, party — untouched. No "returning to title screen".
@@ -350,8 +361,10 @@ you:
   offset is real and reproducible, and the cause is still open.
 - **Only ever tested over loopback**, two instances on one desk. Real latency
   and packet loss are still an unknown.
-- **No accounts, no bans, no encryption.** Anyone who can reach the port can
-  join under any name. Host for people you know — see the security posture in
+- **No accounts, and no encryption anywhere.** Hosting from the game, anyone
+  who can reach the port can join under any name. The standalone hub adds a
+  join code, bans and an allowlist — but the traffic is still readable on the
+  path either way. Host for people you know — see the security posture in
   [server/README.md](server/README.md).
 
 ---

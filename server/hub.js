@@ -67,7 +67,14 @@ const { config, warnings } = validate({
 const log = createLog({ level: config.log.level });
 for (const warning of warnings) log.warn(warning);
 
-start({ config, log }).catch((err) => {
+start({ config, log }).then(() => {
+  // Said out loud, once, because it is not visible from anywhere else: this
+  // front door is open by design, and a host who put it on a public box
+  // deserves to learn that from the hub rather than from a stranger.
+  log.warn('This entry point is unauthenticated and has no per-address or ' +
+    'connection-rate limits; run bin/rby-mmo-hub.js for a hub with a join ' +
+    'code and the limits turned on.');
+}).catch((err) => {
   log.error(`hub failed to start: ${err.message}`);
   process.exit(1);
 });
