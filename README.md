@@ -581,8 +581,13 @@ you:
 - **No NAT traversal.** Hosting from the game means your friends have to
   reach *you*. LAN is effortless; over the internet somebody forwards 7788,
   or you all use a standalone hub on a box with a public address.
-- **No host migration.** Host leaves → the game ends for everyone. They get
-  told, rather than left staring at a frozen world.
+- **No host migration — when a player is the host.** Hosting from the game
+  means the relay is running *inside* that copy of the game, so if the host
+  quits, the game ends for everyone. They get told, rather than left staring
+  at a frozen world. Nobody else can pick it up.
+  **This does not apply to a dedicated hub**, where nobody is the host: a
+  player leaving is just a player leaving, and everyone else carries on. If
+  that matters to your group, that alone is a reason to run one.
 - **Nameplates sit about a tile low.** You can see it in the shots above —
   the plate lands across the character's chest rather than over their head.
   This was previously written up here as drift at the edge of small maps,
