@@ -1451,4 +1451,308 @@ eq(Client.joinAddress(), "192.168.1.7:7788", "leaving the previous one intact")
 
 eq(Client.isHosting(), false, "a fresh client is not hosting")
 
+-- ------------------------------------------------------------------
+-- 8. Trading, and the one invariant that matters
+-- ------------------------------------------------------------------
+--
+-- Either both sides of a trade apply it or neither does.  Nothing else in
+-- this suite is worth as much: the failure mode is silent, permanent, and
+-- costs a player a Pokemon.
+--
+-- It is driven end to end -- two Sessions instances, the real Hub between
+-- them, and the engine's own Protocol.TradeSession doing the trading -- so
+-- the thing under test is the message ordering a real pair of clients sees.
+-- pump() is deliberately shaped like src/Client.lua's tick: every message
+-- the hub queued is dispatched first, and only then does the session get
+-- its update.  That gap is where the duplication bug lived, so a harness
+-- that collapsed the two would not be able to see it.
+--
+-- Wrapped in a function purely for scope: the chunk above it is already
+-- close to Lua's 200-local ceiling for one function body.
+
+;(function()
+
+local Sessions = need("Sessions")
+local Data = T.fixtures.load()
+local Pokemon = require("src.pokemon.Pokemon")
+
+local warns = {}
+local function clearWarns()
+  for i = #warns, 1, -1 do warns[i] = nil end
+end
+stubMod.log.warn = function(_, fmt, ...)
+  local ok, line = pcall(string.format, fmt, ...)
+  warns[#warns + 1] = ok and line or tostring(fmt)
+end
+
+local function tradeSide(hub, name, species)
+  local side = { name = name, said = {} }
+  side.peer = fakePeer()
+  side.client = hub:accept(side.peer)
+  side.transport = {
+    send = function(_, msgType, payload)
+      local msg = {}
+      if type(payload) == "table" then
+        for k, v in pairs(payload) do msg[k] = v end
+      end
+      msg.type = msgType
+      hub:receive(side.client, msg)
+      return true
+    end,
+    isReady = function() return true end,
+  }
+  side.ui = {
+    say = function(_, text) side.said[#side.said + 1] = text end,
+    confirm = function(_, _, text, cb) side.confirmText = text; side.confirmBox = cb end,
+    pickPartyMon = function(_, _, _, cb) side.pickBox = cb end,
+    pushState = function() end,
+  }
+  side.sessions = Sessions.new(side.transport, side.ui)
+  side.game = {
+    data = Data,
+    save = {
+      party = { Pokemon.new(Data, species, 12) },
+      player = { name = name },
+      pokedex = { seen = {}, owned = {} },
+    },
+  }
+  hub:receive(side.client, { type = Wire.HELLO, proto = Config.PROTOCOL,
+                             name = name, map = "FIX_TOWN", x = 1, y = 1 })
+  return side
+end
+
+local sessionDispatch = {
+  [Wire.SESSION] = function(s, m) s.sessions:onSession(s.game, m) end,
+  [Wire.RELAY] = function(s, m) s.sessions:onRelay(m) end,
+  [Wire.SESSION_END] = function(s, m) s.sessions:onSessionEnd(m.reason) end,
+  [Wire.REQUEST] = function(s, m) s.sessions:onRequest(s.game, m) end,
+  [Wire.DECLINE] = function(s, m) s.sessions:onDecline(m) end,
+}
+
+local function pump(side, dt)
+  local batch = side.peer.outbox
+  side.peer.outbox = {}
+  for _, msg in ipairs(batch) do
+    local handler = sessionDispatch[msg.type]
+    if handler then handler(side, msg) end
+  end
+  side.sessions:update(side.game, dt or 0)
+end
+
+local function partyOf(side)
+  local names = {}
+  for _, mon in ipairs(side.game.save.party) do names[#names + 1] = mon.species end
+  return table.concat(names, ",")
+end
+
+local function answerPick(side, index)
+  local box = side.pickBox
+  side.pickBox = nil
+  box(index)
+end
+
+local function answerConfirm(side, yes)
+  local box = side.confirmBox
+  side.confirmBox = nil
+  box(yes)
+end
+
+-- Two players, paired through the hub, driven as far as both confirm boxes
+-- being open -- which is the fork every ordering below takes from.
+local function pairAtConfirm()
+  -- the hub counts its own refusals, so a scenario can say out loud whether
+  -- a message died on the way through it or after it arrived
+  local hub = Hub.new({ maxPlayers = 2 })
+  hub.dropped = 0
+  hub.onDrop = function() hub.dropped = hub.dropped + 1 end
+  local a = tradeSide(hub, "ANN", "FIXMON_B")
+  local b = tradeSide(hub, "BOB", "FIXMON_C")
+
+  a.sessions:request({ id = b.client.id, name = "BOB" }, "trade")
+  pump(b)                     -- the ask lands, and BOB says yes
+  answerConfirm(b, true)
+  pump(a); pump(b)            -- paired: both send hello
+  pump(a); pump(b)            -- hello in, party out
+  pump(a); pump(b)            -- party in, both picking
+  answerPick(a, 1); answerPick(b, 1)
+  pump(a); pump(b)            -- picks crossed, both confirming
+  return hub, a, b
+end
+
+local hubX, ann, bob = pairAtConfirm()
+check(ann.confirmBox ~= nil and bob.confirmBox ~= nil,
+      "both sides reach the confirm box")
+eq(partyOf(ann), "FIXMON_B", "ANN starts with her own POKéMON and nothing else")
+eq(partyOf(bob), "FIXMON_C", "and BOB with his")
+
+-- ------- the box does not ask twice
+--
+-- The machine sits in "confirming" from the moment this side answers until
+-- the peer's answer arrives, so a prompt driven off the stage alone re-opened
+-- the instant the player closed it -- asking them to agree to the same trade
+-- again, and putting a second confirm on the wire each time.
+
+answerConfirm(ann, true)
+pump(ann); pump(ann)
+eq(ann.confirmBox, nil, "answering the confirm box does not re-open it")
+
+-- ------- local-first: this side completes before the peer does
+
+pump(bob)                     -- BOB sees ANN's confirm; his box is still open
+answerConfirm(bob, true)      -- ...and now he completes first
+pump(bob)
+pump(ann)
+pump(bob)
+pump(ann)
+
+eq(partyOf(ann), "FIXMON_C", "peer-completes-first: ANN ends up with BOB's POKéMON")
+eq(partyOf(bob), "FIXMON_B", "and BOB with ANN's")
+eq(#ann.game.save.party, 1, "ANN's party did not grow")
+eq(#bob.game.save.party, 1, "nor did BOB's")
+eq(ann.sessions.active, nil, "and the session is closed on ANN's side")
+eq(bob.sessions.active, nil, "and on BOB's")
+
+-- ------- the other ordering, which used to decide who lost a POKéMON
+
+local hubY, ann2, bob2 = pairAtConfirm()
+answerConfirm(bob2, true)
+pump(ann2)
+answerConfirm(ann2, true)     -- ANN completes first this time
+pump(ann2)
+
+-- The rule the whole fix rests on: finishing locally is not what ends a
+-- session.  ANN has applied, and BOB's confirm is still in flight to nobody
+-- -- if she hung up here the hub would tell BOB "peer_left" and the message
+-- he needs would go down with the session.
+eq(partyOf(ann2), "FIXMON_C", "ANN has applied her half")
+check(ann2.sessions.active ~= nil,
+      "but the session outlives local completion rather than ending on it")
+eq(ann2.sessions.active.stage, "settling",
+   "waiting on the peer to say it applied too")
+
+pump(bob2)
+pump(ann2)
+pump(bob2)
+
+eq(hubY.dropped, 0, "and the hub refused nothing along the way")
+eq(partyOf(ann2), "FIXMON_C", "local-completes-first: ANN still ends up with BOB's")
+eq(partyOf(bob2), "FIXMON_B", "and BOB with ANN's")
+eq(ann2.sessions.active, nil, "with the session closed on ANN's side")
+eq(bob2.sessions.active, nil, "and on BOB's")
+
+-- ------- the regression: peer_left arriving with a confirm still unread
+--
+-- The failure this whole section exists for.  BOB finishes, applies, and his
+-- process goes away in the same breath; the hub forwards his confirm and
+-- then tells ANN "peer_left", and both land in one batch.  Dropping the
+-- session on peer_left threw away the confirm that was already sitting in
+-- its inbox, so ANN never applied: two of BOB's POKéMON in the world and
+-- none of ANN's.  Nothing errored, which is the whole signature.
+
+local hubZ, ann3, bob3 = pairAtConfirm()
+answerConfirm(ann3, true)     -- ANN's confirm goes on the wire
+pump(bob3)
+answerConfirm(bob3, true)
+pump(bob3)                    -- BOB applies his half
+eq(partyOf(bob3), "FIXMON_B", "BOB applied his half before leaving")
+
+hubZ:receive(bob3.client, { type = Wire.SESSION_LEAVE })
+pump(ann3)                    -- confirm, then peer_left, in one batch
+
+eq(partyOf(ann3), "FIXMON_C",
+   "a peer that leaves in the same batch as its confirm does not strand us")
+eq(partyOf(bob3), "FIXMON_B", "and BOB is left holding exactly one POKéMON")
+eq(#ann3.game.save.party, 1, "ANN holds exactly one too")
+eq(ann3.sessions.active, nil, "and the session is finished, not left hanging")
+
+-- neither FIXMON exists twice across the two parties, which is the invariant
+-- stated as the thing it actually protects
+local census = {}
+for _, side in ipairs({ ann3, bob3 }) do
+  for _, mon in ipairs(side.game.save.party) do
+    census[mon.species] = (census[mon.species] or 0) + 1
+  end
+end
+eq(census.FIXMON_B, 1, "exactly one of the POKéMON ANN put up")
+eq(census.FIXMON_C, 1, "and exactly one of BOB's -- neither duplicated nor lost")
+eq(hubZ.dropped, 0,
+   "and the hub refused nothing -- the message that used to vanish was "
+   .. "relayed fine and died a layer further in, which is why nobody saw it")
+
+-- ------- a peer that never acknowledges does not pin the session open
+--
+-- An older build of this mod, or one whose acknowledgement is lost with the
+-- connection, simply never sends it.  Both halves are applied by then, so
+-- the settling clock is a courtesy rather than a commitment.
+
+local _, ann7, bob7 = pairAtConfirm()
+answerConfirm(bob7, true)
+pump(ann7)
+answerConfirm(ann7, true)
+pump(ann7)
+eq(ann7.sessions.active.stage, "settling", "ANN is settling")
+bob7.peer.outbox = {}         -- BOB's half of the world goes quiet
+pump(ann7, 11)
+eq(ann7.sessions.active, nil, "an acknowledgement that never comes still ends it")
+eq(partyOf(ann7), "FIXMON_C", "with the applied trade left exactly as it was")
+
+-- ------- the timeout fails closed
+--
+-- ANN answers, BOB never does.  What must not happen is ANN keeping a copy
+-- of both: a trade that times out is a trade that did not happen, on both
+-- sides.
+
+local _, ann4, bob4 = pairAtConfirm()
+answerConfirm(ann4, true)
+pump(ann4, 30)
+check(ann4.sessions.active ~= nil, "a wait shorter than the timeout is still live")
+pump(ann4, 31)
+
+eq(ann4.sessions.active, nil, "silence past the timeout ends the session")
+eq(partyOf(ann4), "FIXMON_B", "and leaves ANN's party exactly as it started")
+eq(#ann4.game.save.party, 1, "with nothing gained")
+local timedOut = false
+for _, line in ipairs(ann4.said) do
+  if line:find("never answered") then timedOut = true end
+end
+check(timedOut, "with something on screen saying why")
+
+pump(bob4)
+eq(partyOf(bob4), "FIXMON_C", "and BOB's party exactly as it started too")
+eq(bob4.sessions.active, nil, "his session ends on the goodbye rather than hanging")
+
+-- ------- the second silent drop, given a voice
+--
+-- onRelay used to swallow a refused payload without a word, which is how the
+-- duplication above stayed invisible: src/Hub.lua counted zero drops because
+-- the message was relayed fine and died one layer further in.
+
+local _, ann5, bob5 = pairAtConfirm()
+clearWarns()
+ann5.sessions:onRelay({ from = "999999", payload = { type = "confirm" } })
+eq(#warns, 1, "a relay from someone who is not the peer is logged, not swallowed")
+check(warns[1]:find("MMO"), "and the warning names somewhere to go from")
+
+ann5.sessions:onRelay({ from = bob5.client.id, payload = "not a table" })
+ann5.sessions:onRelay({ from = "999999", payload = {} })
+eq(#warns, 1, "further drops in the same session stay quiet -- one line, not a flood")
+
+-- ...and the count starts again with the next session, so a later trade that
+-- goes wrong is not silenced by an earlier one that did
+local _, ann6 = pairAtConfirm()
+clearWarns()
+ann6.sessions:onRelay({ from = "999999", payload = {} })
+eq(#warns, 1, "a fresh session gets its own warning")
+
+-- a relay arriving with no session at all is the same story
+clearWarns()
+local orphan = Sessions.new(ann6.transport, ann6.ui)
+orphan:onRelay({ from = "1", payload = {} })
+orphan:onRelay({ from = "1", payload = {} })
+eq(#warns, 1, "a relay with no session open is logged exactly once")
+
+stubMod.log.warn = function() end
+
+end)()
+
 T.finish("rby_mmo")

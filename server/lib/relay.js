@@ -255,12 +255,30 @@ handlers['mmo.respond'] = (relay, client, msg) => {
   relay.startSession(asker, client, kind);
 };
 
+// A refused relay payload used to be four bare `return`s. Trade and battle
+// ride that path and nothing else does, so a silent refusal there is a trade
+// that half-happened: one side applied it, the other never heard. Logged once
+// per connection -- enough to name a real fault, too little for a peer sending
+// nothing but junk to flood the host's terminal.
+function noteDrop(relay, client, reason) {
+  client.relayDrops = (client.relayDrops || 0) + 1;
+  if (client.relayDrops === 1) {
+    relay.log.warn(`refused a relayed message from ${client.id}: ${reason}`);
+  }
+}
+
 handlers['mmo.relay'] = (relay, client, msg) => {
-  if (!client.ready || !client.sessionId) return;
+  if (!client.ready || !client.sessionId) {
+    return noteDrop(relay, client, 'sender is not in a session');
+  }
   const peer = relay.peerOf(client);
-  if (!peer) return;
-  if (cleanId(msg.to) !== peer.id) return;
-  if (!payloadOk(msg.payload)) return;
+  if (!peer) return noteDrop(relay, client, 'the session has no other side');
+  if (cleanId(msg.to) !== peer.id) {
+    return noteDrop(relay, client, 'addressed to someone who is not the peer');
+  }
+  if (!payloadOk(msg.payload)) {
+    return noteDrop(relay, client, 'payload is deeper or larger than the cap');
+  }
   // The hub does not read the payload. It is the engine's own link
   // vocabulary, and interpreting it here would couple this process to a
   // protocol the game already owns.

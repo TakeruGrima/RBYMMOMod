@@ -53,12 +53,15 @@ GUEST_ID="mmoguest-$$"
 HOST_LOG="/tmp/rby_mmo_host_$$.log"
 GUEST_LOG="/tmp/rby_mmo_guest_$$.log"
 # Wall-clock budget per phase (host coming up, then both sides reaching DONE).
-# 420 was the whole run's length on a good day, which left the join-code phase
-# nothing: two windows on one desktop do not get equal frame time -- the
-# occluded one is throttled hard -- so a slow guest needs headroom rather than
-# a tighter script. The run still exits the moment both sides print DONE, so
-# this costs nothing when things go well.
-TIMEOUT="${MMO_TIMEOUT:-600}"
+#
+# This is a backstop, not an expectation: a healthy run finishes in about
+# seven minutes and the loop below exits the moment both sides print DONE, so
+# a larger number costs a good run nothing. It has to clear the longest
+# barrier in mmo_util's PHASE table (host_battle_done, 540s) with room, or the
+# harness kills a run that was about to report properly and replaces a real
+# verdict with "incomplete" -- which is how the frame-budget bug stayed
+# invisible for as long as it did.
+TIMEOUT="${MMO_TIMEOUT:-900}"
 
 # ------------------------------------------------------------------ preflight
 

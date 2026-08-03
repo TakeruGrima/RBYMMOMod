@@ -16,6 +16,11 @@ local function mod_current(game)
   return { mapId = ow.map.id, x = ow.player.cellX, y = ow.player.cellY }
 end
 
+-- Muted at load, for the reason given at the top of mmo_host.lua.
+if os.getenv("MMO_SOUND") ~= "1" and love and love.audio then
+  love.audio.setVolume(0)
+end
+
 return function(game)
   local H = dofile("mods/rby_mmo/tests/drivers/mmo_util.lua")
   local U = H.U
@@ -130,10 +135,10 @@ return function(game)
   -- refusal that leaves them staring at a dead screen with no way back is
   -- worse than one that never came.
   if joinCode then
-    local asked = H.waitFor(game, function()
+    local asked = H.waitSeconds(game, function()
       local top = H.top(game)
       return top ~= nil and H.textOf(top):find("join code", 1, true) ~= nil
-    end, 60 * 30, "the game to ask for a join code")
+    end, 60, "the game to ask for a join code")
     check(asked, "a locked game asks for a code instead of letting us in")
     check(exports.isConnected() == false, "and does not admit us without one")
     U.shot(game, SHOT_DIR .. "/join-code-asked.png")
@@ -141,10 +146,10 @@ return function(game)
     local wrong = H.wrongCode(joinCode)
     check(H.enterJoinCode(game, wrong),
           "a wrong code can be typed on the grid")
-    local refused = H.waitFor(game, function()
+    local refused = H.waitSeconds(game, function()
       local top = H.top(game)
       return top ~= nil and H.textOf(top):find("not accepted", 1, true) ~= nil
-    end, 60 * 30, "the refusal")
+    end, 60, "the refusal")
     check(refused, "a wrong join code is refused, and says so on screen")
     check(exports.isConnected() == false, "and leaves us outside")
     U.shot(game, SHOT_DIR .. "/join-code-refused.png")
@@ -154,8 +159,9 @@ return function(game)
     U.wait(60)
   end
 
-  local connected = H.waitFor(game, function() return exports.isConnected() end,
-                              60 * 30, "the connection to open")
+  -- the hub has to accept, challenge and welcome, so: seconds
+  local connected = H.waitSeconds(game, function() return exports.isConnected() end,
+                                  60, "the connection to open")
   check(connected, "joined over a real socket")
   if not connected then
     -- Transport puts a player-facing sentence in the box on failure, so the
@@ -211,18 +217,18 @@ return function(game)
   H.signal("guest_baseline_taken")
   H.await(game, "host_walk_done")
 
-  local hostMoved = H.waitFor(game, function()
+  local hostMoved = H.waitSeconds(game, function()
     local row = H.avatarRow(exports)
     return row and (row.rosterX ~= fromX or row.rosterY ~= fromY)
-  end, 60 * 40, "the host to move on this side")
+  end, 45, "the host to move on this side")
   check(hostMoved, "the host's movement reaches the guest")
 
-  local hostAvatarFollowed = H.waitFor(game, function()
+  local hostAvatarFollowed = H.waitSeconds(game, function()
     local row = H.avatarRow(exports)
     return row and row.spawned
       and math.abs((row.avatarX or -99) - row.rosterX) < 0.01
       and math.abs((row.avatarY or -99) - row.rosterY) < 0.01
-  end, 60 * 40, "the host's avatar to catch up")
+  end, 45, "the host's avatar to catch up")
   check(hostAvatarFollowed, "and its avatar walks to where the host is")
   U.shot(game, SHOT_DIR .. "/join-host-walked.png")
 
@@ -233,7 +239,7 @@ return function(game)
       if line.text == "HELLO FROM HOST" then return true end
     end
     return false
-  end, 120, "the host's chat line")
+  end, 90, "the host's chat line")
   check(heardHost, "the host's chat arrived")
 
   exports.say("global", "HELLO FROM GUEST")
@@ -266,12 +272,12 @@ return function(game)
     U.teleport(game, hostRow.map, hostRow.rosterX, hostRow.rosterY + 1, "up")
     U.wait(90)
 
-    local facing = H.waitFor(game, function()
+    local facing = H.waitSeconds(game, function()
       local row = H.avatarRow(exports)
       return row and row.spawned
         and math.abs((row.avatarX or -99) - hostRow.rosterX) < 0.01
         and math.abs((row.avatarY or -99) - hostRow.rosterY) < 0.01
-    end, 60 * 30, "the host's avatar to settle on its cell")
+    end, 60, "the host's avatar to settle on its cell")
     check(facing, "the host's avatar is on the cell we are facing")
 
     U.shot(game, SHOT_DIR .. "/join-before-interact.png")
@@ -328,18 +334,21 @@ return function(game)
 
     H.signal("guest_interact_done")
     -- likewise: never ask somebody who is mid-session
-    H.waitFor(game, function()
+    H.waitSeconds(game, function()
       local row = H.avatarRow(exports)
       return row ~= nil and not row.busy
-    end, 60 * 20, "the host to be free")
+    end, 45, "the host to be free")
     if H.selectLabel(game, "TRADE") then
       log("asked to trade")
       H.signal("guest_trade_requested")
 
       local wanted = "CHARIZARD"
+      -- seconds, and it must match the host's own trade budget: the two are
+      -- driving one flow, and whichever gives up first abandons the other
+      local record, prompts = H.promptLog()
       local traded, trail = H.drivePrompts(game, function()
         return H.partySpecies(game)[1] == wanted
-      end, 60 * 90)
+      end, 120, record)
       log("guest party now:", table.concat(H.partySpecies(game), ","))
       if not traded then
         -- the same diagnosis the host prints, which this side was missing:
@@ -347,10 +356,11 @@ return function(game)
         -- arrived from one that was answered and went nowhere
         log("trade stalled -- prompts answered:", trail == "" and "(none)" or trail,
             "top is", tostring(H.top(game) and (H.top(game).title or "?")))
+        log("  boxes:", table.concat(prompts, " | "))
       end
       check(traded, "the guest received the host's " .. wanted)
       U.shot(game, SHOT_DIR .. "/join-after-trade.png")
-      H.await(game, "host_trade_done", 120)
+      H.await(game, "host_trade_done")
 
       -- ------- 6. and a real link battle, to a decision
       --
@@ -368,10 +378,10 @@ return function(game)
       -- is refused, and the run then waits for a battle that was never
       -- going to start. The roster carries their busy flag, so wait on it
       -- rather than on a guessed interval.
-      local free = H.waitFor(game, function()
+      local free = H.waitSeconds(game, function()
         local row = H.avatarRow(exports)
         return row ~= nil and not row.busy
-      end, 60 * 30, "the host to finish the trade")
+      end, 60, "the host to finish the trade")
       if not free then log("WARN host still busy; asking anyway") end
       U.wait(30)
       local reopened = false
@@ -389,19 +399,19 @@ return function(game)
 
         local started = H.drivePrompts(game, function()
           return events["battle.started"] > 0
-        end, 60 * 60)
+        end, 90)
         check(started, "a link battle started on the guest")
 
         local ended = H.drivePrompts(game, function()
           return events["battle.ended"] > 0
-        end, 60 * 240)
+        end, 240)
         check(ended, "and ran to a decision")
         check(events["link.desync"] == 0, "with no desync reported")
         log(("battle events: started=%d ended=%d desync=%d"):format(
           events["battle.started"], events["battle.ended"],
           events["link.desync"]))
         U.shot(game, SHOT_DIR .. "/join-after-battle.png")
-        H.await(game, "host_battle_done", 240)
+        H.await(game, "host_battle_done")
 
         -- ------- 7. leave the game and keep playing
         --
@@ -411,7 +421,7 @@ return function(game)
         -- disconnecting cleanly is easy, staying playable afterwards is
         -- where a teardown bug would show.
 
-        H.await(game, "host_address_checked", 240)
+        H.await(game, "host_address_checked")
         H.closeToOverworld(game)
         local opened = H.openMmo(game)
         if opened then
@@ -427,7 +437,7 @@ return function(game)
         if opened and H.selectLabel(game, "LEAVE") then
           H.drivePrompts(game, function()
             return not exports.isConnected()
-          end, 60 * 30)
+          end, 60)
           check(not exports.isConnected(), "LEAVE disconnects the guest")
           check(not exports.isHosting(), "without it having been the host")
           check(#exports.players() == 0, "and clears the roster")

@@ -11,6 +11,14 @@
 --
 --   POKEPORT_IDENTITY=mmohost POKEPORT_DRIVER=mods/rby_mmo/tests/drivers/mmo_host.lua love .
 
+-- Muted at load rather than in mmo_util, which is only reached once the game
+-- is ready -- by then the title music is already playing. Nothing here ever
+-- asserts on a sound, and two instances playing a battle at each other for
+-- minutes is not something a background run should do to a room.
+if os.getenv("MMO_SOUND") ~= "1" and love and love.audio then
+  love.audio.setVolume(0)
+end
+
 return function(game)
   local H = dofile("mods/rby_mmo/tests/drivers/mmo_util.lua")
   local U = H.U
@@ -142,7 +150,9 @@ return function(game)
             "the screen reads out a code a friend could type: "
               .. H.formatCode(joinCode or ""))
       U.shot(game, SHOT_DIR .. "/host-newcode.png")
-      -- the box's onDone puts the setup menu back
+      -- The box's onDone puts the setup menu back. Frames: this is a local
+      -- text box being dismissed by local button presses, with nothing on
+      -- the wire and no second process involved.
       local back = H.waitFor(game, function()
         local top = H.top(game)
         if top and type(top.items) == "table" then return true end
@@ -167,6 +177,9 @@ return function(game)
 
   -- ------- the listener is real
 
+  -- Frames, and deliberately: socket.bind either works on the step START ran
+  -- on or does not work at all. Nothing outside this process is involved, so
+  -- there is nothing here for the other window's frame rate to skew.
   local hosting = H.waitFor(game, function() return exports.isHosting() end,
                             240, "the listener to come up")
   check(hosting, "hosting started (a real socket is bound)")
@@ -180,7 +193,9 @@ return function(game)
   check(type(address) == "string" and address:find(":"),
         "an address is published: " .. tostring(address))
 
-  -- the host is a player on its own hub, over loopback
+  -- The host is a player on its own hub, over loopback. Frames: HostServer's
+  -- localNet hands messages straight to Hub in-process, so this handshake
+  -- completes in a fixed handful of steps with no second process in it.
   local joinedSelf = H.waitFor(game, function() return exports.isConnected() end,
                                240, "the host to join its own game")
   check(joinedSelf, "the host joined its own game over loopback")
@@ -261,10 +276,10 @@ return function(game)
     -- presence: the guest walks, and the host's roster follows
     local before = exports.players()[1]
     local startX, startY = before.x, before.y
-    local moved = H.waitFor(game, function()
+    local moved = H.waitSeconds(game, function()
       local now = exports.players()[1]
       return now and (now.x ~= startX or now.y ~= startY)
-    end, 60 * 20, "the guest to move")
+    end, 45, "the guest to move")
     check(moved, "the guest's movement reaches the host")
 
     -- The roster moving proves the wire works. Whether the *avatar* moved
@@ -281,8 +296,14 @@ return function(game)
       return a ~= nil and b ~= nil and math.abs(a - b) < 0.01
     end
 
+    -- Bounded by the clock, not by a sample count, for the same reason
+    -- everything else here is: what it is waiting for is a remote player's
+    -- step arriving, and 400 samples is however many seconds this window's
+    -- frame rate says it is. The *sampling* stays fine-grained -- that part
+    -- really is about frames.
     local followed, sawWalking, samples = false, false, 0
-    for _ = 1, 400 do
+    local sampleUntil = os.time() + 60
+    while os.time() < sampleUntil do
       local rows = exports.avatarState()
       local row = rows and rows[1]
       if row then
@@ -391,20 +412,20 @@ return function(game)
     -- roster keeps them, the avatar does not.
 
     H.await(game, "guest_left_map")
-    local despawned = H.waitFor(game, function()
+    local despawned = H.waitSeconds(game, function()
       local row = H.avatarRow(exports)
       return row ~= nil and row.spawned == false
-    end, 60 * 40, "the avatar to despawn")
+    end, 45, "the avatar to despawn")
     check(despawned, "a player who leaves the map loses their avatar")
     local stillListed = #exports.players() > 0
     check(stillListed, "but stays on the roster")
     H.signal("host_saw_despawn")
 
     H.await(game, "guest_back_on_map")
-    local respawned = H.waitFor(game, function()
+    local respawned = H.waitSeconds(game, function()
       local row = H.avatarRow(exports)
       return row ~= nil and row.spawned == true
-    end, 60 * 40, "the avatar to come back")
+    end, 45, "the avatar to come back")
     check(respawned, "and gets it back on returning to the map")
     U.shot(game, SHOT_DIR .. "/host-guest-returned.png")
 
@@ -425,12 +446,15 @@ return function(game)
 
     H.await(game, "guest_trade_requested")
     local wanted = "PIKACHU"
+    -- seconds; PHASE.host_trade_done is derived from this number
+    local record, prompts = H.promptLog()
     local traded, trail = H.drivePrompts(game, function()
       return H.partySpecies(game)[1] == wanted
-    end, 60 * 90)
+    end, 120, record)
     log("host party now:", table.concat(H.partySpecies(game), ","))
     if not traded then
       log("trade stalled -- prompts answered:", trail == "" and "(none)" or trail)
+      log("  boxes:", table.concat(prompts, " | "))
     end
     check(traded, "the host received the guest's " .. wanted)
     U.shot(game, SHOT_DIR .. "/host-after-trade.png")
@@ -444,10 +468,10 @@ return function(game)
     -- reports, and link.desync is the one that matters: two games
     -- disagreeing mid-battle is exactly what lockstep exists to prevent.
 
-    H.await(game, "guest_battle_requested", 180)
+    H.await(game, "guest_battle_requested")
     local started, btrail = H.drivePrompts(game, function()
       return events["battle.started"] > 0
-    end, 60 * 60)
+    end, 90)
     if not started then
       log("battle never started -- prompts answered:",
           btrail == "" and "(none)" or btrail)
@@ -459,6 +483,10 @@ return function(game)
     -- entirely. Capture it rather than reason about it -- but wait for the
     -- battle state to be on top first: battle.started fires before the
     -- transition finishes, and a shot taken then is still the overworld.
+    --
+    -- Frames, and this one genuinely is: a battle transition is a fixed
+    -- number of drawn frames on this machine alone. The peer already did its
+    -- part -- battle.started has fired -- so nothing here waits on it.
     local inBattle = H.waitFor(game, function()
       local top = H.top(game)
       return top ~= nil and top.enemy ~= nil
@@ -473,7 +501,7 @@ return function(game)
 
     local ended = H.drivePrompts(game, function()
       return events["battle.ended"] > 0
-    end, 60 * 240)
+    end, 240)
     check(ended, "and ran to a decision")
     check(events["link.desync"] == 0, "with no desync reported")
     log(("battle events: started=%d ended=%d desync=%d"):format(
@@ -515,7 +543,7 @@ return function(game)
 
     -- ------- 8. and the guest leaving is seen here
 
-    H.await(game, "guest_left_game", 240)
+    H.await(game, "guest_left_game")
     local gone = H.waitSeconds(game, function()
       return #exports.players() == 0
     end, 90, "the guest to drop off the roster")

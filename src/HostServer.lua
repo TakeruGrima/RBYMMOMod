@@ -135,7 +135,21 @@ function M:start(port, maxPlayers, joinCode)
 
   self.server = server
   self.port = port
-  self.hub = Hub.new({ maxPlayers = maxPlayers, joinCode = code })
+  -- Hub is pure logic and owns no logger; this is where a refused relay
+  -- payload becomes something a host can actually see. Trade and battle are
+  -- the only traffic on that path, so one of these lines is the difference
+  -- between "the trade half-happened" and knowing why. Hub only calls this
+  -- once per connection, so a peer sending nothing but junk cannot flood it.
+  self.hub = Hub.new({
+    maxPlayers = maxPlayers,
+    joinCode = code,
+    onDrop = function(reason, clientId)
+      mod.log:warn("refused a relayed message from player %s (%s); "
+        .. "if a trade or battle stalled, this is why -- ask them to "
+        .. "reconnect, and report it if it repeats",
+        tostring(clientId), tostring(reason))
+    end,
+  })
   self.conns = {}
   self.running = true
   self.error = nil

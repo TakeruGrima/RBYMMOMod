@@ -8,6 +8,16 @@ local U = dofile("tests/drivers/util.lua")
 
 local M = { U = U }
 
+-- Two instances play the overworld theme, a trade jingle and a whole battle
+-- at each other for several minutes, and nothing in this test ever asserts
+-- on a sound. Muting at load keeps a background run from taking over the
+-- room; set MMO_SOUND=1 if a change to the audio path ever needs hearing.
+if os.getenv("MMO_SOUND") ~= "1" then
+  if love and love.audio and love.audio.setVolume then
+    love.audio.setVolume(0)
+  end
+end
+
 function M.top(game)
   return game.stack and game.stack:top() or nil
 end
@@ -15,6 +25,12 @@ end
 -- Spin until `predicate` is true, or give up. Returns whether it happened,
 -- so a driver can log a real failure instead of walking on and producing a
 -- confusing error three steps later.
+--
+-- Budgeted in FRAMES, so it is only correct for things that are actually
+-- measured in frames: a menu opening, a transition playing, a socket binding
+-- in this process. If what you are waiting for can only happen once the
+-- *other* game does something, this is the wrong helper and waitSeconds is
+-- the right one -- read the note above it before reaching for either.
 function M.waitFor(game, predicate, frames, what)
   for _ = 1, frames or 300 do
     if predicate() then return true end
@@ -124,20 +140,34 @@ end
 
 -- Wait on something the OTHER process has to get round to, in seconds.
 --
--- Frames are the right unit for anything inside this game: a menu animation
--- is so many frames whatever the clock is doing. They are exactly the wrong
--- unit across the pair. LOVE steps a driver once per rendered frame, and two
--- windows on one desktop do not render at the same rate -- the focused one
--- runs at the display's refresh while the occluded one is throttled by the
--- window server, by an order of magnitude in the bad case.
+-- Frames are the right unit for anything that is genuinely frame-shaped: a
+-- menu opening, a battle transition, a socket binding -- so many frames
+-- whatever the clock is doing. They are exactly the wrong unit for anything
+-- whose completion depends on the other process. LOVE steps a driver once
+-- per rendered frame, and two windows on one desktop do not render at the
+-- same rate -- the focused one runs at the display's refresh while the
+-- occluded one is throttled by the window server, by an order of magnitude
+-- in the bad case. A frame budget is therefore an *unknown* number of
+-- seconds, and comparing one against a barrier measured in seconds is
+-- comparing nothing at all.
 --
--- One run died of precisely that: the host spent "60 * 420 frames" of
--- patience waiting for the guest to connect, burned it in half that many
--- seconds on a 120Hz display, quit -- and the guest, still crawling through
--- the intro at a fraction of its frame rate, finally dialled a port nobody
--- was listening on any more and reported "connection refused". Nothing was
--- wrong with the mod. So anything that waits on the other process waits on
--- the clock.
+-- Two bugs have come out of that, both of them looking like something else:
+--
+--   * the host spent "60 * 420 frames" of patience waiting for the guest to
+--     connect, burned it in half that many seconds on a 120Hz display, quit,
+--     and the guest -- still crawling through the intro -- finally dialled a
+--     port nobody was listening on and reported "connection refused";
+--
+--   * the trade ran "60 * 90 frames" against a partner waiting 120 seconds.
+--     Below about 45fps the driver outlasts its partner, who walks off; the
+--     abandoned side is left mid-cutscene talking to a peer that has moved
+--     on, and reports a stalled trade that is really an abandonment. Either
+--     side can lose, depending on which window the OS throttles, which is
+--     exactly why it looked like a transport fault. It was not: the hub
+--     logged zero drops through it.
+--
+-- So: anything whose completion depends on the other process waits on the
+-- clock. Anything frame-shaped keeps waitFor, and says why at the call site.
 function M.waitSeconds(game, predicate, seconds, what)
   seconds = seconds or 120
   local deadline = os.time() + seconds
@@ -306,31 +336,122 @@ end
 -- the filesystem. Polling "has the other side got there yet" with sleeps is
 -- what made the early runs flaky, so each phase is gated on an explicit
 -- marker instead.
+--
+-- THE RULE, and it is not optional:
+--
+--   A barrier's patience must outlast the worst-case wall-clock of the work
+--   on the other side that it is waiting for, with margin.
+--
+-- Break it and the waiting side walks off while its partner is still
+-- mid-flow. What gets reported is never "I gave up too early" -- it is
+-- whatever the abandoned side was doing when its peer vanished, so a thin
+-- barrier surfaces as a stalled trade, a battle that never started, or a
+-- refused connection. That has cost two debugging sessions here already.
+--
+-- Two things follow, and both are load-bearing:
+--
+--   1. Both halves of the comparison are in seconds. Work budgets on the
+--      other side are waitSeconds / drivePrompts, never frame counts, or the
+--      comparison is between quantities in different units.
+--   2. The patience lives in PHASE below, next to the work it was derived
+--      from, rather than being spelled at the call site where the two sides
+--      cannot see each other.
+--
+-- And the run checks itself rather than trusting the comment: signal()
+-- records how long its side actually took, await() reads that back and warns
+-- when the margin it was given is thinner than MARGIN. A run that is drifting
+-- towards this bug says so before it fails.
+local MARGIN = 1.5
+
+-- barrier -> seconds of patience, and the budget on the other side it was
+-- derived from. Where the work is a handful of frames the floor is 90s,
+-- because a barrier that is generous costs a good run nothing -- it clears
+-- the moment the marker lands -- and only ever delays the report of a hang.
+local PHASE = {
+  -- guest waits on the host finishing presence checks and avatar sampling
+  host_walk_start        = 240,  -- 45 moved + 60 sampling + shots
+  -- host waits on the guest reading one roster row
+  guest_baseline_taken   =  90,  -- floor
+  -- guest waits on three scripted steps
+  host_walk_done         =  90,  -- floor
+  -- host waits on the guest's presence checks, chat and teleport
+  guest_left_map         = 300,  -- 45 + 45 + 90 chat + teleports
+  -- guest waits on the host noticing the despawn
+  host_saw_despawn       =  90,  -- 45 despawn
+  -- host waits on the guest teleporting back
+  guest_back_on_map      =  90,  -- floor
+  -- guest waits on the host noticing the respawn
+  host_ready_for_interact=  90,  -- 45 respawn
+  -- host waits on the guest walking up, reading the card and closing it
+  guest_interact_done    = 240,  -- 60 facing + menu + profile card
+  -- host waits on the guest waiting for it to be free, then picking TRADE
+  guest_trade_requested  = 120,  -- 45 free
+  -- guest waits on the host driving its half of the trade
+  host_trade_done        = 240,  -- 120 trade drive   <-- the one that broke
+  -- host waits on the guest finishing its trade, then asking for a battle
+  guest_battle_requested = 300,  -- 120 trade drive + 60 free
+  -- guest waits on the host running a link battle to a decision
+  host_battle_done       = 540,  -- 90 start + 240 run + transition
+  -- guest waits on the host re-opening the MMO menu
+  host_address_checked   = 150,  -- menus only
+  -- host waits on the guest leaving and proving the world still works
+  guest_left_game        = 240,  -- 60 leave drive + walk test
+}
 
 local SYNC_DIR = os.getenv("MMO_SYNC_DIR") or "/tmp/rby_mmo_sync"
+
+-- when this side last crossed a barrier, so signal() can say how long the
+-- segment it just finished actually took
+local phaseClock = os.time()
 
 function M.syncPath(name)
   return SYNC_DIR .. "/" .. name
 end
 
+function M.patience(name)
+  return PHASE[name] or 180
+end
+
 function M.signal(name)
+  local spent = os.time() - phaseClock
+  phaseClock = os.time()
   os.execute('mkdir -p "' .. SYNC_DIR .. '" 2>/dev/null')
-  local handle = io.open(M.syncPath(name), "w")
+  local path = M.syncPath(name)
+  -- written then renamed: the other side polls for this path to exist, and a
+  -- file caught between open and write would read as a zero-second segment
+  -- and quietly disarm the margin check
+  local handle = io.open(path .. ".tmp", "w")
   if handle then
-    handle:write("1")
+    handle:write(tostring(spent))
     handle:close()
+    os.rename(path .. ".tmp", path)
   end
 end
 
--- Seconds, not frames: a barrier is by definition a wait on the other
--- process, and the two do not run at the same speed. See waitSeconds.
+-- Seconds, not frames, and by default the seconds PHASE says. See the rule
+-- above; `seconds` is here for a caller that genuinely knows better, not as
+-- the normal way to set a budget.
 function M.await(game, name, seconds)
-  return M.waitSeconds(game, function()
+  seconds = seconds or M.patience(name)
+  local spent
+  local ok = M.waitSeconds(game, function()
     local handle = io.open(M.syncPath(name), "r")
     if not handle then return false end
+    spent = tonumber(handle:read("*a") or "")
     handle:close()
     return true
-  end, seconds or 180, "phase " .. name)
+  end, seconds, "phase " .. name)
+  phaseClock = os.time()
+  -- The check that keeps the rule true. It fires whether or not the barrier
+  -- was actually tested this run: "was my patience enough for their work" is
+  -- answerable from the numbers alone, so a run that happened to be fast
+  -- still reports a budget that would not survive a slow one.
+  if ok and spent and spent > 0 and seconds < spent * MARGIN then
+    U.log(("WARN barrier %s: %ds of patience for %ds of work on the other "
+      .. "side (%.1fx, want %.1fx) -- raise it in mmo_util's PHASE table")
+      :format(name, seconds, spent, seconds / spent, MARGIN))
+  end
+  return ok
 end
 
 -- this game's own player cell
@@ -374,17 +495,28 @@ end
 
 M.classify = classify
 
+-- Budgeted in SECONDS, and it must be: a trade or a battle only finishes
+-- when the other process answers its half, so this is a wait on the peer
+-- wearing the clothes of a work loop. It was the last frame budget left in
+-- the pair, and it was the one that broke -- 60 * 90 frames on one side
+-- against a 120-second barrier on the other, which holds above 60fps and
+-- silently inverts below about 45. See the rule at "phase barriers".
+--
 -- Returns whether `done` came true, and the sequence of prompt kinds it
 -- answered on the way. A trade or battle that stalls is otherwise a bare
 -- "did not happen": the sequence says whether the prompt never arrived, or
 -- arrived and was answered and still went nowhere.
-function M.drivePrompts(game, done, frames, onStep)
+--
+-- onStep(kind, top) is called for each prompt just before it is answered;
+-- promptLog below is the standard one to hand it.
+function M.drivePrompts(game, done, seconds, onStep)
   local seen = {}
   local function note(kind)
     if kind and seen[#seen] ~= kind then seen[#seen + 1] = kind end
   end
-  for _ = 1, frames or 60 * 60 do
-    if done and done() then return true end
+  local deadline = os.time() + (seconds or 120)
+  while os.time() < deadline do
+    if done and done() then return true, table.concat(seen, ">") end
     local top = M.top(game)
 
     -- The overworld is NOT a prompt. It has no `items` and no `onChoose`,
@@ -396,11 +528,15 @@ function M.drivePrompts(game, done, frames, onStep)
     -- prompt instead.
     if top == nil or top == game.overworld or top.isOverworld then
       U.wait(4)
-      if onStep then onStep(nil) end
       goto continue
     end
 
+    -- onStep sees the prompt BEFORE it is answered, which is the only moment
+    -- its text still exists: a box that has been dismissed cannot say what it
+    -- asked. The kind sequence alone says a confirm was answered twice; only
+    -- the text says whether it was the same question twice.
     local kind = classify(top)
+    if onStep then onStep(kind, top) end
     if kind == "choice" then
       -- YES is index 1; walk the cursor there rather than assuming it
       local guard = 0
@@ -422,10 +558,36 @@ function M.drivePrompts(game, done, frames, onStep)
       U.wait(4)
     end
     note(kind)
-    if onStep then onStep(kind) end
     ::continue::
   end
   return (done and done() or false), table.concat(seen, ">")
+end
+
+-- An onStep for drivePrompts that records what each prompt actually said.
+--
+-- Returns the recorder and the list it fills. Consecutive repeats are kept,
+-- not collapsed: "the same question twice" is exactly the observation worth
+-- having when a session stalls, and a dedup would hide it. Choices carry the
+-- cursor row, so an answer that went to NO can be told from one that went to
+-- YES rather than assumed.
+function M.promptLog()
+  local seen = {}
+  return function(kind, top)
+    local what = kind
+    if kind == "choice" then
+      what = ("choice@%s"):format(tostring(top.index or 1))
+    elseif kind == "text" then
+      local text = M.textOf(top)
+      if text ~= "" then what = '"' .. text .. '"' end
+    elseif kind == "menu" then
+      local labels = {}
+      for _, item in ipairs(top.items or {}) do
+        labels[#labels + 1] = tostring(item.label)
+      end
+      what = "menu[" .. table.concat(labels, ",") .. "]"
+    end
+    seen[#seen + 1] = what
+  end, seen
 end
 
 -- Put the hardest-hitting move in slot 1.

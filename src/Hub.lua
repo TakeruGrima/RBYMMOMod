@@ -244,8 +244,27 @@ function M.new(opts)
     -- suite does, so that two hubs can be started from identical pools and
     -- fed different material.
     entropy = opts.entropy or Entropy.shared,
+    -- Optional. Called as onDrop(reason, clientId, total) the *first* time a
+    -- relay payload is refused for a given connection, and never again for
+    -- it. This file stays pure logic with no logger of its own, so the seam
+    -- hands the fact to a caller inside a mod callback that can name a
+    -- remediation -- and the once-per-connection rule is why it is safe to
+    -- wire to a log at all: a peer that sends nothing but junk costs one
+    -- line, not a flooded terminal.
+    onDrop = opts.onDrop,
     clock = 0,
   }, M)
+end
+
+-- A refused relay payload used to be four bare `return`s. Trade and battle
+-- ride that path and nothing else does, so a silent refusal there is a trade
+-- that half-happened: one side applied it, the other never heard. Whatever
+-- the cause turns out to be, it should never again be invisible.
+local function noteDrop(self, client, reason)
+  client.relayDrops = (client.relayDrops or 0) + 1
+  if client.relayDrops == 1 and self.onDrop then
+    self.onDrop(reason, client.id, client.relayDrops)
+  end
 end
 
 -- Full means no room for another *player*. A connection that has not said
@@ -639,11 +658,19 @@ handlers[Wire.RESPOND] = function(self, client, msg)
 end
 
 handlers[Wire.RELAY] = function(self, client, msg)
-  if not client.ready or not client.sessionId then return end
+  if not client.ready or not client.sessionId then
+    return noteDrop(self, client, "sender is not in a session")
+  end
   local peer = self:peerOf(client)
-  if not peer then return end
-  if Wire.id(msg.to) ~= peer.id then return end
-  if not Wire.payloadOk(msg.payload) then return end
+  if not peer then
+    return noteDrop(self, client, "the session has no other side")
+  end
+  if Wire.id(msg.to) ~= peer.id then
+    return noteDrop(self, client, "addressed to someone who is not the peer")
+  end
+  if not Wire.payloadOk(msg.payload) then
+    return noteDrop(self, client, "payload is deeper or larger than the cap")
+  end
   -- The hub does not read the payload. It is the engine's own link
   -- vocabulary, and interpreting it here would couple this to a protocol
   -- the game already owns.
