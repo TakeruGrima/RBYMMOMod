@@ -96,11 +96,19 @@ services:
     user: "10001:10001"
 
     # --- lifecycle ---------------------------------------------------------
-    # A real init as PID 1. The image ships tini for the same reason; either is
-    # sufficient, and both together are harmless. Without one, SIGTERM does not
-    # reliably reach the hub, and the goodbye it sends to the players still
-    # connected never goes out.
-    init: true
+    # No `init: true` here, deliberately. The image already runs tini as its
+    # entrypoint, which is what makes SIGTERM reach the hub so the goodbye it
+    # sends to the players still connected actually goes out -- and it does
+    # that for `docker run` too, not only for compose.
+    #
+    # Adding compose's init on top is not harmless, which is what this comment
+    # used to claim: it puts docker-init at PID 1 and leaves tini nested at
+    # PID 7, where it logs
+    #     Tini is not running as PID 1 and isn't registered as a child subreaper
+    # on every single start. Signals still forward correctly through both --
+    # measured: `docker compose stop` returns in 0s with `shutting down` in the
+    # log and exit code 0 -- so this is one line of noise per boot for nothing.
+    # One init, in the image, where every way of running it gets it.
     # Long enough for that drain to finish before Docker escalates to SIGKILL.
     stop_grace_period: 15s
     restart: unless-stopped

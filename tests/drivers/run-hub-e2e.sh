@@ -165,6 +165,40 @@ trap cleanup EXIT
 
 hub_cli() { node "$HUB_CLI" --config "$HUB_CONFIG" "$@"; }
 
+# ------------------------------------------------- an already-running hub
+#
+# Normally this script provisions and runs its own hub, which is what makes it
+# a self-contained test. Set both of these to point the same two clients at a
+# hub that is already up somewhere else:
+#
+#   MMO_HUB_EXTERNAL=192.168.1.20:7788 MMO_HUB_CODE=A7K3P9 \
+#     bash mods/rby_mmo/tests/drivers/run-hub-e2e.sh
+#
+# That is how you smoke-test a *deployment* rather than a build -- a container,
+# a VPS, a box a friend runs -- with real game clients rather than a socket
+# script. The clients cannot tell the difference, which is the whole premise of
+# the protocol, so everything below this point is unchanged: same drivers, same
+# assertions, same verdict.
+#
+# What is skipped, necessarily: provisioning, the local-bind preflight, and the
+# hub-side log checks in the verdict (credential refusals, sessions brokered,
+# relay drops) -- this script cannot read the log of a process it did not
+# start, and on a container that log belongs to `docker compose logs`. The
+# client-side assertions are untouched and they are the substance.
+EXTERNAL_HUB="${MMO_HUB_EXTERNAL:-}"
+if [ -n "$EXTERNAL_HUB" ]; then
+  [ -n "${MMO_HUB_CODE:-}" ] || fail "MMO_HUB_EXTERNAL needs MMO_HUB_CODE too --
+     an external hub requires a passcode and this script cannot mint one for it.
+     Read it from the hub you are pointing at, e.g.
+       docker compose exec hub rby-mmo-hub invite list --reveal"
+  HUB_ADDRESS="$EXTERNAL_HUB"
+  JOIN_CODE="$MMO_HUB_CODE"
+  HUB_PID=""
+  echo "  using an EXTERNAL hub at $HUB_ADDRESS (nothing is started or torn down here)"
+  echo "  join code: ****** (6 chars, supplied)"
+fi
+
+if [ -z "$EXTERNAL_HUB" ]; then
 echo "  hub config: $HUB_CONFIG"
 if ! hub_cli init --yes --host 127.0.0.1 --port "$PORT" --max "$MAX" \
      --log-level info >"$HUB_LOG" 2>&1; then
@@ -246,6 +280,7 @@ if ! grep -q "$READY" "$HUB_LOG" 2>/dev/null; then
   exit 1
 fi
 grep -m1 "$READY" "$HUB_LOG" | sed 's/^/  /'
+fi   # end of the provision-and-start block skipped for an external hub
 
 # ------------------------------------------------------------ the two clients
 
@@ -411,6 +446,16 @@ warns=$( (grep -h "WARN barrier" "$A_LOG" "$B_LOG" 2>/dev/null || true) | sed 's
 # the numeric client id: the reachability summary `start` prints has the word
 # "refused" in its prose, and `refused a relayed message` is a different event
 # entirely -- one that is counted separately below because it must be zero.
+hub_fail=0
+if [ -n "$EXTERNAL_HUB" ]; then
+  # The hub belongs to somebody else -- a container, a VPS -- and its log is
+  # theirs to read. Saying so is better than counting zeroes out of an empty
+  # file and calling the silence a pass; a verdict that cannot fail is not one.
+  echo "  ---- hub ----"
+  echo "  external hub at $HUB_ADDRESS: its log is not readable from here, so the"
+  echo "  hub-side checks (refusals, sessions, relay drops, errors) are SKIPPED."
+  echo "  Read them where it runs, e.g. \`docker compose logs hub\`."
+else
 hub_refusals=$(count 'WARN refused [0-9]' "$HUB_LOG"); hub_refusals=${hub_refusals:-0}
 hub_drops=$(count 'refused a relayed message' "$HUB_LOG"); hub_drops=${hub_drops:-0}
 hub_sessions=$(count 'session [0-9]*:' "$HUB_LOG"); hub_sessions=${hub_sessions:-0}
@@ -421,7 +466,6 @@ echo "  credential refusals: $hub_refusals   sessions brokered: $hub_sessions" \
      "  relay drops: $hub_drops   errors: $hub_errors"
 grep -E 'WARN|ERROR' "$HUB_LOG" | head -10 | sed 's/^/  /'
 
-hub_fail=0
 if [ "$hub_refusals" -lt 1 ]; then
   echo "  !! the hub refused nobody -- the wrong-code leg never reached verify()"
   hub_fail=$((hub_fail + 1))
@@ -441,6 +485,7 @@ if [ "$hub_errors" -ne 0 ]; then
   echo "  !! the hub logged $hub_errors error(s)"
   hub_fail=$((hub_fail + 1))
 fi
+fi   # end of the hub-side checks, skipped for an external hub
 
 dump_logs() {
   echo
