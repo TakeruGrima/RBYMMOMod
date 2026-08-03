@@ -415,24 +415,29 @@ Address first, then passcode, both **before anything is dialled**. An IP or a
 hostname both work, and leaving the port off fills in `7788`:
 
 <p align="center">
-  <img src="docs/screenshots/join-address.png" width="270" alt="The JOIN grid with MYPC.LAN:7788 typed, on the digits page">
-  <img src="docs/screenshots/join-passcode.png" width="270" alt="The JOIN CODE grid mid-entry, showing B ERASES">
-  <img src="docs/screenshots/join-passcode-refused.png" width="270" alt="A text box reading: That join code was not accepted.">
+  <img src="docs/screenshots/join-address.png" width="300" alt="The JOIN grid with MYPC.LAN:7788 typed, on the digits page">
+  <img src="docs/screenshots/join-passcode.png" width="300" alt="The JOIN CODE grid mid-entry, showing B ERASES">
 </p>
 
 **SELECT** flips the keyboard between letters and digits — the vanilla one has
 no numbers at all, which is why this mod ships its own. Dashes, spaces and
 lower case are normalised away, so a passcode pasted out of a chat message
-works exactly as typed.
-
-Get it wrong and the hub says so in one sentence and leaves you outside; the
-grid comes back with what you typed still on it, so a single wrong character
-costs one press to fix. **`B` erases, and on an empty line it backs out** —
-the screen says which, depending on what you've typed, because there is
+works exactly as typed. **`B` erases, and on an empty line it backs out** —
+the screen says which, depending on what you've typed, because there's
 otherwise no way to tell.
 
-Both codes are stored **per hub address**, so playing on two of them means
-typing neither of them twice.
+Then you're standing in their world:
+
+<p align="center">
+  <img src="docs/screenshots/join-connected.png" width="560" alt="The overworld with another trainer standing there, HOSTY on a nameplate above them">
+</p>
+
+Get the passcode wrong and the hub says so in one sentence and leaves you
+outside — the grid comes back with what you typed still on it, so a single
+wrong character costs one press to fix rather than six.
+
+Both the address and the passcode are stored **per hub**, so playing on two of
+them means typing neither of them twice.
 
 ---
 
