@@ -122,6 +122,184 @@ function M.closeToOverworld(game, tries)
   return false
 end
 
+-- Wait on something the OTHER process has to get round to, in seconds.
+--
+-- Frames are the right unit for anything inside this game: a menu animation
+-- is so many frames whatever the clock is doing. They are exactly the wrong
+-- unit across the pair. LOVE steps a driver once per rendered frame, and two
+-- windows on one desktop do not render at the same rate -- the focused one
+-- runs at the display's refresh while the occluded one is throttled by the
+-- window server, by an order of magnitude in the bad case.
+--
+-- One run died of precisely that: the host spent "60 * 420 frames" of
+-- patience waiting for the guest to connect, burned it in half that many
+-- seconds on a 120Hz display, quit -- and the guest, still crawling through
+-- the intro at a fraction of its frame rate, finally dialled a port nobody
+-- was listening on any more and reported "connection refused". Nothing was
+-- wrong with the mod. So anything that waits on the other process waits on
+-- the clock.
+function M.waitSeconds(game, predicate, seconds, what)
+  seconds = seconds or 120
+  local deadline = os.time() + seconds
+  while os.time() < deadline do
+    if predicate() then return true end
+    U.wait(2)
+  end
+  U.log(("TIMEOUT waiting %ds for %s"):format(seconds, tostring(what or "condition")))
+  return false
+end
+
+-- ------- join codes
+--
+-- The driver learns the code the way a friend does: off the screen the host
+-- is looking at. Nothing reaches into the mod for it -- Client deliberately
+-- keeps the code out of every log and out of exports, and a test that read
+-- it from a private table would still pass on a build whose screen printed
+-- nothing.
+
+-- Config.CODE_ALPHABET, as a Lua character class. Crockford-style, so I, L,
+-- O and U are absent -- which is also what stops "will" or "code" in the
+-- surrounding sentence from looking like a group of code.
+local CODE_CHAR = "[0-9A-HJKMNP-TV-Z]"
+local CODE_GROUP = "(" .. CODE_CHAR:rep(4) .. ")"
+
+-- Pull a join code out of whatever a screen is showing.
+--
+-- Ui shows one as Wire.formatCode does -- four-character groups joined by
+-- dashes, broken after two groups so a text box does not wrap it -- so what
+-- comes back from textOf is "... ABCD-EFGH JKMN-PQRS". Only dashed pairs are
+-- matched, which is what keeps the prose in front of it out of the answer.
+function M.codeFrom(text)
+  if type(text) ~= "string" then return nil end
+  local parts = {}
+  for a, b in text:gmatch(CODE_GROUP .. "%-" .. CODE_GROUP) do
+    parts[#parts + 1] = a
+    parts[#parts + 1] = b
+  end
+  local code = table.concat(parts)
+  if #code ~= 16 then return nil end
+  return code
+end
+
+-- the display form, for logs and for asserting a screen reads it back
+function M.formatCode(code)
+  if type(code) ~= "string" then return "" end
+  local groups = {}
+  for i = 1, #code, 4 do groups[#groups + 1] = code:sub(i, i + 3) end
+  return table.concat(groups, "-")
+end
+
+-- A code of the right shape that is not the right code.
+--
+-- Derived from the real one rather than invented, so it is guaranteed to
+-- normalise (Wire.code refuses anything that is not exactly 16 symbols of
+-- the alphabet) and guaranteed to be wrong. A hand-written constant could
+-- be neither.
+function M.wrongCode(code)
+  local first = code:sub(1, 1)
+  return (first == "0" and "1" or "0") .. code:sub(2)
+end
+
+-- ------- typing on the naming grid
+--
+-- The join code screen is NamingScreen, so the only way to enter one is the
+-- d-pad: move the cursor onto a cell and press A. That is worth driving
+-- properly rather than writing the glyphs in directly -- "is the code
+-- typeable at all" is exactly the question this screen answers, and the
+-- alphabet was chosen (Config.CODE_ALPHABET) so that every symbol sits on
+-- the mod's own grid pages.
+local function findCell(grid, ch)
+  for r, row in ipairs(grid) do
+    for c, cell in ipairs(row) do
+      if cell == ch then return r, c end
+    end
+  end
+  return nil
+end
+
+-- Walks the cursor rather than computing a tap count. NamingScreen wraps
+-- both axes and clamps the column when the row changes, and SELECT swaps in
+-- a page with a different number of rows -- so arithmetic that was right on
+-- the letters page lands somewhere else on the digits page. Stepping until
+-- the cursor is where it should be is immune to all of that.
+local function moveTo(game, screen, r, c)
+  for _ = 1, 12 do
+    if (screen.row or 1) == r then break end
+    U.tap(game, "down")
+    U.wait(1)
+  end
+  for _ = 1, 12 do
+    if (screen.col or 1) == c then break end
+    U.tap(game, "right")
+    U.wait(1)
+  end
+  return (screen.row or 1) == r and (screen.col or 1) == c
+end
+
+function M.typeOnGrid(game, text)
+  local screen = M.top(game)
+  if not (screen and type(screen.glyphs) == "table" and screen.grid) then
+    U.log("WARN not on a naming screen; cannot type")
+    return false
+  end
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+    local r, c = findCell(screen:grid(), ch)
+    if not r then
+      -- the other page. SELECT is what the case-switch row does, and the
+      -- mod's grid hook reads the same flag to swap letters for digits
+      U.tap(game, "select")
+      U.wait(2)
+      r, c = findCell(screen:grid(), ch)
+    end
+    if not r then
+      U.log("WARN no cell on the naming grid for", ch)
+      return false
+    end
+    if not moveTo(game, screen, r, c) then
+      U.log("WARN could not reach the cell for", ch)
+      return false
+    end
+    U.tap(game, "a")
+    U.wait(2)
+  end
+  return true
+end
+
+-- Answer a join-code prompt: dismiss whatever box is asking, type the code
+-- on the grid, and confirm with START.
+--
+-- The box comes first and its onDone pushes the grid, and a refusal arrives
+-- as two boxes rather than one (the hub's sentence, then Transport's), so
+-- the way through is to keep pressing A until the grid is actually there
+-- instead of counting screens.
+function M.enterJoinCode(game, code)
+  local screen
+  for _ = 1, 40 do
+    local top = M.top(game)
+    if top and type(top.glyphs) == "table" and top.grid then
+      screen = top
+      break
+    end
+    U.tap(game, "a")
+    U.wait(10)
+  end
+  if not screen then
+    U.log("WARN never reached the join-code grid; top is",
+          tostring(M.top(game) and (M.top(game).title or "?")))
+    return false
+  end
+  if not M.typeOnGrid(game, code) then return false end
+  local typed = table.concat(screen.glyphs)
+  if typed ~= code then
+    U.log("WARN the grid holds", typed, "not", M.formatCode(code))
+    return false
+  end
+  U.tap(game, "start")
+  U.wait(30)
+  return true
+end
+
 -- ------- phase barriers
 --
 -- The two drivers are separate processes with no channel between them but
@@ -144,13 +322,15 @@ function M.signal(name)
   end
 end
 
-function M.await(game, name, frames)
-  return M.waitFor(game, function()
+-- Seconds, not frames: a barrier is by definition a wait on the other
+-- process, and the two do not run at the same speed. See waitSeconds.
+function M.await(game, name, seconds)
+  return M.waitSeconds(game, function()
     local handle = io.open(M.syncPath(name), "r")
     if not handle then return false end
     handle:close()
     return true
-  end, frames or 60 * 90, "phase " .. name)
+  end, seconds or 180, "phase " .. name)
 end
 
 -- this game's own player cell

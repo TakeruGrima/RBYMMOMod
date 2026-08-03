@@ -18,6 +18,10 @@ return function(game)
   local ADDR_FILE = os.getenv("MMO_ADDR_FILE") or "/tmp/rby_mmo_addr.txt"
   local SHOT_DIR = os.getenv("SHOT_DIR") or "/tmp/rby_mmo_shots"
   local LIMIT = tonumber(os.getenv("MMO_LIMIT") or "") or 2
+  -- On by default, because the join code is this build's headline feature
+  -- and nothing else in the suite can reach it in a running game. Off is for
+  -- someone who wants the plain smoke test back.
+  local WANT_CODE = (os.getenv("MMO_JOIN_CODE") or "1") ~= "0"
 
   local function log(...) U.log(TAG, ...) end
   local events = H.captureEvents({ "battle.started", "battle.ended", "link.desync" })
@@ -33,6 +37,7 @@ return function(game)
   end
 
   os.remove(ADDR_FILE)
+  os.remove(ADDR_FILE .. ".tmp")
 
   U.newGame(game)
   -- U.newGame mashes A through the naming grid, so both sides would
@@ -97,12 +102,67 @@ return function(game)
 
   check(H.selectLabel(game, "HOST"), "confirmed the trainer and moved on")
 
+  -- HOST GAME no longer opens the size list. The optional join code needed
+  -- somewhere to live and a bare number box had no room for it, so both
+  -- settings sit on a setup menu with START under them, and hosting begins
+  -- when the host says so rather than the moment a size is picked.
+  U.wait(20)
+  check(H.classify(H.top(game)) == "menu", "the host setup menu opened")
+  U.shot(game, SHOT_DIR .. "/host-setup.png")
+
   -- the size picker is a named list now, so the run picks its row by name
+  check(H.selectLabel(game, "PLAYERS"), "PLAYERS opens the size list")
   U.wait(20)
   check(H.classify(H.top(game)) == "menu", "the limit picker opened")
   U.shot(game, SHOT_DIR .. "/host-limit.png")
   local picked = H.selectLabel(game, ("%d PLAYERS"):format(LIMIT))
   check(picked, "chose " .. LIMIT .. " PLAYERS")
+  U.wait(20)
+  -- picking a size is a setting, not a start: it comes back here
+  check(H.classify(H.top(game)) == "menu", "and came back to the setup menu")
+
+  -- ------- the join code, set before anyone can knock
+  --
+  -- Read back off the screen rather than out of the mod: the code is
+  -- deliberately absent from every log and every export, and a host who
+  -- cannot read theirs has a game nobody can join -- so what the screen
+  -- prints IS the feature.
+
+  local joinCode = nil
+  if WANT_CODE then
+    if check(H.selectLabel(game, "JOIN CODE"), "JOIN CODE opens the lock menu") then
+      U.wait(20)
+      check(H.classify(H.top(game)) == "menu", "the lock menu opened")
+      U.shot(game, SHOT_DIR .. "/host-codemenu.png")
+      check(H.selectLabel(game, "NEW CODE"), "asked the game to make one")
+      U.wait(30)
+      local shown = H.textOf(H.top(game))
+      joinCode = H.codeFrom(shown)
+      check(joinCode ~= nil,
+            "the screen reads out a code a friend could type: "
+              .. H.formatCode(joinCode or ""))
+      U.shot(game, SHOT_DIR .. "/host-newcode.png")
+      -- the box's onDone puts the setup menu back
+      local back = H.waitFor(game, function()
+        local top = H.top(game)
+        if top and type(top.items) == "table" then return true end
+        U.tap(game, "a")
+        return false
+      end, 240, "the setup menu after setting a code")
+      check(back, "and setting one returns to the setup menu")
+      -- the row says so too, which is the only place a host can see the
+      -- game is locked without opening the code screen again
+      local onRow = false
+      for _, item in ipairs((H.top(game) or {}).items or {}) do
+        if item.label == "JOIN CODE" then onRow = tostring(item.right) == "ON" end
+      end
+      check(onRow, "the JOIN CODE row now reads ON")
+    end
+  else
+    log("MMO_JOIN_CODE=0; hosting without a code")
+  end
+
+  check(H.selectLabel(game, "START"), "START begins the game")
   U.wait(30)
 
   -- ------- the listener is real
@@ -148,18 +208,31 @@ return function(game)
 
   -- The guest connects to 127.0.0.1; the LAN address is what a human would
   -- read aloud, so publish both and let the joiner pick.
-  local handle = io.open(ADDR_FILE, "w")
+  --
+  -- Second line: the join code, or empty when the game is open. This is the
+  -- channel the two processes already have -- the address travels it -- and
+  -- a code is the other half of the same sentence a host reads out, so it
+  -- belongs here rather than in a second file with its own race.
+  --
+  -- Written and renamed rather than written in place: the wrapper script and
+  -- the guest both watch for this path to exist, and a two-line file caught
+  -- mid-write would hand the guest an address and no code.
+  local handle = io.open(ADDR_FILE .. ".tmp", "w")
   if handle then
-    handle:write(tostring(address) .. "\n")
+    handle:write(tostring(address) .. "\n" .. (joinCode or "") .. "\n")
     handle:close()
+    os.rename(ADDR_FILE .. ".tmp", ADDR_FILE)
   end
-  log("hosting", tostring(address), "limit", LIMIT)
+  log("hosting", tostring(address), "limit", LIMIT,
+      joinCode and ("code " .. H.formatCode(joinCode)) or "open to anyone")
 
   -- ------- a real remote player shows up
 
-  local sawGuest = H.waitFor(game, function()
+  -- Seconds: the guest is another process, walking its own intro at its own
+  -- frame rate. See H.waitSeconds -- this is the wait that taught us why.
+  local sawGuest = H.waitSeconds(game, function()
     return #exports.players() > 0
-  end, 60 * 420, "the guest to connect")
+  end, 400, "the guest to connect")
   check(sawGuest, "a remote player joined over a real socket")
 
   if sawGuest then
@@ -304,12 +377,12 @@ return function(game)
 
     exports.say("global", "HELLO FROM HOST")
     log("said hello")
-    local heardGuest = H.waitFor(game, function()
+    local heardGuest = H.waitSeconds(game, function()
       for _, line in ipairs(exports.chat()) do
         if line.text == "HELLO FROM GUEST" then return true end
       end
       return false
-    end, 60 * 60, "the guest's chat line")
+    end, 120, "the guest's chat line")
     check(heardGuest, "the guest's chat reached the host")
 
     -- ------- 1. the guest leaves the map, and comes back
@@ -371,7 +444,7 @@ return function(game)
     -- reports, and link.desync is the one that matters: two games
     -- disagreeing mid-battle is exactly what lockstep exists to prevent.
 
-    H.await(game, "guest_battle_requested", 60 * 90)
+    H.await(game, "guest_battle_requested", 180)
     local started, btrail = H.drivePrompts(game, function()
       return events["battle.started"] > 0
     end, 60 * 60)
@@ -426,6 +499,13 @@ return function(game)
       log("address screen reads:", shown)
       check(shown:find(tostring(address), 1, true) ~= nil,
             "the address can be re-viewed from the MMO menu")
+      -- and the code with it: they are read out in the same breath, and a
+      -- host who set one and cannot find it again has a locked game nobody
+      -- can get into
+      if joinCode then
+        check(H.codeFrom(shown) == joinCode,
+              "and the join code is on the same screen")
+      end
       U.shot(game, SHOT_DIR .. "/host-address-recheck.png")
     else
       check(false, "no ADDRESS row while hosting")
@@ -435,10 +515,10 @@ return function(game)
 
     -- ------- 8. and the guest leaving is seen here
 
-    H.await(game, "guest_left_game", 60 * 120)
-    local gone = H.waitFor(game, function()
+    H.await(game, "guest_left_game", 240)
+    local gone = H.waitSeconds(game, function()
       return #exports.players() == 0
-    end, 60 * 40, "the guest to drop off the roster")
+    end, 90, "the guest to drop off the roster")
     check(gone, "a guest who leaves drops off the host's roster")
     check(exports.isHosting(), "and the host is still hosting afterwards")
   end

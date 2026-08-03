@@ -59,17 +59,29 @@ return function(game)
   -- The host writes its address once the listener is up; that file is the
   -- start gun. This side still dials the default 127.0.0.1:7788, because
   -- both instances are on one machine.
-  local ready = H.waitFor(game, function()
+  --
+  -- Its second line is the join code, when the host set one. Whether this
+  -- run exercises the code is therefore decided by what the host actually
+  -- did, not by this side's own copy of an env flag -- two drivers reading
+  -- the same switch and disagreeing about it is a whole class of confusing
+  -- failure that never has to exist.
+  local hostAddress, joinCode
+  local ready = H.waitSeconds(game, function()
     local handle = io.open(ADDR_FILE, "r")
     if not handle then return false end
+    hostAddress = handle:read("*l")
+    local line = handle:read("*l")
     handle:close()
+    joinCode = (line ~= nil and line ~= "") and line or nil
     return true
-  end, 60 * 60, "the host to publish its address")
+  end, 240, "the host to publish its address")
   check(ready, "the host came up")
   if not ready then
     log("RESULT " .. failures .. " failure(s)")
     return
   end
+  log("host published", tostring(hostAddress),
+      joinCode and ("code " .. H.formatCode(joinCode)) or "with no code")
 
   -- ------- join, through the real menus
 
@@ -105,6 +117,43 @@ return function(game)
   U.tap(game, "start")
   U.wait(60)
 
+  -- ------- the join code, asked for by a running game
+  --
+  -- The one path no other suite can reach. tests/rby_mmo_test.lua drives Hub
+  -- with fake peers, so it can prove the HMAC is checked but never that a
+  -- player can answer a challenge: the code arrives as a nonce mid-connect,
+  -- the answer has to be typed on a d-pad grid with no digits on its first
+  -- page, and every part of that is UI.
+  --
+  -- The wrong code goes first, on the same connection budget, because the
+  -- refusal path is where a player ends up when they mistype -- and a
+  -- refusal that leaves them staring at a dead screen with no way back is
+  -- worse than one that never came.
+  if joinCode then
+    local asked = H.waitFor(game, function()
+      local top = H.top(game)
+      return top ~= nil and H.textOf(top):find("join code", 1, true) ~= nil
+    end, 60 * 30, "the game to ask for a join code")
+    check(asked, "a locked game asks for a code instead of letting us in")
+    check(exports.isConnected() == false, "and does not admit us without one")
+    U.shot(game, SHOT_DIR .. "/join-code-asked.png")
+
+    local wrong = H.wrongCode(joinCode)
+    check(H.enterJoinCode(game, wrong),
+          "a wrong code can be typed on the grid")
+    local refused = H.waitFor(game, function()
+      local top = H.top(game)
+      return top ~= nil and H.textOf(top):find("not accepted", 1, true) ~= nil
+    end, 60 * 30, "the refusal")
+    check(refused, "a wrong join code is refused, and says so on screen")
+    check(exports.isConnected() == false, "and leaves us outside")
+    U.shot(game, SHOT_DIR .. "/join-code-refused.png")
+
+    check(H.enterJoinCode(game, joinCode),
+          "and the host's code can be typed on the same grid")
+    U.wait(60)
+  end
+
   local connected = H.waitFor(game, function() return exports.isConnected() end,
                               60 * 30, "the connection to open")
   check(connected, "joined over a real socket")
@@ -126,9 +175,9 @@ return function(game)
 
   -- ------- the host is a player over here too
 
-  local sawHost = H.waitFor(game, function()
+  local sawHost = H.waitSeconds(game, function()
     return #exports.players() > 0
-  end, 60 * 20, "the host to appear on the roster")
+  end, 60, "the host to appear on the roster")
   check(sawHost, "the host appears on the guest's roster")
   if sawHost then
     log("host is", tostring(exports.players()[1].name))
@@ -179,12 +228,12 @@ return function(game)
 
   -- ------- 3. chat crosses the wire in both directions
 
-  local heardHost = H.waitFor(game, function()
+  local heardHost = H.waitSeconds(game, function()
     for _, line in ipairs(exports.chat()) do
       if line.text == "HELLO FROM HOST" then return true end
     end
     return false
-  end, 60 * 60, "the host's chat line")
+  end, 120, "the host's chat line")
   check(heardHost, "the host's chat arrived")
 
   exports.say("global", "HELLO FROM GUEST")
@@ -288,13 +337,20 @@ return function(game)
       H.signal("guest_trade_requested")
 
       local wanted = "CHARIZARD"
-      local traded = H.drivePrompts(game, function()
+      local traded, trail = H.drivePrompts(game, function()
         return H.partySpecies(game)[1] == wanted
       end, 60 * 90)
       log("guest party now:", table.concat(H.partySpecies(game), ","))
+      if not traded then
+        -- the same diagnosis the host prints, which this side was missing:
+        -- "the trade did not happen" cannot distinguish a prompt that never
+        -- arrived from one that was answered and went nowhere
+        log("trade stalled -- prompts answered:", trail == "" and "(none)" or trail,
+            "top is", tostring(H.top(game) and (H.top(game).title or "?")))
+      end
       check(traded, "the guest received the host's " .. wanted)
       U.shot(game, SHOT_DIR .. "/join-after-trade.png")
-      H.await(game, "host_trade_done", 60 * 60)
+      H.await(game, "host_trade_done", 120)
 
       -- ------- 6. and a real link battle, to a decision
       --
@@ -345,7 +401,7 @@ return function(game)
           events["battle.started"], events["battle.ended"],
           events["link.desync"]))
         U.shot(game, SHOT_DIR .. "/join-after-battle.png")
-        H.await(game, "host_battle_done", 60 * 120)
+        H.await(game, "host_battle_done", 240)
 
         -- ------- 7. leave the game and keep playing
         --
@@ -355,7 +411,7 @@ return function(game)
         -- disconnecting cleanly is easy, staying playable afterwards is
         -- where a teardown bug would show.
 
-        H.await(game, "host_address_checked", 60 * 120)
+        H.await(game, "host_address_checked", 240)
         H.closeToOverworld(game)
         local opened = H.openMmo(game)
         if opened then
