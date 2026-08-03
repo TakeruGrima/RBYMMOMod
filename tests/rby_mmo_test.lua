@@ -229,6 +229,94 @@ local Chat = need("Chat")
 local SessionNet = need("SessionNet")
 local Transport = need("Transport")
 
+-- ------------------------------------------------------------------
+-- Sha256: pinned against the published standard, then against Node
+-- ------------------------------------------------------------------
+--
+-- src/Sha256.lua is a from-scratch SHA-256 / HMAC-SHA256 (its own header
+-- explains why: love.data is unavailable under this headless suite). A
+-- hand-written digest is exactly the kind of code that can be subtly wrong
+-- and still agree with itself, so every check below is against an outside
+-- source of truth -- RFC 4231, FIPS 180-4, or Node's node:crypto via
+-- tests/fixtures/hmac_vectors.lua -- never Sha256 asserting against Sha256.
+
+local Sha256 = need("Sha256")
+local Vectors = dofile(MOD_PATH .. "/tests/fixtures/hmac_vectors.lua")
+
+-- hex -> raw bytes, for RFC 4231's keys and messages, several of which are
+-- not text (a 20/131-byte key of 0x0b/0xaa, 50 bytes of 0xdd)
+local function fromHex(hex)
+  return (hex:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+for _, v in ipairs(Vectors.SHA256) do
+  eq(Sha256.hex(v.input), v.digest,
+     "Sha256.hex matches the standard vector: " .. v.label)
+end
+
+for _, v in ipairs(Vectors.RFC_HMAC) do
+  eq(Sha256.hmacHex(fromHex(v.keyHex), fromHex(v.dataHex)), v.digest,
+     "Sha256.hmacHex matches RFC 4231 test case " .. v.case)
+end
+-- case 6 alone exercises the key-longer-than-the-block path (131 bytes into
+-- a 64-byte block), so it is worth naming on its own rather than trusting
+-- the loop above to have covered it
+local case6
+for _, v in ipairs(Vectors.RFC_HMAC) do
+  if v.case == 6 then case6 = v end
+end
+check(case6 ~= nil, "RFC 4231 case 6 is present in the fixture")
+eq(#fromHex(case6.keyHex), 131,
+   "case 6's key really is longer than the HMAC block size")
+
+-- the cross-language known-answer vector server/auth.test.js already fixes.
+-- The Lua-side key is the *normalised* code as ASCII bytes -- never the
+-- dashed display form -- which is what Wire.code produces and what Hub.lua
+-- actually signs with, so this doubles as a Wire.code cross-check.
+eq(Wire.code(Vectors.KAT.code), "ABCDEFGHJKMNPQRS",
+   "the known-answer vector's code normalises the way the digest assumes")
+eq(Sha256.hmacHex(Wire.code(Vectors.KAT.code), Vectors.KAT.nonce), Vectors.KAT.digest,
+   "the cross-language known-answer vector (also fixed by server/auth.test.js) "
+   .. "reproduces exactly")
+
+-- the generated cross-language set: 24 (code, nonce) -> digest triples Node
+-- produced, covering dashed/undashed/lowercase/messy spellings of one code,
+-- every character of Config.CODE_ALPHABET across the set, and 32-hex
+-- nonces throughout. A drift in either Wire.code or Sha256.hmacHex shows up
+-- here as a specific failing label, not as "wrong join code" in the field.
+for _, v in ipairs(Vectors.CROSS) do
+  eq(Wire.code(v.code), v.normalized,
+     "Wire.code normalises like Node's normalizeCode: " .. v.label)
+  eq(Sha256.hmacHex(v.normalized, v.nonce), v.digest,
+     "Sha256.hmacHex matches the Node-generated vector: " .. v.label)
+end
+
+-- embedded \0 does not truncate the digest the way a C-string read would
+local withNul = fromHex("6162630064656600676869")
+eq(#withNul, 11, "the embedded-\\0 fixture really is 11 raw bytes")
+eq(Sha256.hex(withNul), "039829b9687ee660b05223c59daa86348bf5856dda159e65412a454c57dc1911",
+   "a NUL byte inside the message does not truncate the digest")
+
+-- the 55/56/64-byte padding boundaries: FIPS 180-4 padding needs a 0x80
+-- byte plus an 8-byte length field, so a message must be under 56 bytes to
+-- keep its padding inside the same block; 56 spills into a second block,
+-- and 64 is exactly one full block with the pad occupying an entire block
+-- of its own
+eq(Sha256.hex(string.rep("a", 55)), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+   "55 bytes -- padding still fits in the same block")
+eq(Sha256.hex(string.rep("a", 56)), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+   "56 bytes -- padding spills into a second block")
+eq(Sha256.hex(string.rep("a", 64)), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+   "64 bytes -- exactly one full block, padding is a block of its own")
+
+-- ------- Sha256.equals: constant-time, but still just equality
+
+check(Sha256.equals("abc123", "abc123"), "equals is true for identical strings")
+check(not Sha256.equals("abc123", "abc124"), "and false for a one-character difference")
+check(not Sha256.equals("abc", "abcd"), "and false when the lengths differ")
+check(Sha256.equals(fromHex("610062"), fromHex("610062")),
+      "and true for equal strings containing \\0")
+
 -- ------- Wire: the trust boundary
 
 eq(Wire.text("HELLO"), "HELLO", "plain text survives")
@@ -321,6 +409,58 @@ eq(Wire.payloadOk(nest(Config.PAYLOAD_MAX_DEPTH + 5)), false,
 local wide = {}
 for i = 1, Config.PAYLOAD_MAX_NODES + 50 do wide[i] = i end
 eq(Wire.payloadOk(wide), false, "an over-wide payload is refused")
+
+-- ------- Wire.code / Wire.hex / Wire.formatCode: the join-code sanitisers
+--
+-- Wire.code normalises exactly the way server/lib/auth.js's normalizeCode
+-- does -- same inputs, same verdicts -- so both suites assert the same
+-- cases from testNormalization() in server/auth.test.js rather than two
+-- suites that quietly drift apart on what a "valid code" is.
+
+local CODE_DASHED = "ABCD-EFGH-JKMN-PQRS"
+local CODE_UNDASHED = "ABCDEFGHJKMNPQRS"
+local CODE_LOWER = "abcd-efgh-jkmn-pqrs"
+local CODE_MESSY = " abcd efgh, jkmn! pqrs?? "
+
+eq(Wire.code(CODE_DASHED), CODE_UNDASHED, "the dashed form normalises to the bare 16 characters")
+eq(Wire.code(CODE_UNDASHED), CODE_UNDASHED, "the undashed form is unchanged")
+eq(Wire.code(CODE_LOWER), CODE_UNDASHED, "lowercase normalises the same as uppercase")
+eq(Wire.code(CODE_MESSY), CODE_UNDASHED, "spaces and stray punctuation are stripped")
+
+eq(Wire.code("ABCD-EFGH-JKMN"), nil, "a too-short input is rejected")
+eq(Wire.code("ABCD-EFGH-JKMN-PQRS-TVWX"), nil, "a too-long input is rejected")
+
+eq(Wire.code(42), nil, "a number is not a code")
+eq(Wire.code(true), nil, "a boolean is not a code")
+eq(Wire.code({}), nil, "a table is not a code")
+eq(Wire.code(nil), nil, "nil is not a code")
+
+eq(Wire.formatCode(Wire.code(CODE_DASHED)), CODE_DASHED,
+   "formatCode(code(x)) round-trips the canonical dashed form")
+eq(Wire.formatCode(Wire.code(CODE_MESSY)), CODE_DASHED,
+   "a messy input round-trips to the same canonical dashed form")
+
+-- ------- Wire.hex: the digest/nonce sanitiser
+--
+-- Not "exactly N hex characters" but "hex, and no longer than the caller's
+-- budget" -- the same string accepts a 64-char digest with the default cap
+-- and a 32-char nonce under Config.NONCE_HEX, which is exactly the two
+-- shapes that cross the wire (mmo.challenge's nonce, mmo.auth's response).
+
+local HEX64 = string.rep("a1", 32)
+local HEX32 = string.rep("b2", 16)
+
+eq(Wire.hex(HEX64), HEX64, "64 lowercase hex characters is accepted at the digest length")
+eq(#Wire.hex(HEX64), Config.DIGEST_HEX, "matching the digest length exactly")
+eq(Wire.hex(HEX32, Config.NONCE_HEX), HEX32, "32 lowercase hex characters is accepted as a nonce")
+eq(Wire.hex(HEX64, Config.NONCE_HEX), nil, "64 hex characters exceeds the 32-hex nonce budget")
+
+eq(Wire.hex(HEX64:upper()), nil, "uppercase hex is rejected")
+eq(Wire.hex(HEX64 .. "a1"), nil, "past the default digest budget is rejected")
+eq(Wire.hex("not-hex-at-all!!"), nil, "non-hex characters are rejected")
+eq(Wire.hex(""), nil, "an empty string is rejected")
+eq(Wire.hex(12345), nil, "a non-string is rejected")
+eq(Wire.hex(nil), nil, "nil is rejected")
 
 -- ------- Roster
 
@@ -592,6 +732,151 @@ for _ = 1, Config.MAX_PENDING + 6 do
 end
 eq(accepted, Config.MAX_PENDING, "pending connections are capped")
 eq(floodHub.players, 0, "and none of them are players")
+
+-- ------- authentication: an optional join-code gate in front of admission
+--
+-- Same handshake server/lib/relay.js drives on the Node side: hello, then
+-- -- only when the hub carries a code -- a challenge, then an HMAC response
+-- before the peer is admitted. A hub with no code configured must behave
+-- exactly as it always did: hello admits straight away and no challenge
+-- ever crosses the wire, which is the regression guard every player who
+-- joined before codes existed depends on.
+
+local openHub = Hub.new({ maxPlayers = 3 })
+eq(openHub:requiresCode(), false, "a hub built with no join code does not require one")
+local openClient, openPeer = join(openHub, "OPENPLAYER", "PALLET", 1, 1)
+check(openClient ~= nil, "a hub with no join code still admits on hello")
+eq(openHub.players, 1, "immediately -- no challenge round trip")
+eq(take(openPeer, Wire.CHALLENGE), nil, "and no challenge is ever sent")
+check(take(openPeer, Wire.WELCOME) ~= nil, "the welcome arrives exactly as before codes existed")
+
+-- mmo.auth with no outstanding challenge (never issued one, on a hub with
+-- no code) is a no-op, not an error
+openPeer.outbox = {}
+openHub:receive(openClient, { type = Wire.AUTH, response = string.rep("0", 64) })
+eq(#openPeer.outbox, 0, "mmo.auth with no outstanding challenge is a no-op")
+
+-- ------- a coded hub
+
+local JOIN_CODE = "ABCD-EFGH-JKMN-PQRS"
+local codedHub = Hub.new({ maxPlayers = 3, joinCode = JOIN_CODE })
+eq(codedHub:requiresCode(), true, "a hub constructed with a join code requires one")
+
+-- the answer a client owes for a given nonce, computed the way a real
+-- client would: normalise the code it was handed, then HMAC the nonce with
+-- it -- mirroring src/Sessions.lua / src/Ui.lua, not reaching into the hub
+local function answer(rawCode, nonce)
+  return Sha256.hmacHex(Wire.code(rawCode), nonce)
+end
+
+local codedPeer = fakePeer()
+local codedClient = codedHub:accept(codedPeer)
+codedHub:receive(codedClient, { type = Wire.HELLO, proto = Config.PROTOCOL,
+  name = "ASH", map = "PALLET", x = 1, y = 1, facing = "down" })
+
+eq(codedHub.players, 0, "hello alone does not seat a player on a coded hub")
+eq(codedHub:isFull(), false, "so a coded hub with only unanswered challenges is not full")
+local challenge = take(codedPeer, Wire.CHALLENGE)
+check(challenge ~= nil, "a challenge is sent instead of a welcome")
+eq(#challenge.nonce, Config.NONCE_HEX, "the nonce is 32 hex characters")
+check(challenge.nonce:match("^[0-9a-f]+$") ~= nil, "and lowercase hex")
+eq(take(codedPeer, Wire.WELCOME), nil, "no welcome until the challenge is answered")
+
+-- the correct response admits, and only now charges the seat
+codedHub:receive(codedClient, { type = Wire.AUTH, response = answer(JOIN_CODE, challenge.nonce) })
+check(take(codedPeer, Wire.WELCOME) ~= nil, "the correct response admits the player")
+eq(codedHub.players, 1, "and the seat is charged only on a successful answer")
+
+-- replaying the same accepted response again does nothing: the nonce was
+-- consumed the moment it was read, and the client is ready besides
+codedPeer.outbox = {}
+codedHub:receive(codedClient, { type = Wire.AUTH, response = answer(JOIN_CODE, challenge.nonce) })
+eq(#codedPeer.outbox, 0, "auth after admission is a no-op, not a re-welcome")
+
+-- a wrong response is refused and the connection dropped
+local wrongPeer = fakePeer()
+local wrongClient = codedHub:accept(wrongPeer)
+codedHub:receive(wrongClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "MISTY" })
+local wrongChallenge = take(wrongPeer, Wire.CHALLENGE)
+check(wrongChallenge ~= nil, "a second connection is challenged independently")
+
+codedHub:receive(wrongClient,
+  { type = Wire.AUTH, response = answer("WXYZ-2345-6789-ABCD", wrongChallenge.nonce) })
+local wrongError = take(wrongPeer, Wire.ERROR)
+check(wrongError ~= nil, "a wrong response is refused")
+check(wrongError.message:find("code"), "naming the join code as the problem")
+check(wrongPeer.closed, "and the connection is closed")
+eq(codedHub.clients[wrongClient.id], nil, "the client record is gone, not merely refused")
+eq(codedHub.players, 1, "and no seat was ever charged for it")
+
+-- a second mmo.auth on a connection that already failed is silently
+-- nothing, since the client record no longer exists to receive it
+wrongPeer.outbox = {}
+codedHub:receive(wrongClient, { type = Wire.AUTH, response = answer(JOIN_CODE, wrongChallenge.nonce) })
+eq(#wrongPeer.outbox, 0, "a message from a client the hub already forgot goes nowhere")
+
+-- a response captured for one connection's nonce does not work on another:
+-- the HMAC is bound to the nonce it answers, not just to the join code
+local nonceOwnerPeer = fakePeer()
+local nonceOwnerClient = codedHub:accept(nonceOwnerPeer)
+codedHub:receive(nonceOwnerClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "OWNER" })
+local ownerNonce = take(nonceOwnerPeer, Wire.CHALLENGE).nonce
+
+local replayPeer = fakePeer()
+local replayClient = codedHub:accept(replayPeer)
+codedHub:receive(replayClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "REPLAY" })
+local replayNonce = take(replayPeer, Wire.CHALLENGE).nonce
+check(ownerNonce ~= replayNonce, "two connections are challenged with different nonces")
+
+codedHub:receive(replayClient, { type = Wire.AUTH, response = answer(JOIN_CODE, ownerNonce) })
+eq(take(replayPeer, Wire.WELCOME), nil,
+   "a response computed for another connection's nonce does not admit this one")
+check(take(replayPeer, Wire.ERROR) ~= nil, "and is refused just like a wrong code")
+
+-- a code typed messily still authenticates: both sides normalise through
+-- Wire.code, so the display form the player typed does not have to match
+-- the display form the host was given
+local messyPeer = fakePeer()
+local messyClient = codedHub:accept(messyPeer)
+codedHub:receive(messyClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "MESSY" })
+local messyNonce = take(messyPeer, Wire.CHALLENGE).nonce
+codedHub:receive(messyClient,
+  { type = Wire.AUTH, response = answer("  abcd efgh, jkmn! pqrs  ", messyNonce) })
+check(take(messyPeer, Wire.WELCOME) ~= nil,
+      "a code typed lowercase and messily still authenticates")
+
+-- an unanswered challenge does not hold a slot forever: HELLO_TIMEOUT alone
+-- is not enough once a challenge is outstanding, but HELLO_TIMEOUT plus
+-- AUTH_TIMEOUT together reap it, same as the plain hello-timeout case above
+local ghostPeer = fakePeer()
+local ghostClient = codedHub:accept(ghostPeer)
+codedHub:receive(ghostClient, { type = Wire.HELLO, proto = Config.PROTOCOL, name = "GHOST" })
+check(take(ghostPeer, Wire.CHALLENGE) ~= nil, "the ghost connection is challenged")
+
+codedHub:update(Config.HELLO_TIMEOUT + 1)
+check(not ghostPeer.closed, "HELLO_TIMEOUT alone is not enough once challenged")
+
+codedHub:update(Config.AUTH_TIMEOUT + 1)
+check(ghostPeer.closed, "but HELLO_TIMEOUT + AUTH_TIMEOUT together reap an unanswered challenge")
+check(take(ghostPeer, Wire.ERROR) ~= nil, "having been told why")
+eq(codedHub.clients[ghostClient.id], nil, "and the slot is freed, not held forever")
+
+-- MAX_PENDING and greeted-only isFull() behave the same with a code
+-- configured: a challenged-but-unanswered peer is still just pending
+local pendingHub = Hub.new({ maxPlayers = 2, joinCode = "ZZZZ-ZZZZ-ZZZZ-ZZZZ" })
+local pendingClient, pendingPeer = join(pendingHub, "WAITING")
+check(pendingClient ~= nil, "a hello on a coded hub is still accepted")
+check(take(pendingPeer, Wire.CHALLENGE) ~= nil, "and still challenged")
+eq(pendingHub.players, 0, "but is not a player yet")
+eq(pendingHub:isFull(), false, "so isFull() does not count it")
+
+local floodCodedHub = Hub.new({ maxPlayers = 2, joinCode = "ZZZZ-ZZZZ-ZZZZ-ZZZZ" })
+local floodAccepted = 0
+for _ = 1, Config.MAX_PENDING + 6 do
+  if floodCodedHub:accept(fakePeer()) then floodAccepted = floodAccepted + 1 end
+end
+eq(floodAccepted, Config.MAX_PENDING, "pending connections are capped the same with a code configured")
+eq(floodCodedHub.players, 0, "and none of them are players")
 
 -- the host occupies a slot like anyone else, so a freed one reopens
 hub:drop(cal)
