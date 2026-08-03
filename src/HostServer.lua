@@ -13,6 +13,7 @@
 
 local need, mod = ...
 local Config = need("Config")
+local Wire = need("Wire")
 local Hub = need("Hub")
 
 local M = {}
@@ -96,8 +97,23 @@ end
 
 -- ------- lifecycle
 
-function M:start(port, maxPlayers)
+-- joinCode is optional and off unless the host chose one.  It arrives
+-- normalised, and is checked again here rather than in Hub because this is
+-- the layer that can still refuse to host: a code that will not normalise
+-- would leave Hub with none, and silently opening a game the host believed
+-- was locked is the one failure worth stopping for.  The code never reaches
+-- self.error -- an error string is read out on screen.
+function M:start(port, maxPlayers, joinCode)
   if self.running then return false, "already hosting" end
+
+  local code
+  if type(joinCode) == "string" and joinCode ~= "" then
+    code = Wire.code(joinCode)
+    if not code then
+      self.error = "that join code can't be used; pick another"
+      return false, self.error
+    end
+  end
 
   local socket = luasocket()
   if not socket then
@@ -119,7 +135,7 @@ function M:start(port, maxPlayers)
 
   self.server = server
   self.port = port
-  self.hub = Hub.new({ maxPlayers = maxPlayers })
+  self.hub = Hub.new({ maxPlayers = maxPlayers, joinCode = code })
   self.conns = {}
   self.running = true
   self.error = nil
@@ -188,7 +204,11 @@ function M:localNet()
     close = function() net.closed = true end,
   }
 
-  client = self.hub:accept(peer)
+  -- Trusted, and only this one is: the handle above never leaves this
+  -- process, so nothing off the network can obtain it -- and a join code is
+  -- for keeping strangers out, not for making the host type their own code
+  -- to walk into the game they just started.
+  client = self.hub:accept(peer, true)
   if not client then return nil, "the game is full" end
 
   net.send = function(_, msg)

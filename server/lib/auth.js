@@ -1,0 +1,287 @@
+'use strict';
+
+/*
+ * Join codes and the challenge-response that proves one.
+ *
+ * The hub sends a random nonce; the client answers
+ * HMAC-SHA256(joinCode, nonce). The join code itself never crosses the wire,
+ * so a packet capture leaks nothing reusable and a captured response cannot
+ * be replayed against the next connection's nonce.
+ *
+ * What that does *not* buy is confidentiality of the session, or any defence
+ * against an active man in the middle who proxies the whole conversation.
+ * The client's socket is plain TCP (src/link/Net.lua opens socket.tcp() and
+ * LOVE ships no TLS), so the gap is real; only an overlay network like
+ * WireGuard closes it. The docs say so in those words.
+ *
+ * Every constant and every encoding decision below is a wire contract: a
+ * pure-Lua SHA-256 reimplements this exactly on the client side, and the two
+ * must agree byte for byte or a correct join code looks like a wrong one.
+ *
+ *   key      = the normalised join code, as ASCII bytes
+ *   message  = the nonce, as its lowercase-hex ASCII *string* -- not the
+ *              decoded bytes, so the Lua side never has to hex-decode
+ *   response = the digest as 64 lowercase hex characters
+ *
+ * No dependencies: node:crypto only.
+ */
+
+const crypto = require('node:crypto');
+
+// Crockford-style: uppercase, with I L O U removed so nothing is mistyped off
+// a screenshot or a phone photo. Every character here also exists on the
+// mod's in-game naming grid (src/Ui.lua:54-67), which is the real constraint
+// -- a code a player cannot type is a code that does not work. Do not change
+// this set without changing that grid.
+const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+const CODE_GROUPS = 4;
+const CODE_GROUP_LEN = 4;
+const CODE_LEN = CODE_GROUPS * CODE_GROUP_LEN; // 16 chars = 80 bits
+const NONCE_BYTES = 16;
+
+const HEX_RESPONSE = /^[0-9a-f]{64}$/;
+const HEX_NONCE = /^[0-9a-f]+$/;
+
+// ------------------------------------------------------------------- codes
+
+function randomIndexes(count) {
+  const out = [];
+  // 256 % 32 === 0, so `byte % ALPHABET.length` happens to be uniform for
+  // today's alphabet. Rejection sampling anyway: add or drop a single
+  // character and modulo would quietly bias the low indexes, costing entropy
+  // with nothing failing loudly enough to notice.
+  const limit = 256 - (256 % ALPHABET.length);
+  while (out.length < count) {
+    for (const byte of crypto.randomBytes(count)) {
+      if (byte >= limit) continue;
+      out.push(byte % ALPHABET.length);
+      if (out.length === count) break;
+    }
+  }
+  return out;
+}
+
+/** A fresh join code in its dashed, hand-it-to-a-friend form. */
+function generateJoinCode() {
+  let code = '';
+  for (const index of randomIndexes(CODE_LEN)) code += ALPHABET[index];
+  return formatCode(code);
+}
+
+/**
+ * Total and symmetric: uppercase, then drop everything outside the alphabet.
+ * Dashes, spaces, lowercase and a stray quote from a chat client all survive
+ * the round trip, because the player who reads the code out of a message
+ * should get in without being taught a format first.
+ *
+ * Returns null when nothing usable is left, or when the result is not
+ * exactly CODE_LEN -- a short code is a typo, not a shorter key.
+ */
+function normalizeCode(value) {
+  if (typeof value !== 'string') return null;
+  let out = '';
+  const upper = value.toUpperCase();
+  for (const char of upper) {
+    if (ALPHABET.indexOf(char) >= 0) out += char;
+  }
+  return out.length === CODE_LEN ? out : null;
+}
+
+/** ABCDEFGHJKMNPQRS -> ABCD-EFGH-JKMN-PQRS */
+function formatCode(normalized) {
+  if (typeof normalized !== 'string') return '';
+  const groups = [];
+  for (let i = 0; i < normalized.length; i += CODE_GROUP_LEN) {
+    groups.push(normalized.slice(i, i + CODE_GROUP_LEN));
+  }
+  return groups.join('-');
+}
+
+// ------------------------------------------------------------- the exchange
+
+/** A per-connection, single-use challenge: 32 lowercase hex characters. */
+function newNonce() {
+  return crypto.randomBytes(NONCE_BYTES).toString('hex');
+}
+
+/**
+ * The response a client owes for `nonce`, given `code`. Accepts a raw or an
+ * already-normalised code and normalises internally, so callers never have to
+ * remember which form they are holding.
+ *
+ * Throws on an unnormalisable code: signing with a key nobody can type is a
+ * programming error at the call site, not untrusted input to be swallowed.
+ * Untrusted input arrives at verify(), which never throws.
+ */
+function sign(code, nonce) {
+  const key = normalizeCode(code);
+  if (key === null) {
+    throw new TypeError(
+      `join code is not usable: expected ${CODE_LEN} characters from ` +
+      `${ALPHABET} after normalisation`);
+  }
+  if (typeof nonce !== 'string' || !nonce) {
+    throw new TypeError('nonce must be a non-empty hex string');
+  }
+  return crypto
+    .createHmac('sha256', Buffer.from(key, 'ascii'))
+    .update(nonce, 'ascii')
+    .digest('hex');
+}
+
+// --------------------------------------------------------------- credentials
+
+/**
+ * A credential admits only while it is un-revoked, unexpired, and under its
+ * use budget. An expiry that will not parse counts as expired: a lifetime the
+ * hub cannot read is not one to admit on.
+ */
+function isActive(credential, now = Date.now()) {
+  if (!credential || typeof credential !== 'object') return false;
+  if (credential.revoked) return false;
+  if (typeof credential.secret !== 'string' || !credential.secret) return false;
+
+  if (credential.expiresAt !== null && credential.expiresAt !== undefined) {
+    const at = Date.parse(credential.expiresAt);
+    if (!Number.isFinite(at) || at <= now) return false;
+  }
+
+  if (credential.maxUses !== null && credential.maxUses !== undefined) {
+    const max = Number(credential.maxUses);
+    if (!Number.isFinite(max) || max <= 0) return false;
+    const uses = Number(credential.uses || 0);
+    if (Number.isFinite(uses) && uses >= max) return false;
+  }
+
+  return true;
+}
+
+function activeCredentials(credentials, now = Date.now()) {
+  if (!Array.isArray(credentials)) return [];
+  return credentials.filter((credential) => isActive(credential, now));
+}
+
+/**
+ * Check a client's `response` to `nonce` against every active credential.
+ *
+ * Failure reasons are deliberately coarse -- 'malformed', 'no_credentials',
+ * 'rejected' -- and never name a credential. A wrong code, an expired invite
+ * and a revoked one must look identical from outside, or the refusal itself
+ * becomes an oracle for enumerating which invites a hub has issued.
+ */
+function verify(nonce, response, credentials, now = Date.now()) {
+  if (typeof nonce !== 'string' || !nonce || !HEX_NONCE.test(nonce)) {
+    return { ok: false, credentialId: null, reason: 'malformed' };
+  }
+  // Shape-check before any crypto: a 64-lowercase-hex string is the only
+  // thing this can be, and rejecting the rest here keeps a peer from
+  // spending the hub's HMACs on garbage.
+  if (typeof response !== 'string' || !HEX_RESPONSE.test(response)) {
+    return { ok: false, credentialId: null, reason: 'malformed' };
+  }
+
+  const active = activeCredentials(credentials, now);
+  if (active.length === 0) {
+    return { ok: false, credentialId: null, reason: 'no_credentials' };
+  }
+
+  const given = Buffer.from(response, 'ascii');
+  let hit = null;
+
+  for (const credential of active) {
+    const key = normalizeCode(credential.secret);
+    if (key === null) continue; // a stored secret that will not normalise
+
+    const expected = Buffer.from(sign(key, nonce), 'ascii');
+    // Length is equal by construction (both are 64 hex chars), but
+    // timingSafeEqual throws rather than returning false on a mismatch, so
+    // the guard stays.
+    const same = expected.length === given.length &&
+      crypto.timingSafeEqual(expected, given);
+
+    // No early exit. Breaking here would make the hub answer faster for the
+    // first credential in the list than for the last, which leaks the
+    // position of the code that matched -- and, across many attempts, how
+    // many credentials a hub is carrying.
+    if (same && hit === null) hit = credential;
+  }
+
+  if (hit === null) return { ok: false, credentialId: null, reason: 'rejected' };
+  return { ok: true, credentialId: hit.id || null, reason: null };
+}
+
+/**
+ * A credential in the shape config.json stores (plan §3.5). The secret is
+ * generated when none is given, so the common path -- `init`, `invite` --
+ * never invents one by hand.
+ */
+function newCredential(options = {}) {
+  const { label, secret, expiresAt = null, maxUses = null } = options;
+
+  let stored;
+  if (secret === undefined || secret === null || secret === '') {
+    stored = generateJoinCode();
+  } else {
+    const normalized = normalizeCode(secret);
+    if (normalized === null) {
+      throw new TypeError(
+        `join code is not usable: expected ${CODE_LEN} characters from ` +
+        `${ALPHABET} after normalisation`);
+    }
+    stored = formatCode(normalized);
+  }
+
+  let expires = null;
+  if (expiresAt instanceof Date) {
+    expires = expiresAt.toISOString();
+  } else if (typeof expiresAt === 'string' && expiresAt) {
+    const at = Date.parse(expiresAt);
+    if (!Number.isFinite(at)) {
+      throw new TypeError(`expiresAt is not a date: ${expiresAt}`);
+    }
+    expires = new Date(at).toISOString();
+  } else if (typeof expiresAt === 'number' && Number.isFinite(expiresAt)) {
+    expires = new Date(expiresAt).toISOString();
+  }
+
+  let uses = null;
+  if (maxUses !== null && maxUses !== undefined) {
+    const max = Math.floor(Number(maxUses));
+    if (!Number.isFinite(max) || max < 1) {
+      throw new TypeError(`maxUses must be a positive integer: ${maxUses}`);
+    }
+    uses = max;
+  }
+
+  return {
+    // Short and hex: it goes in log lines and `revoke <id>`, so it has to be
+    // repeatable off a terminal without being guessable enough to matter --
+    // and it is an identifier, not a secret.
+    id: crypto.randomBytes(4).toString('hex'),
+    label: typeof label === 'string' && label ? label : 'Join code',
+    secret: stored,
+    createdAt: new Date().toISOString(),
+    expiresAt: expires,
+    maxUses: uses,
+    uses: 0,
+    revoked: false,
+  };
+}
+
+module.exports = {
+  ALPHABET,
+  CODE_GROUPS,
+  CODE_GROUP_LEN,
+  CODE_LEN,
+  NONCE_BYTES,
+  generateJoinCode,
+  normalizeCode,
+  formatCode,
+  newNonce,
+  sign,
+  verify,
+  isActive,
+  activeCredentials,
+  newCredential,
+};

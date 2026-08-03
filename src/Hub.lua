@@ -14,6 +14,15 @@
 -- the session pairing be tested under plain luajit, which has no luasocket
 -- and no LOVE.
 --
+-- The host may put a join code on the game.  When they do, hello is
+-- answered with a nonce and the peer owes an HMAC of it keyed by the code
+-- (plan §3.2); the code itself never crosses the wire, and a peer that has
+-- not answered is on nobody's roster.  Default is off -- two people on the
+-- same couch should not have to type a secret at each other -- and the
+-- exchange with no code configured is byte-identical to what it was before
+-- codes existed.  server/lib/relay.js runs the same handshake message for
+-- message, so a joining client cannot tell the two hosting paths apart.
+--
 -- Everything arriving here is untrusted -- it comes from another player's
 -- process, and a modified one is a normal thing to meet -- so every field
 -- is re-derived through Wire before it is believed.
@@ -21,20 +30,43 @@
 local need = ...
 local Config = need("Config")
 local Wire = need("Wire")
+local Sha256 = need("Sha256")
 
 local M = {}
 M.__index = M
+
+-- The least predictable values this process can reach without a permission
+-- it does not have.  None of them is a random source; newNonce says so.
+local function entropy()
+  local parts = {
+    tostring(collectgarbage("count")),   -- live heap, in KB with a fraction
+    tostring({}),                        -- where a fresh table landed
+  }
+  if os then
+    parts[#parts + 1] = tostring(os.time())
+    parts[#parts + 1] = tostring(os.clock())
+  end
+  return table.concat(parts, "|")
+end
 
 function M.new(opts)
   opts = opts or {}
   return setmetatable({
     limit = Config.clampPlayers(opts.maxPlayers),
+    -- Absent is nil, never "": a hub with no code admits anyone who says
+    -- hello, which is what a LAN game wants.  Re-normalised on the way in
+    -- because a code that does not survive normalisation is a code no
+    -- player could type; Wire.code is idempotent, so a caller that already
+    -- normalised loses nothing by it.
+    joinCode = Wire.code(opts.joinCode),
     clients = {},     -- id -> client (greeted or not)
     count = 0,        -- connections
-    players = 0,      -- of those, the ones that have said hello
+    players = 0,      -- of those, the ones that have been admitted
     sessions = {},    -- sessionId -> { a, b, kind }
     nextId = 1,
     nextSession = 1,
+    nextNonce = 0,
+    seed = entropy(),
     clock = 0,
   }, M)
 end
@@ -47,6 +79,42 @@ end
 
 function M:pendingCount()
   return self.count - self.players
+end
+
+-- Is this hub asking for a join code?  The code itself stays here: nothing
+-- outside needs it, and the fewer places hold it the fewer can leak it.
+function M:requiresCode()
+  return self.joinCode ~= nil
+end
+
+-- A fresh challenge nonce, 16 bytes as lowercase hex -- the same shape
+-- server/lib/auth.js emits, so both hosting paths challenge identically.
+--
+-- **This is not a cryptographic random source and does not pretend to be
+-- one.** There is none reachable from here: LOVE ships no randomBytes,
+-- love.math.random is a seeded xorshift, Lua's math.random is a PRNG seeded
+-- off the clock, and /dev/urandom would mean a filesystem permission this
+-- mod does not declare. What this does instead is hash a per-hub seed
+-- (heap size, a table's address, wall and CPU clock at start-up) together
+-- with a counter, the host's uptime and the same values sampled again now.
+--
+-- What that buys: nonces never repeat within a run -- the counter alone
+-- guarantees it -- and they are not derivable from anything on the wire, so
+-- a captured response cannot be replayed against a later connection. What
+-- it does not buy: an attacker who could pin down when the host started and
+-- what its heap looked like could narrow the pool down. Replay is harder,
+-- not impossible. A hub exposed to the open internet should be the
+-- dedicated one in server/, whose nonces come from crypto.randomBytes.
+function M:newNonce()
+  self.nextNonce = self.nextNonce + 1
+  local digest = Sha256.hex(table.concat({
+    self.seed, tostring(self.nextNonce), tostring(self.clock), entropy(),
+  }, "|"))
+  -- Sha256 returns nil plus a reason rather than raising; every argument
+  -- above is a string, so this is a guard against a future edit, not a
+  -- path a peer can reach.
+  if type(digest) ~= "string" then return nil end
+  return digest:sub(1, Config.NONCE_HEX)
 end
 
 -- ------- plumbing
@@ -104,7 +172,12 @@ end
 -- a seat forever, so four silent sockets could lock everyone out of a
 -- four-player game. What is bounded here is the number of un-greeted
 -- connections, and update() reaps the ones that never introduce themselves.
-function M:accept(peer)
+--
+-- `trusted` is the one exemption from the join code, and only HostServer's
+-- in-process peer gets it: that handle is created inside this process and
+-- cannot be reached from a socket, and challenging it would mean asking the
+-- host to type the code they just chose in order to enter their own game.
+function M:accept(peer, trusted)
   if self:pendingCount() >= Config.MAX_PENDING then
     self:refuse(peer, "Too many connections. Try again.")
     return nil
@@ -113,6 +186,7 @@ function M:accept(peer)
     since = self.clock,
     id = tostring(self.nextId),
     peer = peer,
+    trusted = trusted and true or false,
     ready = false,
     name = nil,
     sprite = Config.DEFAULT_SPRITE,
@@ -120,11 +194,40 @@ function M:accept(peer)
     sessionId = nil,
     pendingTo = nil,
     lastChat = -math.huge,
+    hello = nil,      -- what it said, held until it is admitted
+    nonce = nil,      -- the challenge it still owes an answer to
   }
   self.nextId = self.nextId + 1
   self.clients[client.id] = client
   self.count = self.count + 1
   return client
+end
+
+-- Take the seat: publish the presence captured at hello and tell everyone.
+--
+-- Reached straight from hello on a hub with no code, and from a passing
+-- mmo.auth on one with a code.  It is the only way onto the roster, which
+-- is the point: a peer that still owes an answer must not be visible to,
+-- or addressable by, the players already in the game.
+function M:admit(client)
+  local hello = client.hello or {}
+  client.name = hello.name
+  client.sprite = hello.sprite or Config.DEFAULT_SPRITE
+  client.profile = hello.profile
+  client.map, client.x, client.y = hello.map, hello.x, hello.y
+  client.facing = hello.facing or "down"
+  client.hello, client.nonce = nil, nil
+  client.ready = true
+  self.players = self.players + 1
+
+  local players = {}
+  for id, other in pairs(self.clients) do
+    if other.ready and id ~= client.id then
+      players[#players + 1] = presenceOf(other)
+    end
+  end
+  send(client, Wire.WELCOME, { id = client.id, players = players })
+  self:broadcast(Wire.JOIN, { player = presenceOf(client) }, client.id)
 end
 
 function M:drop(client)
@@ -212,24 +315,50 @@ handlers[Wire.HELLO] = function(self, client, msg)
       ("This hub is full (%d players)."):format(self.limit))
   end
 
-  client.name = name
-  client.sprite = Wire.spriteId(msg.sprite) or Config.DEFAULT_SPRITE
-  client.profile = Wire.profile(msg.profile)
-  client.map = Wire.mapId(msg.map)
-  client.x = Wire.int(msg.x, 0, 4096)
-  client.y = Wire.int(msg.y, 0, 4096)
-  client.facing = Wire.facing(msg.facing) or "down"
-  client.ready = true
-  self.players = self.players + 1
+  -- Held rather than applied: on a hub with a code this peer is not a
+  -- player yet, and half-applied fields would be a player nobody admitted.
+  client.hello = {
+    name = name,
+    sprite = Wire.spriteId(msg.sprite) or Config.DEFAULT_SPRITE,
+    profile = Wire.profile(msg.profile),
+    map = Wire.mapId(msg.map),
+    x = Wire.int(msg.x, 0, 4096),
+    y = Wire.int(msg.y, 0, 4096),
+    facing = Wire.facing(msg.facing) or "down",
+  }
 
-  local players = {}
-  for id, other in pairs(self.clients) do
-    if other.ready and id ~= client.id then
-      players[#players + 1] = presenceOf(other)
-    end
+  if client.trusted or not self:requiresCode() then
+    return self:admit(client)
   end
-  send(client, Wire.WELCOME, { id = client.id, players = players })
-  self:broadcast(Wire.JOIN, { player = presenceOf(client) }, client.id)
+
+  -- Challenging after hello rather than on connect keeps the client's
+  -- send-hello-immediately flow intact, and spends no nonce on a peer whose
+  -- protocol did not match anyway.
+  local nonce = self:newNonce()
+  if not nonce then
+    return self:refuseClient(client, "This game can't take players right now.")
+  end
+  client.nonce = nonce
+  send(client, Wire.CHALLENGE, { nonce = nonce })
+end
+
+handlers[Wire.AUTH] = function(self, client, msg)
+  -- Only while a challenge is outstanding, and the nonce is spent the moment
+  -- it is read -- pass or fail -- so neither a captured response nor a second
+  -- guess can be tried against the same challenge.
+  if client.ready or not client.nonce then return end
+  local nonce = client.nonce
+  client.nonce = nil
+
+  local response = Wire.hex(msg.response, Config.DIGEST_HEX)
+  local expected = self.joinCode and Sha256.hmacHex(self.joinCode, nonce)
+  -- Sha256.equals, never ==: a plain compare on a digest returns as soon as
+  -- two bytes differ, and a peer that can time this hub's answer recovers a
+  -- valid response one byte at a time.
+  if not (response and expected and Sha256.equals(expected, response)) then
+    return self:refuseClient(client, "That join code was not accepted.")
+  end
+  self:admit(client)
 end
 
 handlers[Wire.MOVE] = function(self, client, msg)
@@ -351,10 +480,17 @@ function M:update(dt)
 
   -- Reap connections that never introduced themselves. Without this a peer
   -- can hold a slot indefinitely simply by saying nothing.
+  --
+  -- A peer that was challenged gets AUTH_TIMEOUT on top to answer, and it is
+  -- still measured from when it arrived: anchoring the deadline at accept
+  -- means re-sending hello for a fresh nonce cannot renew it, so an
+  -- unanswered challenge is as reapable as an unspoken hello.
   local stale
   for _, client in pairs(self.clients) do
+    local deadline = Config.HELLO_TIMEOUT
+    if client.nonce then deadline = deadline + Config.AUTH_TIMEOUT end
     if not client.ready
-       and (self.clock - (client.since or 0)) > Config.HELLO_TIMEOUT then
+       and (self.clock - (client.since or 0)) > deadline then
       stale = stale or {}
       stale[#stale + 1] = client
     end

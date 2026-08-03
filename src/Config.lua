@@ -8,7 +8,7 @@ M.MOD_ID = "rby_mmo"
 -- Bumped when a wire change is not backward compatible.  The hub refuses a
 -- client whose PROTOCOL differs, with a message naming both versions --
 -- silently talking a different dialect is the worst failure mode here.
-M.PROTOCOL = 1
+M.PROTOCOL = 2
 
 M.DEFAULT_HUB = "127.0.0.1:7788"
 M.DEFAULT_PORT = 7788
@@ -72,6 +72,34 @@ M.TIMEOUT = 30
 -- their own, larger allowance and a deadline to introduce themselves.
 M.MAX_PENDING = 8
 M.HELLO_TIMEOUT = 10
+-- ...and the same deal for the challenge->answer leg: a peer that greeted
+-- us but never answers the nonce is still holding a pending slot, so it
+-- gets its own deadline.  Same 10s as HELLO_TIMEOUT -- the answer is one
+-- HMAC over 32 bytes, so anything slower than saying hello was is a stall,
+-- not a slow machine.
+M.AUTH_TIMEOUT = 10
+
+-- Join codes.  Kept in lockstep with server/lib/auth.js -- both ends derive
+-- the HMAC key from the same normalised bytes, so a drift here locks
+-- players out with no error to read.
+--
+-- Crockford-style: I, L, O and U are gone, so nothing is mistyped off a
+-- screenshot (1/I, 0/O) and no code spells anything.  The deeper reason the
+-- alphabet is this and not base32 or hex is that every character here is on
+-- the mod's own naming grid (src/Ui.lua:51-64), dash included and on both
+-- pages -- a code has to be typeable with a d-pad, without a page flip.
+M.CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+M.CODE_LEN = 16             -- 16 symbols of 5 bits = 80 bits of secret
+M.CODE_GROUP_LEN = 4        -- displayed in fours: ABCD-EFGH-JKMN-PQRS
+-- What the naming grid will let you type for a code: the dashed form is 19
+-- characters, and the slop is there because a player pasting from a chat
+-- message may bring spare punctuation that normalisation drops anyway.
+M.CODE_ENTRY_MAX = 24
+
+-- The challenge nonce is 16 random bytes, lowercase hex on the wire...
+M.NONCE_HEX = 32
+-- ...and the answer is an HMAC-SHA256 digest, likewise lowercase hex.
+M.DIGEST_HEX = 64
 
 -- Relay payloads are forwarded unread, so their *shape* is all that can be
 -- checked. A packed party is five or six levels deep; these leave enormous

@@ -10,6 +10,7 @@
 local need, mod = ...
 local Config = need("Config")
 local Wire = need("Wire")
+local Sha256 = need("Sha256")
 local Transport = need("Transport")
 local Roster = need("Roster")
 local Avatars = need("Avatars")
@@ -43,6 +44,15 @@ ctx.server = server
 
 local presenceClock = 0
 local lastSent = { map = nil, x = nil, y = nil, facing = nil, busy = nil }
+
+-- Which hub this connection is talking to, and whether its challenge has
+-- already been answered.  Both belong to exactly one connection: an
+-- mmo.error means "wrong join code" only when it lands after we answered a
+-- challenge and before we were welcomed, and only the hub we dialled may be
+-- offered the code stored for it.  nil while hosting -- the local net has no
+-- address, so the host's own copy answers with the option row's code.
+local dialled = nil
+local authSent = false
 
 -- ------- helpers
 
@@ -108,6 +118,62 @@ function M.setJoinAddress(a, b)
   if type(address) ~= "string" or address == "" then return nil end
   mod.save:set("hub", address)
   return address
+end
+
+-- Where a hub's join code is kept.
+--
+-- One key per hub, because a player who plays on two of them should not have
+-- to retype either -- and because the code is a secret that belongs to one
+-- hub: keying it to the address it was typed for is what stops one hub being
+-- handed another's. The address is lower-cased and stripped of spaces so the
+-- same hub, typed twice, is one key; nothing else is inferred from it (a
+-- guessed default port would key a hub the transport never dials).
+local function codeKey(address)
+  if type(address) ~= "string" then return nil end
+  local clean = address:lower():gsub("%s+", "")
+  if clean == "" then return nil end
+  return "code:" .. clean
+end
+
+-- The join code for a hub, normalised into the bytes the HMAC is keyed with.
+--
+-- No address means no per-hub code -- hosting, where the local net has no
+-- address -- and falls through to the option row, which is the standing code
+-- for a player who only ever plays on one hub. Same shape as joinAddress:
+-- the in-game value wins, the option is the default.
+function M.joinCode(a, b)
+  local key = codeKey(arg1(a, b))
+  local stored = key and mod.save:get(key)
+  return Wire.code(stored) or Wire.code(mod.options:get("code"))
+end
+
+-- Stores the *normalised* form, never what was typed: the dashes, the case
+-- and any punctuation that came with a pasted code are all noise the HMAC
+-- key must not carry. Refuses anything that is not a code rather than
+-- storing a half-code that would fail every challenge silently.
+function M.setJoinCode(a, b, c)
+  local address, value
+  if a == M then address, value = b, c else address, value = a, b end
+  local code = Wire.code(value)
+  local key = codeKey(address)
+  if not (code and key) then return nil end
+  mod.save:set(key, code)
+  return code
+end
+
+-- Put the player in front of the code screen.
+--
+-- Reached when a hub asks for a code we do not have, and when it refuses the
+-- one we do. Either way the alternative is a connection that simply stops,
+-- with nothing on screen to act on.
+function M.askJoinCode(game, address, reconnect)
+  game = game or ctx.game
+  if not game then return false end
+  mod.ui.push(game, Ui.SCREEN.JOINCODE, {
+    address = address,
+    connect = reconnect and true or false,
+  })
+  return true
 end
 
 -- The name other players see.
@@ -236,12 +302,14 @@ function M.connect(a, b)
     return false
   end
 
-  local ok, err = transport:connect(M.joinAddress())
+  local address = M.joinAddress()
+  local ok, err = transport:connect(address)
   if not ok then
     ui:say(tostring(err or "Couldn't connect."))
     return false
   end
 
+  dialled, authSent = address, false
   M.sendHello(game)
   M.applyLook(game)
   return true
@@ -277,6 +345,7 @@ function M.host(a, b)
   end
 
   transport:attach(net)
+  dialled, authSent = nil, false
   M.sendHello(game)
   M.applyLook(game)
   return true
@@ -315,6 +384,7 @@ function M.disconnect()
   ctx.chat:clear()
   transport:close()
   lastSent = { map = nil, x = nil, y = nil, facing = nil, busy = nil }
+  dialled, authSent = nil, false
 end
 
 -- Leaving covers both shapes so callers never have to ask which they are:
@@ -390,6 +460,56 @@ end
 
 local handlers = {}
 
+-- The hub wants a join code before it will let anyone in.
+--
+-- It sends a nonce; the answer is an HMAC of that nonce keyed by the code,
+-- so the code itself never crosses the wire -- a capture cannot be replayed
+-- (the nonce is single-use) and cannot be turned back into the code. The
+-- exact contract is mirrored by server/lib/auth.js: key is the normalised
+-- code as ASCII, message is the nonce as its lowercase-hex *string*, and a
+-- drift in either reaches the player as nothing but "wrong join code".
+--
+-- A hub with no code configured never sends this, so an unauthenticated
+-- game is the exchange it always was.
+handlers[Wire.CHALLENGE] = function(game, msg)
+  -- the hub is a stranger's process like every other peer, so its framing
+  -- is checked exactly as hard as a player's
+  local nonce = Wire.hex(msg.nonce, Config.NONCE_HEX)
+  if not nonce then
+    mod.log:warn("the hub sent a challenge we cannot read; ignoring it -- if "
+      .. "joining keeps failing, the hub is running a different build")
+    return
+  end
+
+  local address = dialled
+  local code = M.joinCode(address)
+  if not code then
+    -- Nothing to answer with. Hang up first: the hub gives an answer ten
+    -- seconds (Config.AUTH_TIMEOUT) and typing sixteen characters on a d-pad
+    -- is not ten seconds, so holding the socket open only buys the player a
+    -- connection that dies behind the screen they are still typing on.
+    M.disconnect()
+    ui:say("This game needs a\njoin code.", function()
+      M.askJoinCode(game, address, address ~= nil)
+    end)
+    return
+  end
+
+  local response, why = Sha256.hmacHex(code, nonce)
+  if not response then
+    -- `why` names the argument, never its value: the code does not go to the
+    -- log, here or anywhere else
+    mod.log:warn("could not answer the hub's challenge (%s) -- re-enter the "
+      .. "code from START > MMO > JOIN CODE", tostring(why))
+    M.disconnect()
+    ui:say("Couldn't answer\nthis game's code.")
+    return
+  end
+
+  authSent = true
+  transport:send(Wire.AUTH, { response = response })
+end
+
 handlers[Wire.WELCOME] = function(game, msg)
   local id = Wire.id(msg.id)
   if not id then
@@ -460,10 +580,22 @@ handlers[Wire.SESSION_END] = function(_, msg)
   sessions:onSessionEnd(msg and msg.reason)
 end
 
-handlers[Wire.ERROR] = function(_, msg)
+handlers[Wire.ERROR] = function(game, msg)
   local text = Wire.text(msg.message, 120) or "The hub refused the connection."
+  -- A refusal that lands after we answered a challenge and before we were
+  -- welcomed is the wrong join code, whatever sentence the hub chose to say
+  -- it in -- so the hub's words are shown, and then the code screen, rather
+  -- than a refusal with nowhere to go from. The stored code is kept: a typo
+  -- is likelier than a rotated code, and clearing it would cost the player
+  -- the one they had.
+  local wrongCode = authSent and not transport:isReady()
+  local address = dialled
   transport:fail(text)
-  ui:say(text)
+  if wrongCode then
+    ui:say(text, function() M.askJoinCode(game, address, address ~= nil) end)
+  else
+    ui:say(text)
+  end
 end
 
 -- ------- the tick
@@ -523,6 +655,14 @@ function M.install()
       default = Config.DEFAULT_PLAYERS,
       min = Config.MIN_PLAYERS, max = Config.MAX_PLAYERS, step = 1 },
     { key = "hub", label = "JOIN", type = "text", default = Config.DEFAULT_HUB },
+    -- The standing join code, so it can be seen and changed deliberately
+    -- rather than only when a hub happens to ask for it. A code typed for a
+    -- particular hub is stored against that hub (see M.joinCode); this row
+    -- is the fallback, and the one a player who only ever plays on one hub
+    -- ever needs. maxLen so the manager's own naming screen accepts a
+    -- dashed code instead of cutting it at seven characters.
+    { key = "code", label = "JOIN CODE", type = "text", default = "",
+      maxLen = Config.CODE_ENTRY_MAX },
     { key = "sprite", label = "MY SPRITE", type = "choice",
       default = Config.DEFAULT_SPRITE, choices = spriteChoices },
     { key = "bubbles", label = "BUBBLES", type = "toggle", default = true },

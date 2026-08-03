@@ -13,6 +13,7 @@
 
 local need, mod = ...
 local Config = need("Config")
+local Wire = need("Wire")
 local Chat = need("Chat")
 local World = need("World")
 local Chars = need("Chars")
@@ -34,6 +35,7 @@ local SCREEN = {
   HOSTSET  = "RbyMmoHostSetup",
   HOSTINFO = "RbyMmoHostInfo",
   JOINADDR = "RbyMmoJoinAddress",
+  JOINCODE = "RbyMmoJoinCode",
   CHARSET  = "RbyMmoCharSetup",
   CHARPICK = "RbyMmoCharPick",
   PROFILE  = "RbyMmoProfile",
@@ -225,6 +227,13 @@ function M:install()
     return ctxInfo.lower and DIGITS or LETTERS
   end)
 
+  -- The mod manager opens its own naming screen for a text option and
+  -- titles it "<LABEL>?", which is a title this mod never pushes and so
+  -- would fall through to the vanilla grid -- the one with no digits on it.
+  -- A join code is half digits, so the JOIN CODE option row would be
+  -- untypeable there. Claiming that title too is the whole fix.
+  ownTitle("JOIN CODE?")
+
   screens:register(SCREEN.TEXT, { new = function(game, opts)
     opts = opts or {}
     return mod.ui.TextBox.new(game, opts.text or "", opts.onDone)
@@ -330,6 +339,13 @@ function M:install()
             onReady = function() mod.ui.push(game, SCREEN.JOINADDR) end,
           })
         end,
+      }
+      -- Set the code before anyone asks for it. A hub that wants one asks
+      -- mid-connect, which is a poor moment to discover you have to type
+      -- sixteen characters; this row is the same screen, reached calmly.
+      items[#items + 1] = {
+        label = "JOIN CODE",
+        onSelect = function() mod.ui.push(game, SCREEN.JOINCODE) end,
       }
     end
 
@@ -494,6 +510,59 @@ function M:install()
       onDone = function(address)
         if not client:setJoinAddress(address) then return end
         client:connect(game)
+      end,
+    })
+  end })
+
+  -- ------- joining: the code that gets you past the door
+
+  -- The dashed form is 19 characters and a text box is 18 columns, so the
+  -- code is shown two groups to a line rather than left to wrap wherever the
+  -- box runs out: a code broken after 18 characters reads as a typo.
+  local function codeLines(code)
+    local shown = Wire.formatCode(code) or ""
+    local half = Config.CODE_GROUP_LEN * 2 + 1        -- "ABCD-EFGH"
+    return shown:sub(1, half) .. "\n" .. shown:sub(half + 2)
+  end
+
+  -- Reached two ways: deliberately, from the MMO menu, and automatically
+  -- when a hub asks for a code this copy does not have. opts.connect is the
+  -- only difference between them -- it says whether a connection is waiting
+  -- on the answer, in which case saving the code dials again rather than
+  -- leaving the player to walk back through the menu.
+  screens:register(SCREEN.JOINCODE, { new = function(game, opts)
+    opts = opts or {}
+    local client = ctx.client
+    local address = opts.address or client:joinAddress()
+    return mod.ui.NamingScreen.new(game, {
+      title = ownTitle("JOIN CODE"),
+      -- the entry cap, not CODE_LEN: a player copying ABCD-EFGH-JKMN-PQRS
+      -- types 19 characters for a 16-character secret, and normalisation is
+      -- what removes the difference
+      maxLen = Config.CODE_ENTRY_MAX,
+      -- Deliberately no `default`: NamingScreen uses it as the answer when
+      -- nothing was typed, so a stored code would be silently re-submitted
+      -- by pressing ED on an empty line -- exactly the code that was just
+      -- refused, resubmitted with no way to tell.
+      onDone = function(text)
+        local code = Wire.code(text)
+        if not code then
+          -- say what shape it should be, and come back to the grid: a code
+          -- that vanished into nothing would look like it was accepted
+          return mod.ui.push(game, SCREEN.TEXT, {
+            text = ("That isn't a join\ncode. It's %d\nletters and digits."):
+              format(Config.CODE_LEN),
+            onDone = function() mod.ui.push(game, SCREEN.JOINCODE, opts) end,
+          })
+        end
+        client:setJoinCode(address, code)
+        if opts.connect then
+          client:connect(game)
+          return
+        end
+        mod.ui.push(game, SCREEN.TEXT, {
+          text = ("Join code saved:\n%s"):format(codeLines(code)),
+        })
       end,
     })
   end })
