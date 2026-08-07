@@ -39,9 +39,17 @@ M.MOD_ID = "rby_mmo"
 -- middle of a game (mmo.sprite -- a hub that has never heard the type
 -- answers it with silence, so the player who picked somebody new would be
 -- the only person in the game who could see it).  7 is the first number
--- that means all of it.  This number lives here and in
--- server/lib/relay.js -- bump them together.
-M.PROTOCOL = 7
+-- that means all of it.
+--
+-- 8 is mmo.party_event -- what the person you are travelling with just did,
+-- fanned out by the hub to the party and to nobody else.  The rule that moved
+-- every number above moves this one: a protocol-7 hub has never heard the
+-- type, so its handler table answers it with silence, and a player would
+-- watch their partner fight all evening and never be told a thing.  Neither
+-- end could tell that from an ordinary quiet route, which is exactly the
+-- silence this number exists to turn into a sentence.  This number lives here
+-- and in server/lib/relay.js -- bump them together.
+M.PROTOCOL = 8
 
 -- The port an in-game host binds, and the one a bare address is completed
 -- with.
@@ -307,11 +315,11 @@ M.COOP_STALL_TIMEOUT = 75
 M.CHAT_SCOPES = { "global", "local", "private", "party" }
 M.LOCAL_RADIUS = 12          -- tiles, and same map
 M.CHAT_HISTORY = 64          -- lines kept for the chat screen
-M.BUBBLE_SECONDS = 5         -- how long a bubble floats over a head
 M.MESSAGE_MAX = 60           -- longest message accepted off the wire
 -- What the naming grid will let you type.  Shorter than MESSAGE_MAX on
 -- purpose: the grid shows the line being typed on one 20-tile row, and a
--- bubble that overflows its box is worse than a message you have to split.
+-- line that has to be truncated to be shown is worse than one the player was
+-- asked to split themselves.
 M.COMPOSE_MAX = 16
 -- A hub's message of the day: one line an operator writes once and every
 -- arrival reads, delivered on the welcome and shown in the scrollback as a
@@ -329,6 +337,31 @@ M.COMPOSE_MAX = 16
 -- is exactly as connected as before.  Nothing goes unexplained on any
 -- screen, so nothing is owed a refusal.
 M.MOTD_MAX = 120
+
+-- ------- toasts
+--
+-- The transient lines src/Toast.lua stacks in the corner: what somebody
+-- said, who arrived, what your partner just beat.  Five seconds is long
+-- enough to read a sentence while walking and short enough that a busy hub
+-- does not leave a wall of text on screen; five lines is what the stack may
+-- hold before the oldest is dropped, and dropping the oldest is right
+-- because the newest line is the one the player has not read yet.
+M.TOAST_SECONDS = 5
+M.TOAST_MAX = 5
+
+-- Rajdhani Regular, SIL Open Font License 1.1 (assets/fonts/OFL.txt).
+--
+-- Its own face rather than the game's, and that is the point: the ROM font
+-- is extracted from the player's cartridge and carries no lowercase and
+-- almost no punctuation, so a chat line drawn with it loses characters
+-- silently.  A toast has to be able to show a sentence somebody typed.
+--
+-- Size is in window pixels and deliberately small -- toasts are read in
+-- passing, not as a second HUD.  The path is relative to the mod root,
+-- which is what mod.assets:path expects -- the same shape as OWN_CHARS'
+-- `dir` above.
+M.TOAST_FONT = "assets/fonts/Rajdhani-Regular.ttf"
+M.TOAST_SIZE = 12
 
 -- Presence liveness.  The hub drops a client that stops pinging; the client
 -- gives up on a hub that stops answering.
