@@ -38,7 +38,7 @@ const {
   cleanText, cleanId, cleanSpriteId, cleanMapId, cleanInt, cleanHex,
   cleanProfile, cleanOutcome, cleanPoints, cleanPlayerId, payloadOk, FACINGS,
   KINDS, SCOPES, NAME_MAX, MESSAGE_MAX, MOTD_MAX, LOCAL_RADIUS,
-  cleanBattleKey, cleanCoopReason, cleanLabel, cleanPartyEvent, PARTY_MAX,
+  cleanBattleKey, cleanCoopReason, cleanCoopOfferMode, cleanLabel, cleanPartyEvent, PARTY_MAX,
   cleanBattleRuleset, cleanBattleParty, cleanBattleChoice, cleanBattleReconnect,
   BATTLE_MOVE_MAX,
 } = require('./sanitize');
@@ -102,10 +102,16 @@ const DEFAULT_SPRITE = 'SPRITE_RED';
 // this is the one feature whose answer may legitimately arrive later (the hub
 // holds an ask for a player who is offline), so "nothing has happened yet" is
 // an ordinary state and a player would have no way at all to tell it from a
-// hub that cannot do this. The rule every bump follows is unchanged: bump
-// whenever a client can send something a hub silently ignores. Kept in step
-// with Config.PROTOCOL on the mod side.
-const PROTOCOL = 17;
+// hub that cannot do this. 18 is Party vs Wild: mode token `coop_wild` (two
+// humans vs one wild NPC seat) and an optional `catcher` player id on
+// mmo.battle_outcome so a successful ball names who keeps the mon. A
+// protocol-17 hub's closed BATTLE_MODES set drops `coop_wild` opens, and its
+// outcome cleaner strips an unknown `catcher` -- either way the partner never
+// joins the grass fight, or both clients grant (or neither) because ownership
+// was never named. The rule every bump follows is unchanged: bump whenever a
+// client can send something a hub silently ignores. Kept in step with
+// Config.PROTOCOL on the mod side.
+const PROTOCOL = 18;
 
 // How long a four-way PARTY BATTLE ask waits for its three answers. Mirrors
 // Config.COOP_ASK_TIMEOUT: every one of the four is looking at a box right
@@ -747,12 +753,15 @@ handlers['mmo.coop_wait'] = (relay, client, msg) => {
 
   const label = cleanLabel(msg.label);
   const map = cleanMapId(msg.map);
+  // Optional mode: only coop_wild is stored (Party vs Wild auto-join). Absent
+  // keeps the trainer WAIT/JOIN invite path.
+  const mode = cleanCoopOfferMode(msg.mode);
   // startedAt so the sweep can expire it on the same clock the partner's
   // client already uses. Mirrors src/Hub.lua.
-  client.coopOffer = { battle, label, map, startedAt: relay.now() };
-  relay.send(partner, 'mmo.coop_offer', {
-    from: client.id, name: client.name, battle, label, map,
-  });
+  client.coopOffer = { battle, label, map, mode, startedAt: relay.now() };
+  const offer = { from: client.id, name: client.name, battle, label, map };
+  if (mode) offer.mode = mode;
+  relay.send(partner, 'mmo.coop_offer', offer);
 };
 
 handlers['mmo.coop_cancel'] = (relay, client, msg) => {
@@ -811,17 +820,17 @@ handlers['mmo.coop_join'] = (relay, client, msg) => {
   // The pair get a fan-out group of their own, on the same footing as a
   // four-player one: from here on the battle traffic does not care which of the
   // two ways it was agreed.
-  // `coop_npc`, and it is the flow that decides it rather than a count: this
-  // pair agreed by one of them standing in front of a trainer, so the other
-  // side of the field is that trainer -- an opponent with a party and no
-  // connection. The four-way path below is the only one that makes a
-  // `coop_pvp`, because it is the only one where both sides are players.
+  // The mode is taken from the offer when the waiter named one: coop_wild for
+  // Party vs Wild (auto-join grass), otherwise coop_npc for the trainer path.
+  // The four-way path below is the only one that makes a coop_pvp, because it
+  // is the only one where both sides are players.
   // "c", for startSession's reason: sessions and co-op battles share the
   // `battles` map and are numbered by two counters that know nothing of each
   // other.
   const battleId = `c${relay.nextCoopAsk++}`;
+  const mode = offer.mode === 'coop_wild' ? 'coop_wild' : 'coop_npc';
   relay.openCoopBattle(battleId, [host.id, client.id],
-    { mode: 'coop_npc', hostId: host.id });
+    { mode, hostId: host.id });
 
   // `plan` is the hub's mediated battle id (`c*`). Without it the waiting
   // host's CoopBattle has no battleId, uploadMediated is a no-op, and the
@@ -831,10 +840,11 @@ handlers['mmo.coop_join'] = (relay, client, msg) => {
     { id: client.id, name: client.name, plan: battleId });
   // `host` names the client that simulates: the player who was already standing
   // at the fight, since they are the one guaranteed to have walked into the
-  // trainer -- the joiner usually has too, but a join taken from the ACTIONS
-  // menu never went near them.
+  // encounter -- the joiner usually has too, but a join taken from the ACTIONS
+  // menu never went near them. `mode` rides so the joiner's CoopBattle opens
+  // as coop_wild without re-deriving from an offer that is already cleared.
   relay.send(client, 'mmo.coop_battle',
-    { id: battleId, side: 'a', allies: members, battle, host: host.id });
+    { id: battleId, side: 'a', allies: members, battle, host: host.id, mode });
 };
 
 // Battle traffic, fanned out to everyone else in the same battle. The payload
@@ -2409,10 +2419,12 @@ class Relay {
    * Open the hub's record of a fight. The sim is still null: a ruleset and
    * every required party have to arrive before tryStartSim takes it over.
    *
-   * `npcIds` is set for coop_npc (two synthetic seats) and wild (one seat).
-   * Coop_npc: two players meet two monsters. Wild: one player meets one wild
-   * mon on a hub NPC seat (protocol-only — no overworld divert). The host
-   * uploads the NPC team as side "b".
+   * `npcIds` is set for coop_npc (two synthetic seats) and for wild /
+   * coop_wild (one seat). Coop_npc: two players meet two monsters. Wild: one
+   * player meets one wild mon on a hub NPC seat (protocol-only — no overworld
+   * divert). Coop_wild: two humans on side a, one wild seat on side b
+   * (overworld divert is client-side). The host uploads the NPC / wild team
+   * as side "b".
    *
    * They are ids a client could in principle type, and that is safe rather than
    * sloppy: client ids are minted as decimal counters, these carry a letter and
@@ -2432,9 +2444,11 @@ class Relay {
 
     let mode = p.mode;
     if (mode !== '1v1' && mode !== 'coop_npc' && mode !== 'coop_pvp'
-        && mode !== 'wild') {
+        && mode !== 'wild' && mode !== 'coop_wild') {
       mode = memberIds.length <= 2 ? '1v1' : 'coop_pvp';
     }
+    // coop_wild is a 2v1 contract (exactly two humans vs one wild seat).
+    if (mode === 'coop_wild' && memberIds.length !== 2) return null;
 
     const hostId = p.hostId || memberIds[0];
     let npcIds = null;
@@ -2443,9 +2457,9 @@ class Relay {
       for (let i = 0; i < COOP_SIDE; i += 1) {
         npcIds.push(`n${id}${String.fromCharCode(97 + i)}`);
       }
-    } else if (mode === 'wild') {
-      // One human, one synthetic wild seat. Protocol-only: nothing here
-      // diverts an overworld encounter onto this path.
+    } else if (mode === 'wild' || mode === 'coop_wild') {
+      // One synthetic wild seat. Wild: one human. Coop_wild: two humans.
+      // Protocol-only here — overworld divert for coop_wild is client-side.
       npcIds = [`n${id}a`];
     }
 
@@ -2453,7 +2467,7 @@ class Relay {
     if (!sides || typeof sides !== 'object') {
       if (mode === '1v1') {
         sides = { a: [memberIds[0]], b: [memberIds[1] || memberIds[0]] };
-      } else if (mode === 'coop_npc' || mode === 'wild') {
+      } else if (mode === 'coop_npc' || mode === 'wild' || mode === 'coop_wild') {
         sides = { a: memberIds.slice(), b: npcIds.slice() };
       } else {
         const mid = Math.ceil(memberIds.length / 2);
@@ -2503,7 +2517,7 @@ class Relay {
         && client.id === record.hostId && record.npcIds) {
       return record.npcIds[0];
     }
-    if (record.mode === 'wild' && party.side === 'b'
+    if ((record.mode === 'wild' || record.mode === 'coop_wild') && party.side === 'b'
         && client.id === record.hostId && record.npcIds) {
       return record.npcIds[0];
     }
@@ -2890,6 +2904,7 @@ class Relay {
     }
     if (outcome.reason) payload.reason = outcome.reason;
     if (outcome.caught) payload.caught = outcome.caught;
+    if (outcome.catcher) payload.catcher = outcome.catcher;
     this.broadcastBattle(record, 'mmo.battle_outcome', payload);
 
     // Rank from the intermediator alone -- no dual mmo.result vote.

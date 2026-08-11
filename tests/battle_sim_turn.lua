@@ -1989,6 +1989,280 @@ do
      "catch success reasons the outcome as catch")
   ok(battle.result.caught ~= nil, "catch outcome carries a caught sheet")
   eq(battle.result.caught.species, "Beta", "caught sheet names the wild mon")
+  eq(battle.result.catcher, "p1", "solo wild catch names the thrower as catcher")
+end
+
+-- ------------------------------------------------------------------
+-- 12f2. wild / coop_wild: Gen1 ball toss/shake anim chain
+-- ------------------------------------------------------------------
+
+local function ballAnimTexts(events)
+  local out = {}
+  for _, event in ipairs(events) do
+    if event.t == "anim" then
+      out[#out + 1] = {
+        text = event.text, amount = event.amount, slot = event.slot,
+      }
+    end
+  end
+  return out
+end
+
+local function hasAnim(anims, text)
+  for _, a in ipairs(anims) do
+    if a.text == text then return a end
+  end
+  return nil
+end
+
+do
+  local battle = battleOf({
+    mode = "wild",
+    seed = 42,
+    sides = {
+      a = {
+        { playerId = "p1", name = "Red", bag = { MASTER_BALL = 1 },
+          mons = { mon({
+            species = "Alpha", maxHp = 200, spd = 120,
+            moves = { move({ id = "splash", power = 0, effect = 85 }) },
+          }) } },
+      },
+      b = {
+        { playerId = "p2", name = "Wild",
+          mons = { mon({
+            species = "Beta", maxHp = 200, spd = 1, catchRate = 255,
+            moves = { move({ id = "splash", power = 0, effect = 85 }) },
+          }) } },
+      },
+    },
+  })
+  drain(battle)
+  battle:submitChoice("p1", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("p2", { action = "fight", move = 0 })
+  local events = drain(battle)
+  local anims = ballAnimTexts(events)
+  eq(anims[1] and anims[1].text, "ULTRATOSS_ANIM",
+     "MASTER_BALL catch opens with ULTRATOSS_ANIM")
+  eq(anims[2] and anims[2].text, "POOF_ANIM", "catch chain poofs after toss")
+  eq(anims[3] and anims[3].text, "HIDEPIC_ANIM", "catch chain hides the foe pic")
+  eq(anims[4] and anims[4].text, "SHAKE_ANIM", "catch chain shakes")
+  eq(anims[4] and anims[4].amount, 3, "MASTER_BALL shake amount is 3")
+  eq(#anims, 4, "caught chain ends after SHAKE (no SHOWPIC)")
+  ok(not hasAnim(anims, "SHOWPIC_ANIM"), "caught chain has no SHOWPIC")
+end
+
+do
+  -- Sleep + mid catchRate: wobble math yields shakes>0; first roll often fails.
+  local found, seedUsed = nil, nil
+  for seed = 89000, 89200 do
+    local battle = battleOf({
+      mode = "wild",
+      seed = seed,
+      sides = {
+        a = {
+          { playerId = "p1", name = "Red", bag = { POKE_BALL = 1 },
+            mons = { mon({
+              species = "Alpha", maxHp = 200, spd = 120,
+              moves = { move({ id = "splash", power = 0, effect = 85 }) },
+            }) } },
+        },
+        b = {
+          { playerId = "p2", name = "Wild",
+            mons = { mon({
+              species = "Beta", maxHp = 200, hp = 200, spd = 1,
+              catchRate = 45, status = "sleep",
+              moves = { move({ id = "splash", power = 0, effect = 85 }) },
+            }) } },
+        },
+      },
+    })
+    drain(battle)
+    battle:submitChoice("p1", { action = "item", item = "POKE_BALL" })
+    battle:submitChoice("p2", { action = "fight", move = 0 })
+    local events = drain(battle)
+    if not battle.result then
+      local anims = ballAnimTexts(events)
+      local shake = hasAnim(anims, "SHAKE_ANIM")
+      if shake and (shake.amount or 0) > 0 and hasAnim(anims, "SHOWPIC_ANIM") then
+        found, seedUsed = anims, seed
+        break
+      end
+    end
+  end
+  ok(found ~= nil, "found a POKE_BALL break-free with shakes>0")
+  if found then
+    eq(found[1] and found[1].text, "TOSS_ANIM",
+       "POKE_BALL fail opens with TOSS_ANIM (seed " .. tostring(seedUsed) .. ")")
+    ok(hasAnim(found, "POOF_ANIM") ~= nil, "fail-with-shakes has POOF")
+    ok(hasAnim(found, "HIDEPIC_ANIM") ~= nil, "fail-with-shakes has HIDEPIC")
+    ok(hasAnim(found, "SHOWPIC_ANIM") ~= nil,
+       "fail-with-shakes restores pic via SHOWPIC")
+  end
+end
+
+-- ------------------------------------------------------------------
+-- 12g. coop_wild: seating, ball order, catcher
+-- ------------------------------------------------------------------
+
+do
+  local battle = battleOf({
+    mode = "coop_wild",
+    seed = 88001,
+    sides = {
+      a = {
+        { playerId = "a1", name = "Ann",
+          mons = { mon({ species = "Alpha", maxHp = 200, spd = 80 }) } },
+        { playerId = "a2", name = "Abe",
+          mons = { mon({ species = "Gamma", maxHp = 200, spd = 70 }) } },
+      },
+      b = {
+        { playerId = "wild", name = "Wild",
+          mons = { mon({ species = "Beta", maxHp = 200, spd = 10, catchRate = 255 }) } },
+      },
+    },
+  })
+  drain(battle)
+  eq(#battle:snapshot().field, 3, "coop_wild create accepts 2v1 seating")
+end
+
+do
+  local battle, err = Turn.create({
+    mode = "coop_wild",
+    seed = 88002,
+    sides = {
+      a = {
+        { playerId = "a1", name = "Ann", mons = { mon() } },
+        { playerId = "a2", name = "Abe", mons = { mon({ species = "Gamma" }) } },
+      },
+      b = {
+        { playerId = "b1", name = "Bob", mons = { mon({ species = "Beta" }) } },
+        { playerId = "b2", name = "Bea", mons = { mon({ species = "Delta" }) } },
+      },
+    },
+  })
+  ok(battle == nil, "coop_wild refuses two fighters on side b")
+  ok(type(err) == "string" and err:find("side b", 1, true) ~= nil,
+     "refusal names side b: " .. tostring(err))
+end
+
+do
+  local splash = move({ id = "splash", power = 0, effect = 85 })
+  local battle = battleOf({
+    mode = "coop_wild",
+    seed = 88003,
+    sides = {
+      a = {
+        { playerId = "a1", name = "Ann",
+          mons = { mon({ species = "Alpha", maxHp = 200, spd = 120, moves = { splash } }) },
+          bag = { POKE_BALL = 1 } },
+        { playerId = "a2", name = "Abe",
+          mons = { mon({ species = "Gamma", maxHp = 200, spd = 1, moves = { splash } }) },
+          bag = { POKE_BALL = 1 } },
+      },
+      b = {
+        { playerId = "wild", name = "Wild",
+          mons = { mon({
+            species = "Beta", maxHp = 200, hp = 200, spd = 1, catchRate = 3,
+            moves = { splash },
+          }) } },
+      },
+    },
+  })
+  drain(battle)
+  battle:submitChoice("a1", { action = "item", item = "POKE_BALL" })
+  battle:submitChoice("a2", { action = "item", item = "POKE_BALL" })
+  battle:submitChoice("wild", { action = "fight", move = 0 })
+  local events = drain(battle)
+  local ballSlots = {}
+  for _, event in ipairs(events) do
+    if event.t == "item" and event.text == "POKE_BALL" then
+      ballSlots[#ballSlots + 1] = event.slot
+    end
+  end
+  eq(#ballSlots, 2, "both POKE_BALL throws resolve when neither catches")
+  eq(ballSlots[1], 0, "faster human's ball resolves first")
+  eq(ballSlots[2], 1, "slower human's ball resolves second")
+end
+
+do
+  local splash = move({ id = "splash", power = 0, effect = 85 })
+  local battle = battleOf({
+    mode = "coop_wild",
+    seed = 88004,
+    sides = {
+      a = {
+        { playerId = "a1", name = "Ann",
+          mons = { mon({ species = "Alpha", maxHp = 200, spd = 120, moves = { splash } }) },
+          bag = { MASTER_BALL = 1 } },
+        { playerId = "a2", name = "Abe",
+          mons = { mon({ species = "Gamma", maxHp = 200, spd = 1, moves = { splash } }) },
+          bag = { MASTER_BALL = 1 } },
+      },
+      b = {
+        { playerId = "wild", name = "Wild",
+          mons = { mon({
+            species = "Beta", maxHp = 200, spd = 1, catchRate = 255,
+            moves = { splash },
+          }) } },
+      },
+    },
+  })
+  drain(battle)
+  battle:submitChoice("a1", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("a2", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("wild", { action = "fight", move = 0 })
+  local events = drain(battle)
+  local ballSlots = {}
+  for _, event in ipairs(events) do
+    if event.t == "item" and event.text == "MASTER_BALL" then
+      ballSlots[#ballSlots + 1] = event.slot
+    end
+  end
+  eq(#ballSlots, 1, "first catch stops the slower ball from resolving")
+  eq(ballSlots[1], 0, "only the faster thrower's ball is spent")
+  eq(battle.result and battle.result.reason, "catch", "coop_wild catch ends the fight")
+  eq(battle.result.catcher, "a1", "catcher is the faster thrower's playerId")
+  eq(battle.byId.a1.bag.MASTER_BALL, nil, "faster fighter spent their ball")
+  eq(battle.byId.a2.bag.MASTER_BALL, 1, "slower fighter never spent their ball")
+  local anims = ballAnimTexts(events)
+  eq(anims[1] and anims[1].text, "ULTRATOSS_ANIM",
+     "coop_wild MASTER_BALL catch emits ULTRATOSS_ANIM")
+  ok(hasAnim(anims, "HIDEPIC_ANIM") ~= nil, "coop_wild catch has HIDEPIC")
+  ok(hasAnim(anims, "SHAKE_ANIM") ~= nil, "coop_wild catch has SHAKE")
+  eq(#anims, 4, "coop_wild catch is one ball chain (slower throw never resolves)")
+end
+
+do
+  local splash = move({ id = "splash", power = 0, effect = 85 })
+  local battle = battleOf({
+    mode = "coop_npc",
+    seed = 88005,
+    sides = {
+      a = {
+        { playerId = "a1", name = "Ann",
+          mons = { mon({ species = "Alpha", maxHp = 200, spd = 120, moves = { splash } }) } },
+        { playerId = "a2", name = "Abe",
+          mons = { mon({ species = "Gamma", maxHp = 200, spd = 70, moves = { splash } }) } },
+      },
+      b = {
+        { playerId = "b1", name = "Bob",
+          mons = { mon({ species = "Beta", maxHp = 200, spd = 60, moves = { splash } }) } },
+        { playerId = "b2", name = "Bea",
+          mons = { mon({ species = "Delta", maxHp = 200, spd = 50, moves = { splash } }) } },
+      },
+    },
+  })
+  drain(battle)
+  battle:submitChoice("a1", { action = "item", item = "POKE_BALL" })
+  battle:submitChoice("a2", { action = "fight", move = 0, target = 3 })
+  battle:submitChoice("b1", { action = "fight", move = 0 })
+  battle:submitChoice("b2", { action = "fight", move = 0, target = 1 })
+  local events = drain(battle)
+  local failed = false
+  for _, event in ipairs(events) do
+    if event.t == "msg" and event.text == "But it failed" then failed = true end
+  end
+  ok(failed, "balls still fail in coop_npc")
 end
 
 do

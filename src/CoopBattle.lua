@@ -21,12 +21,12 @@
 -- own host-authoritative branch already takes for `action`/`event` in a link
 -- battle, one player wider.
 --
--- The upshot for this file: for **hub-refereed** coop modes (always
--- `coop_pvp` / `coop_npc`), the intermediator decides and this screen draws
--- an ordered `mmo.battle_event` stream — same as MediatedBattle. `CoopSim`
--- is still constructed to hold the field the screen is drawn from, and is
--- not asked to *decide* anything. See "the intermediator, when there is one"
--- near the bottom.
+-- The upshot for this file: for **hub-refereed** coop modes (always the three
+-- in Config.MEDIATED_COOP — `coop_pvp` / `coop_npc` / `coop_wild`), the
+-- intermediator decides and this screen draws an ordered `mmo.battle_event`
+-- stream — same as MediatedBattle. `CoopSim` is still constructed to hold the
+-- field the screen is drawn from, and is not asked to *decide* anything. See
+-- "the intermediator, when there is one" near the bottom.
 --
 -- ------- what this covers
 --
@@ -43,17 +43,20 @@
 -- a potion heals and an item that refuses mid-battle refuses in the engine's
 -- words. SWITCH costs the turn, as it does in the original.
 --
--- A thrown ball is **refused**, and that is the complete behaviour rather than
--- a missing one: every monster on the far side belongs to a trainer, and Gen 1
--- does not let you catch somebody else's. It is refused in the original's own
--- words, taken from the game's text table.
+-- A thrown ball is **refused** against a trainer (`coop_npc` / host-sim), and
+-- that is the complete behaviour rather than a missing one: every monster on
+-- the far side belongs to somebody, and Gen 1 does not let you catch somebody
+-- else's. It is refused in the original's own words, taken from the game's
+-- text table. Against **`coop_wild`** the far side is wildlife, so balls are
+-- legal — the referee resolves them (speed-ordered among ball choices).
 --
--- RUN is two questions wearing one label, and they are answered separately.
+-- RUN is three questions wearing one label, and they are answered separately.
 -- Against an **NPC trainer** it is the original's question and keeps the
 -- original's refusal, word for word. Against **two other players** it is a
 -- question Gen 1 never had to ask -- and the answer is yes, with the consent of
--- the partner who shares the loss. See "RUN, in a battle where the other side
--- is people" below for the whole of it.
+-- the partner who shares the loss. Against a **partied wild** (`coop_wild`) it
+-- is solo-wild semantics: either player flees unilaterally, no consent ask.
+-- See "RUN, in a battle where the other side is people" below for the PvP half.
 
 local need, mod = ...
 local Config = need("Config")
@@ -117,6 +120,12 @@ local function loadEngine()
       .. "report this with the game version")
     engine = false
     return engine
+  end
+  -- Optional SFX (Ball_Poof, entrance cries). Missing Sound must not fail the
+  -- whole load — headless / no-audio builds still fight without it.
+  do
+    local good, value = pcall(require, "src.core.Sound")
+    if good then parts.Sound = value end
   end
   engine = parts
   return engine
@@ -196,6 +205,126 @@ function M.trainerParty(game, oppClass, partyIndex)
   return out
 end
 
+-- Map a battleMon / caught-sheet species token to a pokedex registry id.
+-- Sheets narrate under Wire.name(display); Pokemon.new needs the registry key.
+-- Prefer speciesId when present (upload-time snapshots); else the species
+-- field as an id; else a display-name scan — same idea as MediatedBattle's
+-- speciesKeyFor, without needing a live party.
+local function speciesKeyFromSheet(game, sheet)
+  if type(sheet) ~= "table" then return nil end
+  local data = game and game.data
+  local pokedex = data and data.pokemon
+  if type(pokedex) ~= "table" then return nil end
+  local id = sheet.speciesId
+  if type(id) == "string" and id ~= "" and pokedex[id] then return id end
+  local label = sheet.species
+  if type(label) ~= "string" or label == "" then return nil end
+  if pokedex[label] then return label end
+  for key, def in pairs(pokedex) do
+    if type(def) == "table" then
+      local name = Wire.name(def.name or key)
+      if name == label then return key end
+    end
+  end
+  return nil
+end
+
+-- Rebuild a depositable engine mon from a catch-outcome battleMon sheet.
+-- Used when this client never held the encounter (joiner / partner catcher):
+-- wildCatchMon is nil, but the outcome still carries Effects.caughtSheet.
+-- Best-effort: DVs/EVs from ivs/evs when present, else combat stats from the
+-- sheet; moves and current HP always prefer the sheet. Returns nil when the
+-- species cannot be resolved or Pokemon.new fails.
+function M.monFromCaughtSheet(game, sheet)
+  if type(sheet) ~= "table" then return nil end
+  local eng = loadEngine()
+  if not (eng and eng.Pokemon and eng.Stats) then return nil end
+  local species = speciesKeyFromSheet(game, sheet)
+  if not species then return nil end
+  local level = tonumber(sheet.level) or 1
+  if level < 1 then level = 1 end
+  local ok, mon = pcall(eng.Pokemon.new, game.data, species, level)
+  if not (ok and mon) then return nil end
+
+  local wireToEngine = { atk = "attack", def = "defense", spd = "speed", spc = "special" }
+
+  if type(sheet.ivs) == "table" then
+    local dvs = {}
+    for wireKey, engineKey in pairs(wireToEngine) do
+      local n = tonumber(sheet.ivs[wireKey])
+      if not n then dvs = nil break end
+      dvs[engineKey] = math.max(0, math.min(15, math.floor(n)))
+    end
+    if dvs then
+      dvs.hp = (dvs.attack % 2) * 8 + (dvs.defense % 2) * 4
+        + (dvs.speed % 2) * 2 + (dvs.special % 2)
+      mon.dvs = dvs
+    end
+  end
+
+  if type(sheet.evs) == "table" then
+    local statExp = mon.statExp or {
+      hp = 0, attack = 0, defense = 0, speed = 0, special = 0,
+    }
+    for wireKey, engineKey in pairs(wireToEngine) do
+      local n = tonumber(sheet.evs[wireKey])
+      if n then
+        statExp[engineKey] = math.max(0, math.min(65535, math.floor(n)))
+      end
+    end
+    if sheet.evs.hp ~= nil then
+      local n = tonumber(sheet.evs.hp)
+      if n then statExp.hp = math.max(0, math.min(65535, math.floor(n))) end
+    end
+    mon.statExp = statExp
+  end
+
+  if mon.dvs then
+    local def = game.data.pokemon[species]
+    local statsOk, stats = pcall(eng.Stats.calc, def, level, mon.dvs, mon.statExp)
+    if statsOk and stats then mon.stats = stats end
+  elseif type(sheet.stats) == "table" then
+    mon.stats = mon.stats or {}
+    for wireKey, engineKey in pairs(wireToEngine) do
+      local n = tonumber(sheet.stats[wireKey])
+      if n then mon.stats[engineKey] = math.max(1, math.floor(n)) end
+    end
+    local maxHp = tonumber(sheet.maxHp)
+    if maxHp then mon.stats.hp = math.max(1, math.floor(maxHp)) end
+  elseif sheet.maxHp ~= nil then
+    mon.stats = mon.stats or {}
+    local maxHp = tonumber(sheet.maxHp)
+    if maxHp then mon.stats.hp = math.max(1, math.floor(maxHp)) end
+  end
+
+  if type(sheet.moves) == "table" and #sheet.moves > 0 then
+    local moves = {}
+    for _, slot in ipairs(sheet.moves) do
+      if type(slot) == "table" and type(slot.id) == "string" and slot.id ~= "" then
+        local mdef = game.data.moves and game.data.moves[slot.id]
+        local pp = tonumber(slot.pp)
+        if not pp then pp = mdef and mdef.pp or 0 end
+        moves[#moves + 1] = { id = slot.id, pp = math.max(0, math.floor(pp)) }
+      end
+    end
+    if #moves > 0 then mon.moves = moves end
+  end
+
+  local hp = tonumber(sheet.hp)
+  if hp then
+    local maxHp = (mon.stats and mon.stats.hp) or tonumber(sheet.maxHp) or 1
+    mon.hp = math.max(0, math.min(math.floor(hp), maxHp))
+  end
+
+  if sheet.catchRate ~= nil then
+    local rate = tonumber(sheet.catchRate)
+    if rate then mon.catchRate = math.max(0, math.min(255, math.floor(rate))) end
+  end
+  if sheet.status ~= nil then mon.status = sheet.status end
+
+  return mon
+end
+
 -- ------- construction
 --
 -- opts:
@@ -213,7 +342,12 @@ end
 --   battleId  the hub's id for this fight, which every mediated message names
 --   selfId    this client's own hub id, which is how an outcome naming four
 --             players is read as a result for one
---   mode      "coop_npc" | "coop_pvp", the hub's word for which shape this is
+--   mode      "coop_npc" | "coop_pvp" | "coop_wild", the hub's word for which
+--             shape this is (Config.MEDIATED_COOP)
+--   wildCatchMon  engine mon kept for Party.add / Boxes.deposit on a catch
+--                 (coop_wild; host and preferably partner both stash one)
+--   wildParty     optional prebuilt battleMon sheets for the host's side-"b"
+--                 upload; else snapshotMons of wildCatchMon
 function M.new(game, opts)
   local eng = loadEngine()
   if not eng then return nil, "2-on-2 battles need the engine's battle modules." end
@@ -259,6 +393,10 @@ function M.new(game, opts)
     battleId = opts.battleId,
     selfId = opts.selfId,
     mode = opts.mode,
+    -- coop_wild grant material: engine mon for Party.add, optional sheets for
+    -- the host's side-b upload (else snapshot of wildCatchMon at upload time).
+    wildCatchMon = opts.wildCatchMon,
+    wildParty = opts.wildParty,
     mediated = false,
     medUploaded = false,
     medFailed = false, -- upload refused; do not fall back to host-sim
@@ -454,6 +592,11 @@ end
 -- leader's theme with the wrong jingle.
 function M.musicKind(self)
   if self.cachedMusicKind then return self.cachedMusicKind end
+  -- Party vs Wild is wildlife, not a trainer fight or a PvP link cue.
+  if self.mode == "coop_wild" then
+    self.cachedMusicKind = "wild"
+    return "wild"
+  end
   local kind = self.trainer and "trainer" or "link"
   local eng = engine
   if eng and eng.BattleState and self.trainer then
@@ -466,17 +609,173 @@ function M.musicKind(self)
   return kind
 end
 
+-- Display name for the opening "Wild X appeared!" line (Gen 1 BattleState).
+-- Prefer the stashed encounter mon; else the first ownerless field party lead.
+function M:wildIntroName()
+  local mon = self.wildCatchMon
+  if mon then
+    local name = mon.nickname or mon.species
+    if type(name) == "string" and name ~= "" then
+      return Wire.name(name) or name
+    end
+  end
+  if self.wildParty and self.wildParty[1] then
+    local sheet = self.wildParty[1]
+    local name = sheet.species or sheet.speciesId
+    if type(name) == "string" and name ~= "" then
+      return Wire.name(name) or name
+    end
+  end
+  if self.sim then
+    for _, slot in ipairs(self.sim.slots or {}) do
+      if slot.owner == nil then
+        local lead = slot.party and slot.party[1]
+        if lead then
+          local name = lead.nickname or lead.species
+          if type(name) == "string" and name ~= "" then
+            return Wire.name(name) or name
+          end
+        end
+      end
+    end
+  end
+  return "POKeMON"
+end
+
+-- Display name for an on-field battler (Go! / sent out lines).
+local function seatMonName(slot)
+  local battler = slot and slot.battler
+  if not battler then return "?" end
+  return battler.name
+    or (battler.mon and (battler.mon.nickname or battler.mon.species))
+    or "?"
+end
+
+-- Wire-safe trainer/player label for "Name sent out Y!".
+local function seatOwnerName(slot)
+  if not slot then return "Someone" end
+  local raw = slot.name
+  if type(raw) == "string" and raw ~= "" then
+    return Wire.name(raw) or raw
+  end
+  return "Someone"
+end
+
+-- Clear intro presentation flags (exit, forfeit, or battle over).
+function M:clearIntroFlags()
+  self.introBalls = nil
+  self.introHide = nil
+  self.growIn = nil
+end
+
+-- Entrance cry via optional Sound (same clips BattleState:playEntranceCry).
+function M:playEntranceCry(battler)
+  local mon = battler and battler.mon
+  if not mon then return end
+  local Sound = engine and engine.Sound
+  if not (Sound and Sound.playCry) then return end
+  pcall(Sound.playCry, self.game.data, mon.species,
+    mon.status == "SLP" and 37 or 11)
+end
+
+-- Grow-in scale for a slot this frame (nil when not growing). Stages match
+-- BattleState:growInScale: 0 / 3/7 / 5/7 over ~12 frames, then full.
+function M:growInScale(index)
+  local grow = self.growIn
+  if not grow or grow.slot ~= index then return nil end
+  local f = grow.frame or 0
+  return f < 3 and 0 or f < 7 and 3 / 7 or 5 / 7
+end
+
+-- After the opening appear line: wait, then sequential viewer-centric
+-- send-outs (my Go! → POOF/grow/cry, then partner sent out). Ball chrome is
+-- cleared when the appear page advances (see messages dismiss), not here.
+function M:queueIntroSendOut()
+  local sendWait = 40
+  do
+    local ok, Timing = pcall(require, "src.core.Timing")
+    if ok and Timing and Timing.BATTLE_START_SENDOUT then
+      sendWait = Timing.BATTLE_START_SENDOUT
+    end
+  end
+  self.messages[#self.messages + 1] = { wait = sendWait }
+
+  local mine = self.mine
+  local mySlot = self:mySlot()
+  self:say(("Go! %s!"):format(seatMonName(mySlot)))
+  self.messages[#self.messages + 1] = {
+    anim = "POOF_ANIM", from = mine, attackerIsPlayer = true,
+  }
+  self.messages[#self.messages + 1] = {
+    act = function(battle)
+      if battle.introHide then battle.introHide[mine] = nil end
+      local slot = battle.sim and battle.sim:slot(mine)
+      local battler = slot and slot.battler
+      if battler then
+        battle.growIn = { slot = mine, frame = 0 }
+        battle:playEntranceCry(battler)
+      end
+    end,
+  }
+  self.messages[#self.messages + 1] = { wait = 12 }
+
+  local partner = self:partnerOf(mySlot)
+  if not partner then
+    -- Seats we hid in enter() but will not animate must not stay blank.
+    if self.introHide then
+      for idx, _ in pairs(self.introHide) do
+        if idx ~= mine then self.introHide[idx] = nil end
+      end
+    end
+    return
+  end
+  local pIndex = partner.index
+  self:say(("%s sent out\n%s!"):format(
+    seatOwnerName(partner), seatMonName(partner)))
+  self.messages[#self.messages + 1] = {
+    anim = "POOF_ANIM", from = pIndex, attackerIsPlayer = true,
+  }
+  self.messages[#self.messages + 1] = {
+    act = function(battle)
+      if battle.introHide then battle.introHide[pIndex] = nil end
+      local slot = battle.sim and battle.sim:slot(pIndex)
+      local battler = slot and slot.battler
+      if battler then
+        battle.growIn = { slot = pIndex, frame = 0 }
+        battle:playEntranceCry(battler)
+      end
+    end,
+  }
+  self.messages[#self.messages + 1] = { wait = 12 }
+end
+
 function M:enter()
   -- The trainer theme, through the engine's own picker so a gym leader still
   -- gets a gym leader's music. `kind` is the battle's, not this screen's: a
   -- co-op fight against a trainer is a trainer battle to everything except the
-  -- turn loop.
+  -- turn loop. coop_wild uses the wild cue (see musicKind).
   local eng = engine
   if eng and eng.Music then
     pcall(eng.Music.playBattle, self.game.data, self:musicKind(),
       self.trainer and self.trainer.id or nil)
   end
-  self:say("2 on 2 battle!")
+  -- Intro ball chrome + hide ally humans until their Go!/sent-out step.
+  -- Foes (wild / NPC) stay visible; no introSlide / trainer-back this pass.
+  self.introBalls = true
+  self.introHide = {}
+  for _, slot in ipairs((self.sim and self.sim.slots) or {}) do
+    if slot.owner ~= nil and not self:foeSide(slot.index) then
+      self.introHide[slot.index] = true
+    end
+  end
+  -- Party vs Wild is a grass encounter shared with a partner, not a 2-on-2:
+  -- open with the same sentence solo wild uses (BattleState introText).
+  if self.mode == "coop_wild" then
+    self:say(("Wild %s\nappeared!"):format(self:wildIntroName()))
+  else
+    self:say("2 on 2 battle!")
+  end
+  self:queueIntroSendOut()
   self.phase = "messages"
   self.after = "choose"
   self:announce("coop_battle_started")
@@ -531,6 +830,7 @@ end
 
 function M:exit()
   self:refundUnspent()
+  self:clearIntroFlags()
 
   -- The world gets its music back on the way out, win or lose. The victory
   -- theme loops until something stops it -- each Defeated* song ends in a
@@ -664,6 +964,11 @@ local MSG_AUTO_ADVANCE = 1.6
 
 function M:update(dt)
   self.frame = self.frame + 1
+  -- Grow-in advances on the same fixed step as the engine's AnimateSendingOutMon.
+  if self.growIn then
+    self.growIn.frame = (self.growIn.frame or 0) + 1
+    if self.growIn.frame >= 12 then self.growIn = nil end
+  end
   if self.sim and not self.result then
     self:stepFocusSlides()
   end
@@ -735,17 +1040,35 @@ function M:update(dt)
       -- in the middle of the thing it is describing.
       local head = self.messages[1]
       if type(head) == "table"
-         and (head.anim or head.drain or head.faintfx) then
-        table.remove(self.messages, 1)
-        if head.anim then
-          self.acting = head.from or self.acting
-          self:startAnim(head)
-        elseif head.drain then
-          self:startDrain(head)
+         and (head.anim or head.drain or head.faintfx
+              or head.wait or head.act) then
+        -- Hold wait/act/anim behind opening appear line(s). Drop ball chrome
+        -- when the post-appear wait starts (not on every page advance), so a
+        -- multi-page appear does not begin the gap early.
+        if (head.wait or head.act or head.anim)
+           and self.shown ~= nil and self.introBalls then
+          -- fall through to dwell
+        elseif head.wait then
+          if self.introBalls then self.introBalls = nil end
+          head._t = (head._t or 0) + 1
+          if head._t >= (tonumber(head.wait) or 0) then
+            table.remove(self.messages, 1)
+          end
+          return
         else
-          self:startFaint(head)
+          table.remove(self.messages, 1)
+          if head.act then
+            if type(head.act) == "function" then pcall(head.act, self) end
+          elseif head.anim then
+            self.acting = head.from or self.acting
+            self:startAnim(head)
+          elseif head.drain then
+            self:startDrain(head)
+          else
+            self:startFaint(head)
+          end
+          return
         end
-        return
       end
       if self.shown == nil then
         local next = table.remove(self.messages, 1)
@@ -786,10 +1109,14 @@ function M:update(dt)
       -- on screen long enough to be read (see MSG_MIN_DWELL). The clock is not
       -- ticked while an effect runs, so the floor is a quarter of a second of
       -- the line actually being *up*, not of wall time under a flash.
+      local advance = false
       if self.msgClock >= MSG_MIN_DWELL
          and (input:wasPressed("a") or input:wasPressed("b")) then
-        self.shown = nil
+        advance = true
       elseif self.msgClock > MSG_AUTO_ADVANCE then
+        advance = true
+      end
+      if advance then
         self.shown = nil
       end
       return
@@ -1102,8 +1429,11 @@ function M:updateCommand(input)
       self.itemIndex = 1
       self.phase = "item"
     elseif command == "RUN" then
-      -- Two different questions behind one command, told apart by who is on
-      -- the other side of the field (M:partyBattle).
+      -- Three different questions behind one command.
+      --
+      -- Against a **partied wild** (`coop_wild`) it is solo-wild semantics:
+      -- either player flees unilaterally. No COOP_RUN_ASK / partner consent —
+      -- the choice goes straight to the referee (or host-sim commit).
       --
       -- Against a **trainer** it is the original's question, and the original's
       -- answer: you cannot run from a trainer battle. Filed as an action rather
@@ -1115,7 +1445,9 @@ function M:updateCommand(input)
       -- ends the battle for four people and books the pair who left a ranked
       -- loss, so the other half of that pair is asked first (M:askToRun).
       -- Nothing is committed until they answer -- see the state machine there.
-      if self:partyBattle() then
+      if self.mode == "coop_wild" then
+        self:commit({ slot = self.mine, kind = "run" })
+      elseif self:partyBattle() then
         self:askToRun()
       else
         self:commit({ slot = self.mine, kind = "run" })
@@ -1678,8 +2010,12 @@ function M:mediatedRunAsk()
   return true
 end
 
--- Ask the partner. Commits nothing.
+-- Ask the partner. Commits nothing — except `coop_wild`, which never asks:
+-- flee is unilateral (solo-wild), so this routes to a run choice instead.
 function M:askToRun()
+  if self.mode == "coop_wild" then
+    return self:commit({ slot = self.mine, kind = "run" })
+  end
   if not self:partyBattle() then return false end
   if self.mediated then return self:mediatedRunAsk() end
   local partner = self:partnerOf(self:mySlot())
@@ -2160,7 +2496,7 @@ function M:playEvents(events)
       -- the order the turn produced it rather than all at once at the end.
       self.messages[#self.messages + 1] =
         { anim = event.anim, from = event.from, to = event.to,
-          attackerIsPlayer = event.attackerIsPlayer }
+          attackerIsPlayer = event.attackerIsPlayer, amount = event.amount }
     elseif event.kind == "damage" then
       -- The replayers are told the resulting HP rather than the amount, so a
       -- dropped or reordered event cannot leave a bar drifting away from the
@@ -2610,6 +2946,7 @@ end
 function M:finish()
   if self.finished then return end
   self.finished = true
+  self:clearIntroFlags()
   self:snapDisplay()
   self.game.stack:pop()
 end
@@ -3540,6 +3877,7 @@ end
 
 function M:drawField()
   local hideFoes = self:showingTrainer()
+  local introHide = self.introHide
 
   for _, index in ipairs(self:paintOrder()) do
     local slot = self.sim:slot(index)
@@ -3549,13 +3887,38 @@ function M:drawField()
     local sprite = (sinking and sinking.battler and sinking.battler.sprite)
       or (battler and battler.sprite)
     local x, y, scale = self:picOriginFor(index, sprite)
-    if sprite and x and not (hideFoes and theirs) then
+    local hideIntro = introHide and introHide[index]
+    if sprite and x and not (hideFoes and theirs)
+       and not (theirs and self.foePicHidden)
+       and not hideIntro then
       if sinking then
         love.graphics.setColor(1, 1, 1, 1)
         pcall(drawSinking, sprite, x, y, sinking.frames, scale)
       elseif not hidden(slot, battler) then
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.draw(sprite, x, y, 0, scale, scale)
+        local gs = self:growInScale(index)
+        if gs == 0 then
+          -- Ball beat: blank until the first grow stage.
+        else
+          local drawScale = scale
+          local dx, dy = x, y
+          if gs then
+            drawScale = scale * gs
+            local sw, sh = 56, 56
+            local ok, w, h = pcall(sprite.getDimensions, sprite)
+            if ok and type(w) == "number" then sw, sh = w, h end
+            -- Feet + horizontal centre pinned (BattleState AnimateSendingOutMon).
+            dx = x + sw * scale * (1 - gs) / 2
+            if not theirs then
+              local inset = ALLY_FOOT_INSET
+              if inset > sh - 8 then inset = 0 end
+              dy = FIELD_FLOOR - (sh - inset) * drawScale
+            else
+              dy = y + sh * scale * (1 - gs)
+            end
+          end
+          love.graphics.setColor(1, 1, 1, 1)
+          love.graphics.draw(sprite, dx, dy, 0, drawScale, drawScale)
+        end
       end
     end
   end
@@ -3573,7 +3936,8 @@ function M:drawField()
   if foe then
     local battler = self:shownBattlerAt(foe)
     local slot = self.sim:slot(foe)
-    if battler and not hidden(slot, battler) then
+    if battler and not hidden(slot, battler)
+       and not (introHide and introHide[foe]) then
       Font.drawBox(FOE_HUD.tx, FOE_HUD.ty, FOE_HUD.tw, FOE_HUD.th)
       drawReadout(self, battler, FOE_HUD, 1, foe == self.mine)
     end
@@ -3582,10 +3946,29 @@ function M:drawField()
   if ally then
     local battler = self:shownBattlerAt(ally)
     local slot = self.sim:slot(ally)
-    if battler and not hidden(slot, battler) then
+    if battler and not hidden(slot, battler)
+       and not (introHide and introHide[ally]) then
       Font.drawBox(ALLY_HUD.tx, ALLY_HUD.ty, ALLY_HUD.tw, ALLY_HUD.th)
       drawReadout(self, battler, ALLY_HUD, 1, ally == self.mine)
     end
+  end
+  self:drawIntroBalls()
+end
+
+-- Party ball chrome under the opening appear line (both humans' parties).
+-- Positions approximate classic player row + a second row for the partner.
+function M:drawIntroBalls()
+  if not self.introBalls then return end
+  local BS = engine and engine.BattleState
+  if not (BS and BS.drawBallRow and love and love.graphics) then return end
+  local mySlot = self:mySlot()
+  local partner = self:partnerOf(mySlot)
+  love.graphics.setColor(1, 1, 1, 1)
+  if mySlot and mySlot.party then
+    pcall(BS.drawBallRow, BS, mySlot.party, 88, 80, 8)
+  end
+  if partner and partner.party then
+    pcall(BS.drawBallRow, BS, partner.party, 88, 64, 8)
   end
 end
 
@@ -3620,6 +4003,18 @@ local CLASSIC_ENEMY = { x = STAGE_FOE.x, y = STAGE_FOE.y }
 
 function M:startAnim(row)
   self.anim = row
+  -- Ball chain: HIDEPIC / SHOWPIC gate foe stage pics (engine enemyHidden).
+  if row.anim == "HIDEPIC_ANIM" then
+    self.foePicHidden = true
+  elseif row.anim == "SHOWPIC_ANIM" then
+    self.foePicHidden = nil
+  elseif row.anim == "POOF_ANIM" then
+    -- Intro send-out and catch ball chain both play SFX_BALL_POOF.
+    local Sound = engine and engine.Sound
+    if Sound and Sound.play then
+      pcall(Sound.play, self.game.data, "Ball_Poof")
+    end
+  end
   if not (self.animPlayer and self.animPlayer.start) then
     -- No animation data in this build: the flash is skipped and the messages
     -- carry on, which is the degrade the header promises.
@@ -3638,7 +4033,13 @@ function M:startAnim(row)
   else
     isPlayer = true
   end
-  local ok = pcall(self.animPlayer.start, self.animPlayer, row.anim, isPlayer)
+  local ball = self.medBall
+  local opts = {
+    shakes = row.amount,
+    ball = ball,
+    ballFlicker = ball == "MASTER_BALL" or ball == "ULTRA_BALL" or nil,
+  }
+  local ok = pcall(self.animPlayer.start, self.animPlayer, row.anim, isPlayer, opts)
   if not ok then self.anim = nil end
   return ok
 end
@@ -4675,11 +5076,12 @@ end
 -- batch (`turn`, or `over`), which makes an arriving turn look exactly like the
 -- single `res` the client-simulated path sends.
 
--- Is this mode hub-refereed? Always for shipped coop_pvp / coop_npc — not a
--- Config toggle. Host-sim for those modes was removed (BattleSim vs engine
+-- Is this mode hub-refereed? Always for Config.MEDIATED_COOP
+-- (`coop_pvp` / `coop_npc` / `coop_wild`) — not a Config toggle beyond that
+-- table. Host-sim for those modes was removed (BattleSim vs engine
 -- ItemEffects must not diverge). CoopSim remains for field layout / tests.
 function M.mediates(mode)
-  return mode == "coop_pvp" or mode == "coop_npc"
+  return mode == "coop_pvp" or mode == "coop_npc" or mode == "coop_wild"
 end
 
 -- ------- 1. what we are bringing
@@ -4696,6 +5098,9 @@ end
 --
 -- One party and not two, because the intermediator seats one npc: see
 -- Config.MEDIATED_COOP's first reason.
+--
+-- **Not used for `coop_wild`.** Wild is one mon on side b; interleave would
+-- invent a second trainer slot. See `uploadMediated`'s coop_wild branch.
 function M:npcMons()
   if not self.sim then return nil end
   local parties = {}
@@ -4718,6 +5123,19 @@ function M:npcMons()
     index = index + 1
   end
   return Mediated.snapshotMons(self.game, flat)
+end
+
+-- Sheets for the wild seat (coop_wild side b): prebuilt `wildParty`, else a
+-- snapshot of the stashed `wildCatchMon`. Never npcMons interleave — that
+-- assumes two ownerless trainer slots.
+function M:wildMons()
+  if type(self.wildParty) == "table" and #self.wildParty > 0 then
+    return self.wildParty
+  end
+  if self.wildCatchMon then
+    return Mediated.snapshotMons(self.game, { self.wildCatchMon })
+  end
+  return nil
 end
 
 -- Offer this fight to the intermediator.
@@ -4770,6 +5188,17 @@ function M:uploadMediated()
     else
       mod.log:warn("the trainer's party could not be described for a refereed "
         .. "2-on-2 -- report which trainer it was")
+      self.medFailed = true
+    end
+  elseif self.host and self.mode == "coop_wild" then
+    -- One wild mon on side b (not npcMons — that re-interleaves two trainer
+    -- slots). Sheets from wildParty or a snapshot of wildCatchMon.
+    local wild = self:wildMons()
+    if wild and #wild > 0 then
+      Mediated.sendParty(self.transport, self.battleId, wild, "b")
+    else
+      mod.log:warn("the wild POKeMON could not be described for a refereed "
+        .. "party encounter -- report this with the map and the encounter")
       self.medFailed = true
     end
   end
@@ -4870,6 +5299,7 @@ local MED_REASONS = {
   run        = "Someone ran away!",
   forfeit    = "Someone gave up.",
   agree      = "The battle was\ncalled off.",
+  catch      = "Gotcha!",
 }
 
 -- One wire event, as rows `playEvents` understands.
@@ -4942,13 +5372,22 @@ function M:medRows(msg)
   elseif kind == "anim" then
     -- Play via the existing AnimPlayer path; if mapping fails `startAnim`
     -- no-ops safely. The "X used MOVE" line rides in the `msg` beside this.
+    -- `amount` is shake count on SHAKE_ANIM; ball id is stashed from `item`.
     if index then
       rows[#rows + 1] = {
         kind = "anim", anim = msg.text, from = index,
+        amount = msg.amount,
         -- Viewer-relative: this client's ally side faces as the player.
         attackerIsPlayer = not self:foeSide(index),
       }
     end
+
+  elseif kind == "item" then
+    -- Ball id for AnimPlayer opts on the following toss/shake chain.
+    local Effects = need("BattleSim/Effects")
+    local effect = msg.text and Effects.itemEffect(msg.text)
+    if effect and effect.ball then self.medBall = msg.text end
+    say(msg.text)
 
   elseif kind == "switch" then
     -- Already said in the `msg` beside it, and the `send` that follows every
@@ -4966,7 +5405,7 @@ function M:medRows(msg)
     -- trainer's name as a battle line.
 
   else
-    -- status, stat, item, run, wait, reconnect: the referee's own sentence is
+    -- status, stat, run, wait, reconnect: the referee's own sentence is
     -- the whole of what they contribute to a screen today. The state they
     -- describe rides on the events beside them -- a status that gated a move is
     -- followed by the `damage` that did or did not happen.
@@ -5095,6 +5534,10 @@ function M:onBattleEvent(msg)
   elseif msg.t == "over" then
     self.medMustReplace = nil
     self.replacing = nil
+    -- Ball opts / foe hide outlive the turn event: anims still drain from the
+    -- message queue after medFlush. Cleared when the fight ends.
+    self.medBall = nil
+    self.foePicHidden = nil
     self:medFlush()
   end
   return true
@@ -5185,7 +5628,48 @@ function M:onBattleOutcome(msg)
     self.medPending[#self.medPending + 1] = { kind = "msg", text = why }
   end
   self:medFlush()
+  -- Catcher-only grant: everyone sees Gotcha; only msg.catcher adds the mon.
+  if msg.reason == "catch" then
+    local catcher = msg.catcher
+    if catcher ~= nil and (catcher == self.selfId
+        or tostring(catcher) == tostring(self.selfId)) then
+      self:grantCatch(msg)
+    end
+  end
   return true
+end
+
+-- Put the caught wild into this client's party (or PC). Mirrors
+-- MediatedBattle:grantCatch — duplicated so CoopBattle owns the coop_wild
+-- path without sharing a module with the 1v1 screen.
+--
+-- Host usually has wildCatchMon from the engine encounter. Partner / joiner
+-- often does not; rebuild from msg.caught (Effects.caughtSheet) so a catcher
+-- who never held the wild can still Party.add / Boxes.deposit.
+function M:grantCatch(msg)
+  local mon = self.wildCatchMon
+  if not mon and msg and msg.caught then
+    mon = M.monFromCaughtSheet(self.game, msg.caught)
+    if not mon then
+      self:say("Caught, but could not\nadd to the party.")
+      return
+    end
+  end
+  if not mon then return end
+  local game = self.game
+  local save = game and game.save
+  if not save then return end
+  local okParty, Party = pcall(require, "src.pokemon.Party")
+  if okParty and Party.add(save.party, mon) then
+    self:say((mon.nickname or mon.species or "It") .. " was\nadded to the party!")
+    return
+  end
+  local okBoxes, Boxes = pcall(require, "src.pokemon.Boxes")
+  if okBoxes and Boxes.deposit(save, mon) then
+    self:say((mon.nickname or mon.species or "It") .. " was\nsent to the PC!")
+    return
+  end
+  self:say("But every BOX\nis full!")
 end
 
 -- ------- one turn's intent

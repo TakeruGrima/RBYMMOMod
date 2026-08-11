@@ -212,6 +212,13 @@ function cleanBattleKey(value) {
   return /^[\w.\-:|]+$/.test(value) ? value : null;
 }
 
+// Optional wait/offer mode. Only coop_wild is meaningful; anything else
+// (including absent) is null so the trainer invite path stays the default.
+// Mirrors Wire.coopOfferMode.
+function cleanCoopOfferMode(value) {
+  return value === 'coop_wild' ? 'coop_wild' : null;
+}
+
 // Which side of a co-op battle somebody is on, and why an offer or an ask
 // ended. Both are closed sets rather than free text: each value picks a
 // different sentence on the client, and an unknown one has to degrade to the
@@ -544,12 +551,14 @@ const BATTLE_REASONS = new Set([
   'timeout', 'disconnect', 'run', 'ko', 'agree', 'forfeit', 'catch',
 ]);
 
-// The three shapes a mediated fight comes in: two players with one monster
-// each, a pair against a trainer somebody walked into, or two pairs against
-// each other. Named on the wire rather than inferred from how many ids arrived,
-// because the two co-op modes have the same four field slots and differ only in
-// whether one side has an owner.
-const BATTLE_MODES = new Set(['1v1', 'coop_npc', 'coop_pvp', 'wild']);
+// The shapes a mediated fight comes in: two players with one monster each, a
+// pair against a trainer somebody walked into, two pairs against each other,
+// one player against a wild NPC seat, or two humans against one wild NPC seat
+// (coop_wild). Named on the wire rather than inferred from how many ids
+// arrived, because the co-op modes share field-slot shapes and differ in who
+// owns a side -- and "guess the mode from the roster" is right until an NPC
+// battle happens to have a spectatorless second slot.
+const BATTLE_MODES = new Set(['1v1', 'coop_npc', 'coop_pvp', 'wild', 'coop_wild']);
 
 /*
  * A roster: who is on a side, who won, who lost.
@@ -1080,8 +1089,8 @@ function cleanBattleEvent(raw) {
 
   const event = { battle, seq, t: raw.t };
   if (raw.text !== undefined && raw.text !== null) {
-    // Item events carry an id in `text`, not prose -- cleanText strips `_`.
-    const text = raw.t === 'item'
+    // Item / anim `text` is an id (POKE_BALL, TOSS_ANIM, move id) — cleanText strips `_`.
+    const text = (raw.t === 'item' || raw.t === 'anim')
       ? cleanId(raw.text)
       : cleanText(raw.text, MESSAGE_MAX);
     if (text) event.text = text;
@@ -1166,6 +1175,15 @@ function cleanBattleOutcome(raw) {
     if (!caught) return null;
     result.caught = caught;
   }
+  // Optional catcher: who keeps the mon on a coop_wild catch. Absent is fine
+  // (solo wild / KO outcomes need no thrower); present-and-bad refuses the
+  // whole outcome -- same posture as winners/losers, since this is the name
+  // a grant moves for.
+  if (raw.catcher !== undefined && raw.catcher !== null) {
+    const catcher = cleanId(raw.catcher);
+    if (!catcher) return null;
+    result.catcher = catcher;
+  }
   return result;
 }
 
@@ -1184,6 +1202,7 @@ module.exports = {
   cleanId,
   cleanMember,
   cleanBattleKey,
+  cleanCoopOfferMode,
   cleanLabel,
   cleanSide,
   cleanCoopReason,

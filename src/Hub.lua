@@ -1249,10 +1249,11 @@ end
 -- Open the hub's record of a fight.  The sim is still nil: a ruleset and every
 -- required party have to arrive before tryStartSim takes it over.
 --
--- `npcIds` is set for coop_npc (**two** synthetic seats) and wild (**one**
--- seat). Coop_npc: two players meet two monsters. Wild: one player meets one
--- wild mon on a hub NPC seat (protocol-only — no overworld divert). The host
--- uploads the NPC team as side "b".
+-- `npcIds` is set for coop_npc (**two** synthetic seats) and for wild /
+-- coop_wild (**one** seat). Coop_npc: two players meet two monsters. Wild: one
+-- player meets one wild mon on a hub NPC seat (protocol-only — no overworld
+-- divert). Coop_wild: two humans on side a, one wild seat on side b (overworld
+-- divert is client-side). The host uploads the NPC / wild team as side "b".
 --
 -- They are ids a client could in principle type, and that is safe rather than
 -- sloppy: client ids are minted as decimal counters, these carry a letter and
@@ -1270,8 +1271,11 @@ function M:openMediatedBattle(id, plan)
   end
   if #memberIds == 0 then return nil end
 
-  local mode = Turn.MODES[plan.mode] and plan.mode
+  -- Accept coop_wild explicitly so seating works before Turn.MODES gains it (T3).
+  local mode = (Turn.MODES[plan.mode] or plan.mode == "coop_wild") and plan.mode
     or ((#memberIds <= 2) and "1v1" or "coop_pvp")
+  -- coop_wild is a 2v1 contract (exactly two humans vs one wild seat).
+  if mode == "coop_wild" and #memberIds ~= 2 then return nil end
   local hostId = plan.hostId or memberIds[1]
   local npcIds = nil
   if mode == "coop_npc" then
@@ -1279,9 +1283,9 @@ function M:openMediatedBattle(id, plan)
     for i = 1, Config.COOP_SIDE do
       npcIds[i] = "n" .. tostring(id) .. string.char(96 + i)
     end
-  elseif mode == "wild" then
-    -- One human, one synthetic wild seat. Protocol-only: nothing here diverts
-    -- an overworld encounter onto this path.
+  elseif mode == "wild" or mode == "coop_wild" then
+    -- One synthetic wild seat. Wild: one human. Coop_wild: two humans.
+    -- Protocol-only here — overworld divert for coop_wild is client-side.
     npcIds = { "n" .. tostring(id) .. "a" }
   end
 
@@ -1289,7 +1293,7 @@ function M:openMediatedBattle(id, plan)
   if not sides then
     if mode == "1v1" then
       sides = { a = { memberIds[1] }, b = { memberIds[2] or memberIds[1] } }
-    elseif mode == "coop_npc" or mode == "wild" then
+    elseif mode == "coop_npc" or mode == "wild" or mode == "coop_wild" then
       sides = { a = memberIds, b = npcIds }
     else
       local mid = math.ceil(#memberIds / 2)
@@ -1355,7 +1359,7 @@ function M:battleSeat(record, client, party)
      and client.id == record.hostId and record.npcIds then
     return record.npcIds[1]
   end
-  if record.mode == "wild" and party.side == "b"
+  if (record.mode == "wild" or record.mode == "coop_wild") and party.side == "b"
      and client.id == record.hostId and record.npcIds then
     return record.npcIds[1]
   end
@@ -1758,6 +1762,7 @@ function M:settleMediated(record, outcome)
   end
   if outcome.reason then payload.reason = outcome.reason end
   if outcome.caught then payload.caught = outcome.caught end
+  if outcome.catcher then payload.catcher = outcome.catcher end
   self:broadcastBattle(record, Wire.BATTLE_OUTCOME, payload)
 
   local match = self.matches[record.id]
@@ -2452,22 +2457,28 @@ handlers[Wire.COOP_WAIT] = function(self, client, msg)
   local partner = self:partnerOf(client)
   if not partner then return end
 
+  -- Optional mode: only coop_wild is stored (Party vs Wild auto-join). Absent
+  -- keeps the trainer WAIT/JOIN invite path.
+  local mode = Wire.coopOfferMode(msg.mode)
   client.coopOffer = {
     battle = battle,
     label = Wire.label(msg.label),
     map = Wire.mapId(msg.map),
+    mode = mode,
     -- Stamped so the sweep can expire it on the same clock the partner's
     -- client already uses; without one the two ends disagreed about whether
     -- the fight was still joinable.
     startedAt = self.clock,
   }
-  send(partner, Wire.COOP_OFFER, {
+  local offer = {
     from = client.id,
     name = client.name,
     battle = battle,
     label = client.coopOffer.label,
     map = client.coopOffer.map,
-  })
+  }
+  if mode then offer.mode = mode end
+  send(partner, Wire.COOP_OFFER, offer)
 end
 
 handlers[Wire.COOP_CANCEL] = function(self, client, msg)
@@ -2529,18 +2540,18 @@ handlers[Wire.COOP_JOIN] = function(self, client, msg)
   -- four-player one: from here on the battle traffic does not care which of
   -- the two ways it was agreed.
   --
-  -- `coop_npc`, and it is the flow that decides it rather than a head count:
-  -- this pair agreed by one of them standing in front of a trainer, so the
-  -- other side of the field is that trainer -- an opponent with a party and no
-  -- connection.  The four-way path is the only one that makes a `coop_pvp`,
-  -- because it is the only one where both sides are players.
+  -- The mode is taken from the offer when the waiter named one: coop_wild for
+  -- Party vs Wild (auto-join grass), otherwise coop_npc for the trainer path.
+  -- The four-way path is the only one that makes a `coop_pvp`, because it is
+  -- the only one where both sides are players.
   -- "c", for startSession's reason: sessions and co-op battles share the
   -- `battles` table and are numbered by two counters that know nothing of each
   -- other.
   local id = "c" .. tostring(self.nextCoopAsk)
   self.nextCoopAsk = self.nextCoopAsk + 1
+  local mode = offer.mode == "coop_wild" and "coop_wild" or "coop_npc"
   self:openCoopBattle(id, { host.id, client.id },
-    { mode = "coop_npc", hostId = host.id })
+    { mode = mode, hostId = host.id })
 
   -- `plan` is the hub's mediated battle id (`c*`). Without it the waiting
   -- host's CoopBattle has no battleId, uploadMediated is a no-op, and the
@@ -2550,10 +2561,12 @@ handlers[Wire.COOP_JOIN] = function(self, client, msg)
     { id = client.id, name = client.name, plan = id })
   -- `host` names the client that simulates. It is the player who was already
   -- standing at the fight, because they are the one *guaranteed* to have
-  -- walked into the trainer -- the joiner usually has too, but a join taken
-  -- from the ACTIONS menu never went near them.
+  -- walked into the encounter -- the joiner usually has too, but a join taken
+  -- from the ACTIONS menu never went near them. `mode` rides so the joiner's
+  -- CoopBattle opens as coop_wild without re-deriving from a cleared offer.
   send(client, Wire.COOP_BATTLE,
-    { id = id, side = "a", allies = members, battle = battle, host = host.id })
+    { id = id, side = "a", allies = members, battle = battle, host = host.id,
+      mode = mode })
 end
 
 -- Battle traffic, fanned out to everyone else in the same battle.

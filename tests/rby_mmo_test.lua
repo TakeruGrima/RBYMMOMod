@@ -6522,6 +6522,36 @@ local function engage(side, oppClass)
   return side.coop:onTrainerBattle(side.game, battle, "FIX_TOWN"), battle
 end
 
+-- Engine pushing a wild encounter -- the Party vs Wild divert watches this.
+local function wildEngage(side, species, level, mapId)
+  species = species or "FIXMON_A"
+  level = level or 5
+  mapId = mapId or "FIX_TOWN"
+  local battle = {
+    kind = "wild",
+    enemy = { mon = { species = species, level = level } },
+    onFinish = function(result) side.finished = result end,
+  }
+  side.engine = battle
+  side.finished = nil
+  side.stack:push(battle)
+  return side.coop:onWildEncounter(side.game, battle, mapId), battle
+end
+
+local function resetCoopWild(side)
+  while side.stack:top() do side.stack:pop() end
+  side.engine = nil
+  side.finished = nil
+  side.chosen = nil
+  side.confirmBox = nil
+  side.coop.encounter = nil
+  side.coop.waiting = nil
+  side.coop.offer = nil
+  side.coop.running = false
+  side.coop.joinAsk = nil
+  if side.client then side.client.coopOffer = nil end
+end
+
 -- BATTLE ALONE leaves the engine's own battle on top, untouched.
 local function fightsAlone(side)
   return side.stack:top() == side.engine
@@ -7007,6 +7037,144 @@ bob.coop:onBattle(bob.game, {
 eq(bob.coop.lastPlan.engine, nil,
    "nor does a battle field too malformed for Wire.battleKey to accept")
 bob.coop.running, bob.coop.battle, bob.coop.encounter = false, nil, nil
+
+-- ------- Party vs Wild: coop_wild divert and auto-join (TT3)
+--
+-- Overworld predicates and the COOP_WAIT the host posts. Hub seating for
+-- coop_wild is pinned in hub_battle (TT2); full stack handoff into
+-- CoopBattle + mediated wild resolution needs LOVE (TT4 e2e).
+--
+-- Driven on a fresh hub pair so join handoffs do not disturb the four-way
+-- party-battle state the sections below still assert against.
+
+local WILD_KEY = Coop.battleKey("FIX_TOWN", "FIXMON_A", 5)
+local wildHub = Hub.new({ maxPlayers = 8 })
+local wAnn = coopSide(wildHub, "WANN")
+local wBob = coopSide(wildHub, "WBOB")
+pump(wAnn); pump(wBob)
+wAnn.party:invite({ id = wBob.client.id, name = "WBOB" })
+pump(wBob)
+answerConfirm(wBob, true)
+pump(wAnn); pump(wBob)
+eq(wAnn.party:has(), true, "wild harness is a party of two")
+
+do
+  local loneHub = Hub.new({ maxPlayers = 8 })
+  local lone = coopSide(loneHub, "LONE")
+  pump(lone)
+  eq(wildEngage(lone), false,
+     "a player with no party does not divert a wild encounter")
+  eq(lone.coop:isWaiting(), false, "and posts no coop wait")
+end
+
+wildHub:receive(wBob.client, { type = Wire.MOVE, map = "FIX_ROUTE", x = 4, y = 4 })
+wBob.mapId = "FIX_ROUTE"
+pump(wAnn)
+eq(wildEngage(wAnn), false,
+   "a partied player whose partner is off-map does not divert")
+eq(wAnn.coop:isWaiting(), false, "and does not post COOP_WAIT")
+resetCoopWild(wAnn)
+
+wildHub:receive(wBob.client, { type = Wire.MOVE, map = "FIX_TOWN", x = 1, y = 1 })
+wBob.mapId = "FIX_TOWN"
+pump(wAnn)
+wAnn.roster:setBusy(wBob.id, true)
+eq(wildEngage(wAnn), false, "nor when the partner is session-busy")
+wAnn.roster:setBusy(wBob.id, false)
+
+-- A standing trainer wait is not coop_wild -- local wild stays engine-owned.
+engage(wAnn)
+pick(wAnn, "WAIT")
+pump(wBob)
+check(wBob.coop:pendingOffer() ~= nil, "trainer wait offer is up for the partner")
+eq(wBob.coop:pendingOffer().mode, nil, "without a coop_wild mode token")
+eq(wildEngage(wBob), false,
+   "a wild under a trainer offer does not divert or auto-join")
+resetCoopWild(wAnn); resetCoopWild(wBob)
+pump(wAnn); pump(wBob)
+
+local coopWaits = {}
+local origSend = wAnn.transport.send
+wAnn.transport.send = function(transport, msgType, payload)
+  if msgType == Wire.COOP_WAIT then coopWaits[#coopWaits + 1] = payload end
+  return origSend(transport, msgType, payload)
+end
+wBob.coop.running = true
+eq(wildEngage(wAnn), true, "on-map party diverts grass into Party vs Wild")
+wAnn.transport.send = origSend
+eq(#coopWaits, 1, "beginWildCoop posts exactly one COOP_WAIT")
+eq(coopWaits[1].mode, "coop_wild", "with mode=coop_wild on the wire")
+eq(coopWaits[1].battle, WILD_KEY, "and the derived wild battle key")
+eq(wAnn.coop:isWaiting(), true, "the host is waiting")
+eq(wAnn.coop.waiting.mode, "coop_wild", "in coop_wild mode")
+eq(wAnn.coop.waiting.kind, "wild", "holding the engine wild for handoff")
+eq(#(wAnn.chosen or {}), 1, "the wild wait box has one row")
+eq(wAnn.chosen[1].label, "ALONE", "ALONE only -- no BACK on this path")
+eq(wAnn.client.coopOffer.mode, "coop_wild",
+   "the hub stored the mode on the host's standing offer")
+
+pump(wBob)
+local wildOffer = wBob.coop:pendingOffer()
+check(wildOffer ~= nil, "the partner receives the coop_wild offer")
+eq(wildOffer.mode, "coop_wild", "with the mode intact")
+eq(wBob.confirmBox, nil, "coop_wild never raises a join confirm")
+
+wBob.coop.running = false
+wBob.peer.outbox = {}
+wBob.coop:considerOffer(wBob.game, wBob.mapId)
+check(take(wAnn.peer, Wire.COOP_JOINED) ~= nil,
+      "a free on-map partner auto-joins without a confirm box")
+
+resetCoopWild(wAnn); resetCoopWild(wBob)
+pump(wAnn); pump(wBob)
+
+-- Mutual coop_wild waits: lexicographically smaller playerId's wait wins.
+local winner, loser
+if wAnn.id < wBob.id then winner, loser = wAnn, wBob
+else winner, loser = wBob, wAnn end
+
+eq(wildEngage(winner), true, "the first waiter posts coop_wild")
+eq(wildEngage(loser), true, "the second waiter also posts locally")
+pump(loser)
+eq(loser.coop:isWaiting(), false,
+   "the larger-id client withdraws and joins the smaller-id wait")
+eq(winner.coop:isWaiting(), true, "while the smaller-id wait stays up")
+eq(loser.coop:pendingOffer(), nil,
+   "the larger-id client no longer holds a standing offer")
+pump(winner)
+eq(winner.coop:isWaiting(), false,
+   "the smaller-id waiter is told their partner joined")
+
+resetCoopWild(wAnn); resetCoopWild(wBob)
+pump(wAnn); pump(wBob)
+
+-- Partner already waiting on coop_wild: a second local wild joins instead of
+-- opening another wait.
+eq(wildEngage(wAnn), true, "the host posts the first coop_wild wait")
+wBob.coop.running = true
+pump(wBob)
+eq(wBob.coop:pendingOffer().mode, "coop_wild", "the partner holds the offer")
+wBob.coop.running = false
+local joinWild = {
+  kind = "wild",
+  enemy = { mon = { species = "FIXMON_B", level = 7 } },
+  onFinish = function() end,
+}
+wBob.game.stack:push(joinWild)
+eq(wBob.coop:onWildEncounter(wBob.game, joinWild, "FIX_TOWN"), true,
+   "a second wild while coop_wild is standing auto-joins the partner")
+check(wBob.game.stack:top() ~= joinWild,
+      "and pops the just-pushed wild so keys cannot fight under the co-op screen")
+pump(wAnn)
+eq(wAnn.coop:isWaiting(), false,
+   "the standing waiter is joined from the second wild")
+
+resetCoopWild(wAnn); resetCoopWild(wBob)
+eq(wBob.coop:joinFromMenu(wBob.game), false,
+   "joinFromMenu with no offer is a no-op")
+wBob.coop.offer = { from = wAnn.id, battle = WILD_KEY, mode = "coop_wild" }
+eq(wBob.coop:joinFromMenu(wBob.game), true,
+   "joinFromMenu on coop_wild auto-joins like considerOffer")
 
 -- ------- a ranked 2-on-2 needs all four to agree
 --
@@ -11083,6 +11251,189 @@ end)()
   stubEvents = {}
 end)()
 
+-- ------- CoopBattle intro: appear line, sequential Go! / POOF / partner sent out
+--
+-- Headless drain of enter()'s local cinematic before the first choose menu.
+-- Pins message order and that POOF_ANIM (and Ball_Poof when Sound loads) fire.
+
+;(function()
+  local CoopBattle = need("CoopBattle")
+  local MSG_MIN_DWELL = 0.25
+
+  local function fakeAnimPlayer()
+    return {
+      start = function() end,
+      update = function() end,
+      isDone = function() return true end,
+    }
+  end
+
+  local function spyStartAnim()
+    local started = {}
+    local orig = CoopBattle.startAnim
+    CoopBattle.startAnim = function(self, row)
+      if row and row.anim then started[#started + 1] = row.anim end
+      return orig(self, row)
+    end
+    return started, function() CoopBattle.startAnim = orig end
+  end
+
+  local function spySoundPlay()
+    local played = {}
+    local eng = CoopBattle.loadEngine()
+    if not (eng and eng.Sound and eng.Sound.play) then
+      return played, function() end
+    end
+    local orig = eng.Sound.play
+    eng.Sound.play = function(data, name, ...)
+      played[#played + 1] = name
+      return orig(data, name, ...)
+    end
+    return played, function() eng.Sound.play = orig end
+  end
+
+  local function introClient(opts)
+    return setmetatable({
+      sim = opts.sim,
+      host = opts.host ~= false,
+      mine = opts.mine or 1,
+      mode = opts.mode,
+      messages = {},
+      phase = "intro",
+      frame = 0,
+      animPlayer = fakeAnimPlayer(),
+      game = { data = data, save = { inventory = {}, party = {} } },
+    }, { __index = CoopBattle })
+  end
+
+  -- Advance messages with A/B after the dwell floor; stop at choose or cap.
+  local function drainIntro(client, cap)
+    cap = cap or 600
+    local history, lastShown = {}, nil
+    local function record()
+      if client.shown and client.shown ~= lastShown then
+        history[#history + 1] = client.shown
+        lastShown = client.shown
+      end
+    end
+    local input = {
+      wasPressed = function(_, k)
+        if k ~= "a" and k ~= "b" then return false end
+        return (client.msgClock or 0) >= MSG_MIN_DWELL
+      end,
+    }
+    client.game.input = input
+    for _ = 1, cap do
+      record()
+      CoopBattle.update(client, 1 / 60)
+      if client.phase == "choose" then
+        record()
+        break
+      end
+    end
+    return history
+  end
+
+  local function lineIndex(history, needle)
+    for i, line in ipairs(history) do
+      if tostring(line):find(needle, 1, true) then return i end
+    end
+    return nil
+  end
+
+  local function wildField()
+    return fieldSim({
+      { side = "a", owner = "ann", name = "ANN",
+        party = { mon(60, 50, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "a", owner = "bob", name = "BOB",
+        party = { mon(60, 40, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "b", owner = nil, name = "WILD",
+        party = { mon(60, 30, { { id = "FIX_TACKLE", pp = 20 } }) } },
+    })
+  end
+
+  local function npcField()
+    return fieldSim({
+      { side = "a", owner = "ann", name = "ANN",
+        party = { mon(60, 50, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "a", owner = "bob", name = "BOB",
+        party = { mon(60, 40, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "b", owner = nil, name = "TRAINER",
+        party = { mon(50, 20, { { id = "FIX_TACKLE", pp = 20 } }),
+                  mon(50, 18, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "b", owner = nil, name = "TRAINER",
+        party = { mon(50, 19, { { id = "FIX_TACKLE", pp = 20 } }),
+                  mon(50, 17, { { id = "FIX_TACKLE", pp = 20 } }) } },
+    })
+  end
+
+  local function countAnim(started, name)
+    local n = 0
+    for _, anim in ipairs(started) do
+      if anim == name then n = n + 1 end
+    end
+    return n
+  end
+
+  local function heardSound(played, name)
+    for _, clip in ipairs(played) do
+      if clip == name then return true end
+    end
+    return false
+  end
+
+  do
+    local anims, restoreAnim = spyStartAnim()
+    local sounds, restoreSound = spySoundPlay()
+    local client = introClient({ sim = wildField(), mode = "coop_wild" })
+    CoopBattle.enter(client)
+    check(client.introBalls == true,
+          "coop_wild enter arms intro ball chrome before the appear line")
+    local history = drainIntro(client)
+    restoreAnim()
+    restoreSound()
+    eq(client.phase, "choose",
+       "coop_wild intro drains to the command menu headlessly")
+    local appear = lineIndex(history, "appeared!")
+    local go = lineIndex(history, "Go!")
+    local partner = lineIndex(history, "sent out")
+    check(appear ~= nil, "the Wild appeared line is shown")
+    check(go ~= nil, "Go! is shown after the appear line")
+    check(partner ~= nil, "the partner sent-out line is shown")
+    if appear and go and partner then
+      check(appear < go, "appear precedes Go!")
+      check(go < partner, "Go! precedes the partner sent-out line")
+    end
+    check(countAnim(anims, "POOF_ANIM") >= 1,
+          "at least one POOF_ANIM started during coop_wild intro")
+    if CoopBattle.loadEngine() and CoopBattle.loadEngine().Sound then
+      check(heardSound(sounds, "Ball_Poof"),
+            "Ball_Poof plays when POOF_ANIM starts and Sound is loaded")
+    end
+  end
+
+  do
+    local anims, restoreAnim = spyStartAnim()
+    local client = introClient({ sim = npcField(), mode = "coop_npc" })
+    CoopBattle.enter(client)
+    local history = drainIntro(client)
+    restoreAnim()
+    eq(client.phase, "choose",
+       "coop_npc intro drains to the command menu headlessly")
+    local battle = lineIndex(history, "2 on 2 battle!")
+    local go = lineIndex(history, "Go!")
+    local partner = lineIndex(history, "sent out")
+    check(battle ~= nil, "the 2 on 2 battle! line is shown")
+    check(go ~= nil, "Go! follows the non-wild appear line")
+    if battle and go then
+      check(battle < go, "2 on 2 battle! precedes Go!")
+    end
+    check(partner ~= nil, "the partner sent-out line still plays in coop_npc")
+    check(countAnim(anims, "POOF_ANIM") >= 1,
+          "at least one POOF_ANIM started during coop_npc intro")
+  end
+end)()
+
 -- ------- what a co-op battle is worth, and what it is not
 --
 -- **An NPC co-op battle pays no ranked points, deliberately.** Elo rates you
@@ -13294,8 +13645,19 @@ if eng and eng.BattleState then
   }
 
   local function battle(trainer)
+    local sim = fieldSim({
+      { side = "a", owner = "ann", name = "ANN",
+        party = { mon(60, 50, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "a", owner = "bob", name = "BOB",
+        party = { mon(60, 40, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "b", owner = nil, name = "FOE",
+        party = { mon(60, 30, { { id = "FIX_TACKLE", pp = 20 } }) } },
+      { side = "b", owner = nil, name = "FOE",
+        party = { mon(60, 20, { { id = "FIX_TACKLE", pp = 20 } }) } },
+    })
     return setmetatable({
-      game = { data = data }, trainer = trainer, messages = {},
+      game = { data = data, save = { inventory = {}, party = {} } },
+      trainer = trainer, messages = {}, mine = 1, sim = sim,
       announce = function() end, say = function() end,
     }, { __index = CoopBattle })
   end

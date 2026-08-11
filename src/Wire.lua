@@ -75,11 +75,13 @@ M.RANKS         = "mmo.ranks"
 -- same one PARTY_INVITE has: the hub is what turns "I am waiting" into "your
 -- friend is waiting", because only the hub knows who is in the party.
 --
--- COOP_WAIT carries { battle, label, map } -- the fight this player is
--- standing in front of.  COOP_CANCEL withdraws it with an optional reason
--- (`alone` / `left` / `timeout` from the waiter; `no` from the partner who
--- declined the invite). Naming which offer is unnecessary: there is only ever
--- one per player.  COOP_JOIN answers somebody else's offer with { to, battle }.
+-- COOP_WAIT carries { battle, label, map [, mode] } -- the fight this player is
+-- standing in front of.  Optional `mode` is only `"coop_wild"` (Party vs Wild
+-- auto-join); absent means the trainer WAIT/JOIN invite path.  COOP_CANCEL
+-- withdraws it with an optional reason (`alone` / `left` / `timeout` from the
+-- waiter; `no` from the partner who declined the invite). Naming which offer
+-- is unnecessary: there is only ever one per player.  COOP_JOIN answers
+-- somebody else's offer with { to, battle }.
 --
 -- A partner decline (`COOP_CANCEL` reason `no`) is forwarded to the waiter as
 -- `COOP_DECLINE`, so they can leave the wait and fight the trainer alone.
@@ -210,10 +212,11 @@ M.RANKING     = "mmo.ranking"
 -- Co-op, coming back.
 --
 -- COOP_OFFER is your partner's standing "I am waiting for you at this fight":
--- { from, name, battle, label, map }.  COOP_OFFER_END withdraws it, and
--- carries a reason so the partner's client can tell "they went in alone" from
--- "they walked away" -- two things that look identical from the outside and
--- read very differently to the person who was going to join.
+-- { from, name, battle, label, map [, mode] }.  Optional `mode` mirrors
+-- COOP_WAIT (`coop_wild` only).  COOP_OFFER_END withdraws it, and carries a
+-- reason so the partner's client can tell "they went in alone" from "they
+-- walked away" -- two things that look identical from the outside and read
+-- very differently to the person who was going to join.
 M.COOP_OFFER     = "mmo.coop_offer"
 M.COOP_OFFER_END = "mmo.coop_offer_end"
 -- Somebody accepted yours: { id, name }.  This is the message that ends the
@@ -809,11 +812,20 @@ function M.battleKey(value)
   return value
 end
 
+-- Optional wait/offer mode. Only `coop_wild` is meaningful; anything else
+-- (including absent) is nil so the trainer invite path stays the default.
+function M.coopOfferMode(value)
+  if value == "coop_wild" then return "coop_wild" end
+  return nil
+end
+
 -- A co-op offer as it reaches the partner.  `label` is what the box calls the
 -- fight ("BUG CATCHER") and is prose; `battle` is the key and is not.  A
 -- missing label is fine and common -- a script-driven battle need not name its
 -- trainer -- so it degrades to nil and the screen says "a battle" instead of
--- refusing the whole offer over a cosmetic field.
+-- refusing the whole offer over a cosmetic field.  Optional `mode` is only
+-- `coop_wild` (auto-join Party vs Wild); unknown values are dropped, not a
+-- refuse of the whole offer.
 function M.coopOffer(raw)
   if type(raw) ~= "table" then return nil end
   local from = M.id(raw.from)
@@ -826,6 +838,7 @@ function M.coopOffer(raw)
     battle = battle,
     label = M.label(raw.label),
     map = M.mapId(raw.map),
+    mode = M.coopOfferMode(raw.mode),
   }
 end
 
@@ -1522,9 +1535,9 @@ function M.battleEvent(raw)
   if not (battle and seq) then return nil end
 
   local out = { battle = battle, seq = seq, t = raw.t }
-  -- Item events carry an id in `text`, not prose -- M.text would strip `_`.
+  -- Item / anim `text` is an id (POKE_BALL, TOSS_ANIM, move id) — M.text strips `_`.
   if raw.text ~= nil then
-    if raw.t == "item" then
+    if raw.t == "item" or raw.t == "anim" then
       out.text = M.id(raw.text)
     else
       out.text = M.text(raw.text, Config.MESSAGE_MAX)
@@ -1646,6 +1659,14 @@ function M.battleOutcome(raw)
     out.caught = M.battleMon(raw.caught)
     if not out.caught then return nil end
   end
+  -- Optional catcher: who keeps the mon on a coop_wild catch. Absent is fine
+  -- (solo wild / KO outcomes need no thrower); present-and-bad refuses the
+  -- whole outcome -- same posture as winners/losers, since this is the name
+  -- a grant moves for.
+  if raw.catcher ~= nil then
+    out.catcher = M.id(raw.catcher)
+    if not out.catcher then return nil end
+  end
   return out
 end
 
@@ -1668,15 +1689,19 @@ end
 --   1v1       -- two players, one monster each
 --   coop_npc  -- a party of two against a trainer somebody walked into
 --   coop_pvp  -- two parties against each other
---   wild      -- one player against one hub NPC seat (catch/run legal)
+--   wild      -- one player against one hub NPC seat (catch/run legal;
+--               protocol-only; no overworld divert)
+--   coop_wild -- two humans vs one wild NPC seat (catch/run legal; overworld
+--               divert when partied + same map — seating lands in a later wave)
 --
 -- Named on the wire rather than inferred from how many ids arrived, because the
 -- two co-op modes have the same four field slots and differ only in whether one
 -- side has an owner -- and "guess the mode from the roster" is the kind of
 -- inference that is right until an NPC battle happens to have a spectatorless
 -- second slot.
---   wild      -- one player against a hub NPC seat (protocol-only; no overworld divert)
-M.BATTLE_MODES = { ["1v1"] = true, coop_npc = true, coop_pvp = true, wild = true }
+M.BATTLE_MODES = {
+  ["1v1"] = true, coop_npc = true, coop_pvp = true, wild = true, coop_wild = true,
+}
 
 function M.battleMode(value)
   if M.BATTLE_MODES[value] then return value end
