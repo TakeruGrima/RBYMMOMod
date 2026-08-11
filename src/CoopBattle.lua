@@ -21,10 +21,12 @@
 -- own host-authoritative branch already takes for `action`/`event` in a link
 -- battle, one player wider.
 --
--- The upshot for this file: `self.host` runs `CoopSim` and broadcasts; everyone
--- else applies what arrives. **Both paths draw from the same event list**, so
--- the battle a replayer sees is the battle the host ran, not an approximation
--- of it.
+-- The upshot for this file: for **hub-refereed** coop modes (always
+-- `coop_pvp` / `coop_npc`), the intermediator decides and this screen draws
+-- an ordered `mmo.battle_event` stream — same as MediatedBattle. `CoopSim`
+-- is still constructed to hold the field the screen is drawn from, and is
+-- not asked to *decide* anything. See "the intermediator, when there is one"
+-- near the bottom.
 --
 -- ------- what this covers
 --
@@ -58,6 +60,10 @@ local Config = need("Config")
 local Wire = need("Wire")
 local CoopSim = need("CoopSim")
 local CoopField = need("CoopField")
+-- The 1v1 mediated client, for its snapshots and its senders rather than for
+-- its screen: what a party looks like on the wire must not depend on how many
+-- monsters are on the field.
+local Mediated = need("MediatedBattle")
 
 local M = {}
 M.__index = M
@@ -198,6 +204,16 @@ end
 --   host    true if this client runs the simulation
 --   net     { send = fn(payload), poll = fn() -> { payload } } or nil
 --   onDone  called with "win"|"loss"|"draw" once the battle ends
+--
+-- ...and four more for a fight the intermediator may referee. All optional: a
+-- screen built without them is the client-simulated battle this file always was.
+--   transport the mod's hub connection, for the mmo.battle_* types. Not `net`:
+--             those are addressed to the hub itself rather than relayed to the
+--             other three, which is the whole difference between the two paths
+--   battleId  the hub's id for this fight, which every mediated message names
+--   selfId    this client's own hub id, which is how an outcome naming four
+--             players is read as a result for one
+--   mode      "coop_npc" | "coop_pvp", the hub's word for which shape this is
 function M.new(game, opts)
   local eng = loadEngine()
   if not eng then return nil, "2-on-2 battles need the engine's battle modules." end
@@ -232,6 +248,30 @@ function M.new(game, opts)
     ranksPoints = opts.ranksPoints and true or false,
     net = opts.net,
     onDone = opts.onDone,
+    -- ------- the intermediator's half, all of it inert until it answers
+    --
+    -- `mediated` is the flag every cut below is gated on, and it is set by
+    -- mmo.battle_ready and by nothing else -- not by the mode, not by having a
+    -- transport. Modes in Config.MEDIATED_COOP never host-sim while waiting
+    -- (tryResolve/openTurn/autoPickLate no-op); upload failure sets medFailed
+    -- and ends the fight rather than falling through to engine ItemEffects.
+    transport = opts.transport,
+    battleId = opts.battleId,
+    selfId = opts.selfId,
+    mode = opts.mode,
+    mediated = false,
+    medUploaded = false,
+    medFailed = false, -- upload refused; do not fall back to host-sim
+    bagSheet = nil,    -- uploaded PROTOCOL 15 bag counts when mediated
+    pendingItem = nil, -- item choice awaiting hub `item` event
+    pendingItemSlot = nil, -- 1-based seat.party index for vitamin writeback
+    itemPick = nil,    -- mediated ITEM menu selection awaiting party/move
+    itemPartyIndex = nil,
+    medPending = {},   -- rows built from events, played when the turn closes
+    medSeq = 0,        -- the highest event sequence applied
+    medGaps = 0,       -- events that arrived out of order
+    awaitingReconnect = false,
+    reconnectSent = false,
     phase = "intro",
     moveIndex = 1,
     targetIndex = 1,
@@ -246,6 +286,12 @@ function M.new(game, opts)
     hostClock = 0,
     sent = false,
     result = nil,
+    hitSlot = nil,
+    stageAlly = nil,
+    stageFoe = nil,
+    slideAlly = nil,
+    slideFoe = nil,
+    lastFoeFocus = nil,
   }, M)
 
   local rng = function(a, b)
@@ -259,6 +305,15 @@ function M.new(game, opts)
   local slots = {}
   local field = CoopField.new(
     { BattleState = eng.BattleState, rng = rng }, game, slots, ruleset)
+
+  -- Back sprites for the local seat's side (bottom after viewPos), front for
+  -- the far side. Must be known before CoopSim.new runs sendOut, or the first
+  -- field would face the wrong way until a switch rebuilt it.
+  local facingSide = "a"
+  do
+    local mineSpec = (opts.slots or {})[self.mine]
+    if mineSpec and mineSpec.side == "b" then facingSide = "b" end
+  end
 
   self.sim = CoopSim.new({
     data = game.data,
@@ -279,6 +334,7 @@ function M.new(game, opts)
     trainer = opts.trainer,
     aiUses = opts.aiUses,
     save = game.save,
+    facingSide = facingSide,
     onError = function(err)
       mod.log:warn("a move failed to resolve in a co-op battle (%s); the "
         .. "battle continues -- report the move it happened on", tostring(err))
@@ -424,6 +480,11 @@ function M:enter()
   self.phase = "messages"
   self.after = "choose"
   self:announce("coop_battle_started")
+  -- ...and this is where a refereed fight is offered its field. Last, because
+  -- everything above is what the player sees either way: an upload that goes
+  -- nowhere leaves a client-simulated battle rather than a screen that never
+  -- opened.
+  self:uploadMediated()
 end
 
 -- The fanfare, once, when the result is known.
@@ -449,11 +510,16 @@ end
 
 -- Give back an item paid for on a turn that never happened.
 --
--- The bag is debited when the action is committed, because only this client
--- owns it -- but the battle can end before that action is ever resolved: the
--- host disconnects, the stall clock fires, somebody forfeits. A potion that
--- healed nobody should not be gone.
+-- Host-sim only: the bag is debited when the action is committed. Mediated
+-- fights debit only after the hub `item` event, so there is nothing to refund
+-- for a refused choice (never spent) or an accepted one (hub already spent).
 function M:refundUnspent()
+  if self.mediated then
+    self.pendingItem = nil
+    self.pendingItemSlot = nil
+    self.owed = nil
+    return
+  end
   local id = self.owed
   self.owed = nil
   if not id then return end
@@ -480,15 +546,101 @@ function M:exit()
   end
 end
 
+-- Inner columns of the bottom box (20-tile box, one tile of border each side).
+-- Every battle line and every list label is cut to this so nothing paints past
+-- the right edge -- Gen 1's own fight box is the same budget.
+local BOX_COLS = 18
+local BOX_ROWS = 2
+
+-- Soft-wrap one string into lines that fit the bottom box.
+--
+-- Prefers a break at the last space that still fits; otherwise hard-cuts. Keeps
+-- author newlines as paragraph breaks so curated two-line pages stay two lines
+-- when each half already fits.
+local function wrapBoxLines(text, width)
+  width = width or BOX_COLS
+  local lines = {}
+  local raw = tostring(text or "")
+  if raw == "" then return { "" } end
+  for line in (raw .. "\n"):gmatch("(.-)\n") do
+    local rest = line
+    if rest == "" then
+      lines[#lines + 1] = ""
+    else
+      while #rest > width do
+        local chunk = rest:sub(1, width)
+        local space = chunk:match("^.*()%s")
+        local breakAt = width
+        if space and space > 1 then breakAt = space - 1 end
+        lines[#lines + 1] = rest:sub(1, breakAt):gsub("%s+$", "")
+        rest = rest:sub(breakAt + 1):gsub("^%s+", "")
+      end
+      lines[#lines + 1] = rest
+    end
+  end
+  return lines
+end
+
+-- Pages of at most BOX_ROWS lines, each line already <= BOX_COLS.
+local function pageBoxText(text)
+  local lines = wrapBoxLines(text, BOX_COLS)
+  local pages = {}
+  for i = 1, #lines, BOX_ROWS do
+    local page = lines[i]
+    if lines[i + 1] then page = page .. "\n" .. lines[i + 1] end
+    pages[#pages + 1] = page
+  end
+  if #pages == 0 then pages[1] = "" end
+  return pages
+end
+
+-- One step on a vertical list. UP/DOWN move; LEFT/RIGHT are aliases (same habit
+-- as the target column and the move list). Clamped -- no wrap.
+local function listPress(index, count, input)
+  if count < 1 then return nil end
+  local step = 0
+  if input:wasPressed("up") or input:wasPressed("left") then step = -1
+  elseif input:wasPressed("down") or input:wasPressed("right") then step = 1 end
+  if step == 0 then return nil end
+  return math.max(1, math.min(count, (index or 1) + step))
+end
+
+-- Classic Gen 1 battle-command grid: two columns, two rows. Each arrow moves
+-- on its own axis and clamps at the edge (BattleState / WideBattle).
+local function gridStep(index, count, direction)
+  local row = math.floor((index - 1) / 2)
+  local col = (index - 1) % 2
+  if direction == "left" then col = math.max(0, col - 1)
+  elseif direction == "right" then col = math.min(1, col + 1)
+  elseif direction == "up" then row = math.max(0, row - 1)
+  elseif direction == "down" then row = math.min(1, row + 1)
+  else return index end
+  local moved = row * 2 + col + 1
+  if moved > count then return index end
+  return moved
+end
+
+local GRID_KEYS = { "left", "right", "up", "down" }
+
+local function gridPress(index, count, input)
+  for _, key in ipairs(GRID_KEYS) do
+    if input:wasPressed(key) then return gridStep(index, count, key) end
+  end
+  return nil
+end
+
 function M:say(text)
-  self.messages[#self.messages + 1] = text
+  for _, page in ipairs(pageBoxText(text)) do
+    self.messages[#self.messages + 1] = page
+  end
 end
 
 function M:mySlot() return self.sim:slot(self.mine) end
 
 -- ------- input
 --
--- The same four commands the original offers, in the same 2x2 arrangement.
+-- The same four commands the original offers, as a 2x2 grid
+-- (FIGHT/SWITCH over ITEM/RUN), navigated with every d-pad direction.
 
 -- How long a freshly shown line is safe from the button that dismisses it.
 --
@@ -512,7 +664,14 @@ local MSG_AUTO_ADVANCE = 1.6
 
 function M:update(dt)
   self.frame = self.frame + 1
+  if self.sim and not self.result then
+    self:stepFocusSlides()
+  end
   local input = self.game.input
+
+  if self.medFailed and not self.result then
+    self:failMediation()
+  end
 
   if self.net then
     self:drainNet()
@@ -593,6 +752,15 @@ function M:update(dt)
         if type(next) == "table" then
           self.acting = next.from or self.acting
           next = next.text
+        end
+        -- Hub / playEvents lines skip M:say, so wrap here too: a single long
+        -- referee sentence must not paint past the box edge.
+        if type(next) == "string" then
+          local pages = pageBoxText(next)
+          next = pages[1]
+          for i = #pages, 2, -1 do
+            table.insert(self.messages, 1, pages[i])
+          end
         end
         self.shown = next
         self.msgClock = 0
@@ -706,6 +874,7 @@ function M:update(dt)
   if self.phase == "choose" or self.phase == "move"
      or self.phase == "target" then
     self.acting = nil
+    self.hitSlot = nil
   end
   -- A replacement outranks the turn: this slot has nothing on the field, so
   -- there is no move for it to make until one is chosen.
@@ -740,6 +909,8 @@ function M:update(dt)
   if self.phase == "target" then return self:updateTarget(input) end
   if self.phase == "switch" then return self:updateSwitch(input) end
   if self.phase == "item" then return self:updateItem(input) end
+  if self.phase == "item_party" then return self:updateItemParty(input) end
+  if self.phase == "item_move" then return self:updateItemMove(input) end
   -- "wait" does nothing but let drainNet do its work
 end
 
@@ -775,6 +946,9 @@ function M:waitingOn()
     return Config.COOP_CHOICE_TIMEOUT, (pending.name or "Someone")
   end
   if self.phase == "wait" then
+    if self.mediated then
+      return Config.BATTLE_CHOICE_TIMEOUT, nil
+    end
     return Config.COOP_TURN_TIMEOUT, nil
   end
   return nil
@@ -818,6 +992,12 @@ function M:markActed(index)
   self.acted[index] = true
 end
 
+function M:unmarkActed(index)
+  if not index then return end
+  self.acted = self.acted or {}
+  self.acted[index] = false
+end
+
 -- The line a wait puts in the message box once it has gone on long enough to
 -- need explaining. Nil until then, because a clock that flashed up on every
 -- ordinary turn would be noise rather than reassurance.
@@ -848,24 +1028,14 @@ function M:waitLine()
   -- it looks fine for every short name anybody tests with.
   if who then return ("%s is\nchoosing... (%d)"):format(who, left) end
   local missing = self:missingActors()
-  local name = missing[1]
-  if name then
-    name = name:sub(1, Config.NAME_MAX)
-    -- ------- what fits, in the order it is worth keeping
-    --
-    -- Eighteen columns for "<NAME>... +N (60)", and at NAME_MAX all three
-    -- cannot have them: ten for the name, three for the ellipsis and five for
-    -- " (60)" is exactly eighteen with nothing left over. So the rule, in
-    -- priority order: the **name** is never truncated, the **number** is kept
-    -- because it is the half the deadline makes true, and the " +N" tail --
-    -- "how many others are also still deciding" -- is the one that goes. Both
-    -- tails are measured rather than assumed, so the day NAME_MAX moves the
-    -- line loses a tail instead of running off the edge.
-    local more = (#missing > 1) and (" +%d"):format(#missing - 1) or ""
+  if #missing > 0 then
+    local name = missing[1]:sub(1, Config.NAME_MAX)
+    -- Gen1 font has no '+'; use " &N" so the wait line stays drawable.
+    local tail = (#missing > 1) and (" &" .. (#missing - 1)) or ""
     local clock = (" (%d)"):format(left)
-    if #name + #more + 3 + #clock > 18 then more = "" end
+    if #name + 3 + #tail + #clock > 18 then tail = "" end
     if #name + 3 + #clock > 18 then clock = "" end
-    return ("Waiting for\n%s...%s%s"):format(name, more, clock)
+    return ("Waiting for\n%s...%s%s"):format(name, tail, clock)
   end
   -- Nobody nameable -- an older host that sends no `act` this client can read,
   -- or a turn whose last answer is already in flight. The number still stands
@@ -895,62 +1065,25 @@ function M:spectating()
 end
 
 function M:liveMoves()
+  if self.medMoveList then return self.medMoveList end
   local slot = self:mySlot()
   local battler = slot and slot.battler
   return (battler and battler.curMoves) or {}
 end
 
--- FIGHT / ITEM / SWITCH / RUN, laid out 2x2 like the original's command box.
-M.COMMANDS = { "FIGHT", "ITEM", "SWITCH", "RUN" }
-
--- ------- one step around a 2x2 picker
---
--- Every picker on this screen is drawn by `drawList`, which lays its rows out
--- **row-major across two columns**: row 1 top-left, row 2 top-right, row 3
--- bottom-left, row 4 bottom-right. So the arrows have to move that way too,
--- and until now they did not: the command box cycled 1>2>3>4>1 on up/left and
--- down/right, which meant DOWN from FIGHT landed on ITEM -- the box to its
--- *right* -- and LEFT from FIGHT wrapped round to RUN. Anybody navigating by
--- what is on screen went somewhere else.
---
--- The rule is the engine's own (BattleState.lua:1544-1557): decompose the
--- index into a row and a column, move one of them, clamp at every edge. No
--- wrap anywhere -- LEFT from FIGHT stays on FIGHT.
---
--- `count` closes the second half of it, and that is the Wide-layout move
--- grid's rule (WideBattle.lua:351-377): a direction that points at a slot
--- past the end of the list **holds** the current position rather than moving
--- to a row that is not drawn. Three moves, cursor on the second: DOWN would
--- be slot four, which nothing occupies, so the cursor stays where it is.
---
--- One deliberate difference from WideBattle: its horizontal step *crosses* to
--- the other column (LEFT and RIGHT do the same thing) rather than clamping.
--- Here the command box and the move list are the same box, drawn by the same
--- function, one press apart -- so both clamp, and no arrow on this screen ever
--- wraps.
-local function gridStep(index, count, direction)
-  local row = math.floor((index - 1) / 2)
-  local col = (index - 1) % 2
-  if direction == "left" then col = math.max(0, col - 1)
-  elseif direction == "right" then col = math.min(1, col + 1)
-  elseif direction == "up" then row = math.max(0, row - 1)
-  elseif direction == "down" then row = math.min(1, row + 1)
-  else return index end
-  local moved = row * 2 + col + 1
-  if moved > count then return index end
-  return moved
-end
-
-local GRID_KEYS = { "left", "right", "up", "down" }
-
--- The slot a directional press lands on, or nil when no direction was pressed
--- -- so the caller's own A / B handling stays exactly where it was.
-local function gridPress(index, count, input)
-  for _, key in ipairs(GRID_KEYS) do
-    if input:wasPressed(key) then return gridStep(index, count, key) end
+function M:hasLivePP()
+  if self.medMoveList then
+    for _, move in ipairs(self.medMoveList) do
+      if (move.pp or 0) > 0 then return true end
+    end
+    return false
   end
-  return nil
+  local slot = self:mySlot()
+  return self.sim:hasPP(slot and slot.battler)
 end
+
+-- Classic Gen 1 order (row-major): FIGHT SWITCH / ITEM RUN.
+M.COMMANDS = { "FIGHT", "SWITCH", "ITEM", "RUN" }
 
 function M:updateCommand(input)
   self.commandIndex = self.commandIndex or 1
@@ -1051,31 +1184,46 @@ end
 function M:updateMove(input)
   local moves = self:liveMoves()
   if #moves == 0 then return end
-  -- The list is drawn 2x2 (drawMoves), so it is navigated 2x2 -- see gridStep
-  -- for the rule and for what a direction pointing past the last move does.
-  local moved = gridPress(self.moveIndex, #moves, input)
-  if moved then
-    self.moveIndex = moved
+  -- One name per row (drawMoves), so UP/DOWN step the list. LEFT/RIGHT stay
+  -- aliases -- same habit as the target column -- and both ends clamp.
+  local step = 0
+  if input:wasPressed("up") or input:wasPressed("left") then step = -1
+  elseif input:wasPressed("down") or input:wasPressed("right") then step = 1 end
+  if step ~= 0 then
+    self.moveIndex = math.max(1, math.min(#moves, (self.moveIndex or 1) + step))
   elseif input:wasPressed("b") then
     self.phase = "choose"
   elseif input:wasPressed("a") then
     -- Nothing to aim at yet.
     --
     -- A slot whose monster has fainted is *down* until its trainer sends the
-    -- next one out, so when both opponents faint in the same turn there is a
-    -- real window with no legal target -- and it is exactly the window the
-    -- other side is standing in a menu deciding. Refused here with a sentence
-    -- rather than opened empty, because an empty picker is a cursor pointing
-    -- at nothing that no key gets out of.
+    -- next one out. On the host-sim path that pauses the field; on the
+    -- mediated path their replace and your fight share one choice window, so
+    -- `targetsFor` still names those seats when the side has party left.
+    -- Only a wiped side returns nothing here -- refused with a sentence rather
+    -- than an empty picker that no key gets out of.
     --
     -- Checked ahead of the self-move shortcut below, and for both of them: a
     -- Swords Dance committed during that window would still carry a target
     -- slot, and there is none to name.
-    if #self.sim:targetsFor(self:mySlot()) == 0 then
+    local targets = self.sim:targetsFor(self:mySlot())
+    if #targets == 0 then
       self.phase = "messages"
       self.after = "choose"
       self:say("Wait for the other\ntrainer!")
       return
+    end
+    -- Every aimable seat is mid-replace (empty on the field, party still
+    -- alive): skip "Attack who?" -- the player cannot see a mon to pick, and
+    -- the hub retargets onto whoever they send out. Committing is what breaks
+    -- the old deadlock of looping the wait line while the referee waited on us.
+    local anyUp = false
+    for _, entry in ipairs(targets) do
+      if not self.sim:isDown(entry) then anyUp = true; break end
+    end
+    if not anyUp then
+      return self:commit({ slot = self.mine, move = self.moveIndex,
+                           target = targets[1].index })
     end
     -- A move that is aimed at nobody is committed on the spot.
     --
@@ -1095,9 +1243,9 @@ function M:updateMove(input)
     -- player most wants to choose.
     local pick = moves[self.moveIndex]
     local mine = self:mySlot()
-    local hasPP = self.sim:hasPP(mine and mine.battler)
+    local hasPP = self:hasLivePP()
     if pick and hasPP and not self:needsTarget(pick) then
-      local first = self.sim:targetsFor(self:mySlot())[1]
+      local first = targets[1]
       return self:commit({ slot = self.mine, move = self.moveIndex,
                            target = first.index })
     end
@@ -1132,10 +1280,9 @@ function M:updateReplace(input)
     return
   end
   self.switchIndex = math.min(self.switchIndex or 1, #bench)
-  if input:wasPressed("up") then
-    self.switchIndex = self.switchIndex > 1 and self.switchIndex - 1 or #bench
-  elseif input:wasPressed("down") then
-    self.switchIndex = self.switchIndex < #bench and self.switchIndex + 1 or 1
+  local moved = listPress(self.switchIndex, #bench, input)
+  if moved then
+    self.switchIndex = moved
   elseif input:wasPressed("a") then
     self.replacing = nil
     self:sendAction({ slot = self.mine, kind = CoopSim.REPLACE,
@@ -1154,10 +1301,9 @@ function M:updateSwitch(input)
     self.after = "choose"
     return
   end
-  if input:wasPressed("up") then
-    self.switchIndex = self.switchIndex > 1 and self.switchIndex - 1 or #bench
-  elseif input:wasPressed("down") then
-    self.switchIndex = self.switchIndex < #bench and self.switchIndex + 1 or 1
+  local moved = listPress(self.switchIndex or 1, #bench, input)
+  if moved then
+    self.switchIndex = moved
   elseif input:wasPressed("b") then
     self.phase = "choose"
   elseif input:wasPressed("a") then
@@ -1168,18 +1314,40 @@ end
 
 -- What is in the bag that can be used in a battle at all.
 --
--- Read from the live save rather than a copy: an item spent in a co-op battle
--- is spent, the same way it is in any other. Balls are listed, because
--- refusing one is a thing the game *says* rather than a row it hides.
+-- Mediated fights follow the uploaded bag sheet (same set the hub proves).
+-- Host-sim fights still read the live save, but only ids BattleSim knows.
 function M:usableItems()
   if self.itemList then return self.itemList end
   local out = {}
   local inventory = (self.game.save and self.game.save.inventory) or {}
   local items = self.game.data.items or {}
-  for id, count in pairs(inventory) do
-    local def = items[id]
-    if def and (count or 0) > 0 and not def.machine and not def.key then
-      out[#out + 1] = { id = id, name = def.name or id, count = count }
+  if self.mediated and type(self.bagSheet) == "table" then
+    for id, bagCount in pairs(self.bagSheet) do
+      local effect = Mediated.itemIsBattleUsable(id, self.game)
+      if effect and (bagCount or 0) > 0 then
+        local inv = inventory[id] or 0
+        local count = effect.noConsume
+          and ((inv >= 1 or bagCount >= 1) and 1 or 0)
+          or math.min(bagCount, inv)
+        if count > 0 then
+          local def = items[id]
+          out[#out + 1] = {
+            id = id, name = (def and def.name) or id, count = count, effect = effect,
+          }
+        end
+      end
+    end
+  else
+    for id, count in pairs(inventory) do
+      if type(id) == "string" and (count or 0) > 0 then
+        local effect = Mediated.itemIsBattleUsable(id, self.game)
+        if effect then
+          local def = items[id]
+          out[#out + 1] = {
+            id = id, name = (def and def.name) or id, count = count, effect = effect,
+          }
+        end
+      end
     end
   end
   table.sort(out, function(a, b) return a.name < b.name end)
@@ -1195,35 +1363,150 @@ function M:updateItem(input)
     self.after = "choose"
     return
   end
-  if input:wasPressed("up") then
-    self.itemIndex = self.itemIndex > 1 and self.itemIndex - 1 or #items
-  elseif input:wasPressed("down") then
-    self.itemIndex = self.itemIndex < #items and self.itemIndex + 1 or 1
+  local moved = listPress(self.itemIndex or 1, #items, input)
+  if moved then
+    self.itemIndex = moved
   elseif input:wasPressed("b") then
     self.phase = "choose"
   elseif input:wasPressed("a") then
     local pick = items[self.itemIndex]
-    -- Paid for here, on the client that owns the bag.
-    --
-    -- The host simulates every slot but holds nobody else's inventory, so if
-    -- the deduction were left to the simulation an item used by any other
-    -- player would work and cost nothing. Spending it at the moment of
-    -- committing keeps the bag the one thing each player accounts for
-    -- themselves -- the same reason only your own party is the live one.
-    local inventory = self.game.save and self.game.save.inventory
-    if inventory and (inventory[pick.id] or 0) > 0 then
-      inventory[pick.id] = inventory[pick.id] - 1
-      if inventory[pick.id] <= 0 then inventory[pick.id] = nil end
-      -- Held until the turn it was spent on comes back resolved. The bag is
-      -- debited here on purpose -- only this client owns it -- but a turn that
-      -- never resolves (the host drops, the stall clock fires) used to take
-      -- the item with it, healing nobody.
-      self.owed = pick.id
+    local Effects = need("BattleSim/Effects")
+    local effect = pick.effect or Effects.itemEffect(pick.id)
+    if self.mediated then
+      -- Parity with MediatedBattle: party / move pickers for heals, Revive,
+      -- Ether, vitamins; balls/doll/flute/X-items commit without a bench pick.
+      self.itemPick = pick
+      local seat = self:mySlot()
+      local active = (seat and seat.active) or 1
+      if not effect then
+        self:commitMediatedItem(active, nil)
+      elseif effect.ball or effect.pokeDoll or effect.pokeFlute then
+        self:commitMediatedItem(nil, nil)
+      elseif effect.activeOnly then
+        self:commitMediatedItem(active, nil)
+      elseif effect.needsMove or effect.needsParty or effect.faintedOnly then
+        self.switchIndex = 1
+        self.phase = "item_party"
+      else
+        self:commitMediatedItem(active, nil)
+      end
+    else
+      -- Host-sim: debit on commit; owed refunds if the turn never resolves.
+      local inventory = self.game.save and self.game.save.inventory
+      if inventory and (inventory[pick.id] or 0) > 0
+         and not (effect and effect.noConsume) then
+        inventory[pick.id] = inventory[pick.id] - 1
+        if inventory[pick.id] <= 0 then inventory[pick.id] = nil end
+        self.owed = pick.id
+      end
+      self.itemList = nil
+      self:commit({ slot = self.mine, kind = "item", item = pick.id })
     end
-    -- the list is cached, and it has just changed
-    self.itemList = nil
-    self:commit({ slot = self.mine, kind = "item", item = pick.id })
   end
+end
+
+-- Own party rows for mediated item targeting (1-based party index).
+function M:itemPartyRows()
+  local seat = self:mySlot()
+  local party = (seat and seat.party) or {}
+  local active = (seat and seat.active) or 1
+  local out = {}
+  for i, mon in ipairs(party) do
+    out[#out + 1] = {
+      index = i,
+      label = tostring(mon.nickname or mon.species or ("#" .. i)),
+      fainted = (mon.hp or 0) <= 0,
+      active = i == active,
+    }
+  end
+  return out
+end
+
+function M:updateItemParty(input)
+  local rows = self:itemPartyRows()
+  if #rows == 0 then
+    self.phase = "item"
+    return
+  end
+  local moved = listPress(self.switchIndex or 1, #rows, input)
+  if moved then
+    self.switchIndex = moved
+  elseif input:wasPressed("b") then
+    self.itemPick = nil
+    self.phase = "item"
+  elseif input:wasPressed("a") then
+    local row = rows[self.switchIndex]
+    local effect = self.itemPick and self.itemPick.effect
+    if effect and effect.faintedOnly and not row.fainted then
+      self:say("It won't have\nany effect.")
+      return
+    end
+    if effect and effect.needsMove then
+      self.moveIndex = 1
+      self.itemPartyIndex = row.index
+      self.phase = "item_move"
+      return
+    end
+    self:commitMediatedItem(row.index, nil)
+  end
+end
+
+function M:updateItemMove(input)
+  local seat = self:mySlot()
+  local party = (seat and seat.party) or {}
+  local mon = party[self.itemPartyIndex or (seat and seat.active) or 1]
+  local moves = (mon and mon.moves) or {}
+  if #moves == 0 then
+    self.phase = "item_party"
+    return
+  end
+  local moved = listPress(self.moveIndex or 1, #moves, input)
+  if moved then
+    self.moveIndex = moved
+  elseif input:wasPressed("b") then
+    self.phase = "item_party"
+  elseif input:wasPressed("a") then
+    self:commitMediatedItem(self.itemPartyIndex or (seat and seat.active) or 1,
+                            self.moveIndex)
+  end
+end
+
+-- Mediated item commit: debit after hub `item` event; partySlot is 1-based.
+function M:commitMediatedItem(partyIndex, moveIndex)
+  local pick = self.itemPick
+  if not pick then return false end
+  local effect = pick.effect
+  local bagCount = self.bagSheet and self.bagSheet[pick.id] or 0
+  if bagCount < 1 and not (effect and effect.noConsume) then
+    self:say("You have nothing\nto use!")
+    self.phase = "choose"
+    self.itemPick = nil
+    return false
+  end
+  if not (effect and effect.noConsume) then
+    local inventory = self.game.save and self.game.save.inventory
+    if not (inventory and (inventory[pick.id] or 0) > 0) then
+      self:say("You have nothing\nto use!")
+      self.phase = "choose"
+      self.itemPick = nil
+      return false
+    end
+  end
+  self.pendingItem = pick.id
+  self.pendingItemSlot = partyIndex
+  self.itemList = nil
+  self.itemPick = nil
+  local fields = {
+    slot = self.mine, kind = "item", item = pick.id,
+  }
+  if partyIndex then fields.partySlot = partyIndex - 1 end
+  if moveIndex then fields.move = moveIndex - 1 end
+  if not self:commit(fields) then
+    self.pendingItem = nil
+    self.pendingItemSlot = nil
+    return false
+  end
+  return true
 end
 
 function M:updateTarget(input)
@@ -1369,9 +1652,36 @@ M.RUN_ANSWERS = RUN_ANSWERS
 local RUN_DEFAULT = 2   -- "NO"
 M.RUN_DEFAULT = RUN_DEFAULT
 
+-- ------- and on a refereed fight the partner cannot be asked at all
+--
+-- **This is a real loss, so it is written down rather than worked around.** The
+-- ask and the answer ride `mmo.coop_relay`, and both hubs stop forwarding a
+-- co-op payload the moment they start refereeing the fight (src/Hub.lua's
+-- COOP_RELAY handler) -- so on the mediated path there is no channel left to put
+-- a question on. There is no room in the mmo.battle_* vocabulary for one either:
+-- a choice says what was pressed, and "may I?" is not a choice.
+--
+-- What is kept is the half of the consent flow that was protecting against an
+-- accident rather than against a partner: the picker, and its cursor starting on
+-- NO. See RUN_DEFAULT -- the prompt lands at the exact moment all four players
+-- are holding A through the last turn's narration, and one already-travelling
+-- press must not forfeit a ranked battle. So the player is asked to confirm,
+-- with the safe answer under the cursor, and their partner is not consulted.
+--
+-- Restoring the veto is an additive wire change (a run-consent pair inside the
+-- battle vocabulary, refereed like everything else) and belongs with whoever
+-- teaches the intermediator about it.
+function M:mediatedRunAsk()
+  local partner = self:partnerOf(self:mySlot())
+  self.runAsk = { role = "confirming", name = partner and partner.name,
+                  index = RUN_DEFAULT, clock = 0 }
+  return true
+end
+
 -- Ask the partner. Commits nothing.
 function M:askToRun()
   if not self:partyBattle() then return false end
+  if self.mediated then return self:mediatedRunAsk() end
   local partner = self:partnerOf(self:mySlot())
   self.runAsk = { role = "asking", slot = partner and partner.index,
                   name = partner and partner.name }
@@ -1388,6 +1698,18 @@ end
 function M:answerRun(ok)
   if not self.runAsk then return false end
   ok = ok and true or false
+  -- A refereed fight has one answer to give and one place to give it: the run is
+  -- a choice like any other, and what it costs -- one side leaving loses the
+  -- battle with reason `run` -- is the intermediator's policy rather than this
+  -- screen's. A no is simply the prompt coming down.
+  if self.mediated then
+    self.runAsk = nil
+    if not ok then return true end
+    self.runAsk = { role = "fleeing" }
+    self:markActed(self.mine)
+    self.phase = "wait"
+    return self:sendMediatedChoice({ kind = "run" })
+  end
   -- A yes leaves this player watching for the host's closing events; a no puts
   -- them straight back where they were, because nothing about their own turn
   -- was ever touched.
@@ -1451,6 +1773,12 @@ end
 -- out.
 function M:resolveFlee(index)
   if not (self.host and self.sim) or self.result then return false end
+  -- Not on a refereed fight: this broadcasts a resolved batch, which is the one
+  -- thing a mediated host may not do. Unreachable today -- `askToRun` never
+  -- reaches here and the relay carries no consent -- and guarded anyway, because
+  -- what it would produce is four clients ending a battle the referee is still
+  -- running.
+  if self.mediated then return false end
   local slot = self.sim:slot(index)
   if not (slot and slot.side) then return false end
 
@@ -1477,8 +1805,8 @@ function M:resolveFlee(index)
   return true
 end
 
--- The prompt and the wait, driven with the same grid the command box uses --
--- because it is the same box, with two answers where four commands normally sit.
+-- The prompt and the wait, driven as a vertical YES/NO list -- same box as
+-- every other picker on this screen.
 function M:updateRunAsk(input, dt)
   local ask = self.runAsk
   if not ask then return end
@@ -1487,9 +1815,13 @@ function M:updateRunAsk(input, dt)
   -- behind a batch of messages (see the branch order in `update`).
   ask.clock = (ask.clock or 0) + (dt or 0)
 
-  if ask.role == "deciding" then
+  -- "confirming" is the mediated path's own question (see `mediatedRunAsk`) and
+  -- is driven by exactly the same two answers, the same safe default and the
+  -- same settle floor -- only who is being asked differs, and that is a fact
+  -- about the words on the box rather than about the picker.
+  if ask.role == "deciding" or ask.role == "confirming" then
     ask.index = ask.index or RUN_DEFAULT
-    local moved = gridPress(ask.index, #RUN_ANSWERS, input)
+    local moved = listPress(ask.index, #RUN_ANSWERS, input)
     if moved then
       ask.index = moved
       return
@@ -1539,6 +1871,12 @@ function M:drawRunAsk()
   local ask = self.runAsk
   if not ask then return end
   local name = ask.name
+  if ask.role == "confirming" then
+    -- Its own words, because the honest sentence is different: nobody is being
+    -- asked for permission, and a title that named the partner would be
+    -- promising a veto they are not being given.
+    return self:drawList(RUN_ANSWERS, ask.index or RUN_DEFAULT, "RUN AWAY?")
+  end
   if ask.role == "deciding" then
     -- Short on purpose: the title row is one line of the box, and at NAME_MAX
     -- "%s: RUN?" is eighteen columns exactly.
@@ -1563,6 +1901,12 @@ end
 -- else's choices: the turn is already paused waiting for it, and holding it
 -- back would deadlock the pause against itself.
 function M:sendAction(action)
+  -- A refereed fight asks for a switch after a faint with bench left (same
+-- `switch` choice as voluntary SWITCH). Timeout / autoPick still lands
+-- firstLiving. Answered as a switch on the wire.
+  if self.mediated then
+    return self:sendMediatedChoice({ kind = "switch", index = action.index })
+  end
   if self.host then return self:applyReplace(action) end
   if self.net then self.net.send({ t = "act", action = action }) end
 end
@@ -1599,6 +1943,23 @@ function M:commit(action)
   -- Your own answer is in, whoever else's is not -- which is what keeps the
   -- wait line from naming the person reading it.
   self:markActed(action.slot)
+  -- ------- and on the mediated path that is the whole of it
+  --
+  -- One choice, addressed to the referee, and nothing fanned out to the other
+  -- three: they will see what this turn did when the intermediator tells them,
+  -- which is the only account any of the four gets. Taken before the `act`
+  -- below rather than beside it -- sending both would put a second, unrefereed
+  -- opinion about this turn on a wire that has already cut it.
+  if self.mediated then
+    local ok = self:sendMediatedChoice(action)
+    if not ok and action.kind == "item" then
+      self.pendingItem = nil
+      self.pendingItemSlot = nil
+      self:unmarkActed(action.slot)
+      self.phase = "choose"
+    end
+    return ok
+  end
   -- ...and everybody else is told, **including when this client is the host**.
   --
   -- The host used to file straight into `pending` and return, so its own
@@ -1627,6 +1988,28 @@ end
 -- would be a second opinion about what the same NPC did.
 function M:tryResolve()
   if not self.host then return end
+  -- ------- and the host stops deciding the moment somebody else is
+  --
+  -- The single cut that makes a co-op battle mediated. Everything below rolls
+  -- dice: `npcAction`, `resolveTurn`, and the `res` broadcast that three other
+  -- clients apply as truth. A second set of those beside the intermediator's is
+  -- not a fallback, it is the desync it looks like -- two fields diverging from
+  -- the same turn, and both hubs would refuse the broadcast anyway.
+  --
+  -- Guarded here rather than at every caller because there are five of them
+  -- (`commit`, `applyReplace`, `drainNet`'s `act`, `autoPickLate`, and its own
+  -- recursion) and one of them missed is a host quietly refereeing beside the
+  -- referee.
+  if self.mediated then return end
+  -- Shipped MEDIATED_COOP modes must not fall through to host-sim (BattleSim
+  -- vs engine ItemEffects diverge on items/effects). Wait for battle_ready, or
+  -- abort if mediation was refused at upload.
+  if M.mediates(self.mode) then
+    if self.medFailed then
+      self:failMediation()
+    end
+    return
+  end
   -- Nobody takes a turn while a slot is still empty. The player choosing has
   -- nothing on the field to act with, and resolving around them would spend
   -- the other three's moves on a field that is about to change.
@@ -1708,6 +2091,19 @@ function M:tryResolve()
   self:playEvents(events)
 end
 
+-- Is this client applying somebody else's arithmetic rather than its own?
+--
+-- True for the three clients that are not the host, and true for **all four** on
+-- the mediated path -- the host included, because a refereed turn was resolved
+-- somewhere else and its `sim` never touched the numbers the events carry. The
+-- two branches in `playEvents` that ask are exactly the two that write sim truth
+-- (`damage` applies HP, `send` swaps a battler), and a host that skipped them
+-- because it "already did it" would draw a field nobody ever changed: bars that
+-- never move, and a monster that faints on three screens out of four.
+function M:replaying()
+  return (not self.host) or self.mediated
+end
+
 -- Apply a turn's events -- the host to its own screen, everybody else to
 -- theirs. One function for both, which is what makes a replay and a simulation
 -- land on the same screen rather than merely a similar one.
@@ -1763,13 +2159,14 @@ function M:playEvents(events)
       -- Queued alongside the messages rather than played now, so it arrives in
       -- the order the turn produced it rather than all at once at the end.
       self.messages[#self.messages + 1] =
-        { anim = event.anim, from = event.from, to = event.to }
+        { anim = event.anim, from = event.from, to = event.to,
+          attackerIsPlayer = event.attackerIsPlayer }
     elseif event.kind == "damage" then
       -- The replayers are told the resulting HP rather than the amount, so a
       -- dropped or reordered event cannot leave a bar drifting away from the
       -- host's.
       local slot = self.sim:slot(event.slot)
-      if slot and slot.battler and not self.host then
+      if slot and slot.battler and self:replaying() then
         slot.battler.mon.hp = event.hp
       end
       -- The number above is the truth and it lands now. The *bar* is a queued
@@ -1858,7 +2255,7 @@ function M:playEvents(events)
       local leaving = showing(event.slot)
       -- Sim truth, applied *now* rather than in the queue: a replayer's
       -- signature has to match the host's the moment the event is applied.
-      if slot and not self.host then self.sim:sendOut(slot, event.index) end
+      if slot and self:replaying() then self.sim:sendOut(slot, event.index) end
       -- ...and the *display* follows at its own pace. The outgoing monster is
       -- held in the shadow so it keeps being drawn -- and keeps draining and
       -- sinking -- while its rows play, and the new one is queued behind them
@@ -2025,6 +2422,7 @@ function M:startDrain(row)
   -- frames is the whole descent (see the rate below); the slack is there so an
   -- ordinary drain never meets this at all, and one that does is snapped to
   -- where it was going rather than left holding the queue.
+  self.hitSlot = row.slot
   self.draining = { battler = battler, slot = row.slot, to = to, frames = 120 }
   return true
 end
@@ -2068,6 +2466,7 @@ function M:startFaint(row)
   local battler = row.faintfx
   if type(battler) ~= "table" then return false end
   battler.fainted = true
+  self.hitSlot = row.slot
   self.faintFx = { battler = battler, slot = row.slot, frames = FAINT_FRAMES }
   return true
 end
@@ -2075,7 +2474,18 @@ end
 function M:stepFaint()
   local fx = self.faintFx
   fx.frames = (fx.frames or 0) - 1
-  if fx.frames <= 0 then self.faintFx = nil end
+  if fx.frames > 0 then return end
+  local idx = fx.slot
+  self.faintFx = nil
+  -- Seat wiped with no reserve: release focus so the strip/stage cannot keep
+  -- pointing at an icon that stripShows is about to drop.
+  local slot = self.sim and self.sim:slot(idx)
+  if slot and self.sim:isDown(slot) and not self.sim:hasReserve(slot) then
+    if self.lastFoeFocus == idx then self.lastFoeFocus = nil end
+    if self.stageAlly == idx then self.stageAlly = nil end
+    if self.stageFoe == idx then self.stageFoe = nil end
+    if self.hitSlot == idx then self.hitSlot = nil end
+  end
 end
 
 -- Is this slot the one currently sinking?
@@ -2233,86 +2643,206 @@ end
 -- Every glyph, box and HP bar is still the engine's own (Font, HudTiles), so a
 -- palette or asset mod owns the look of this exactly as it owns a wild battle.
 
--- Real size. Nothing is scaled.
+-- Real size on the field. Foes stay 1x in the top-right quarter; the near
+-- (bottom) pair draws larger and sits on the message-box lip -- there is
+-- empty field under 1x backs that classic Gen 1 spent on a 2x player pic.
 local PIC_SCALE = 1
+local FOE_SCALE = 1
+-- Target ally draw scale. picOriginFor clamps so the scaled back stays
+-- between the left strip and the ally HUD (right-aligned toward the box).
+local ALLY_SCALE = 1.5
+-- Top of the bottom text/command box. Ally feet flush here (same rule as
+-- BattleState.backPlacement), so the pair reads against the box instead of
+-- floating mid-field.
+local FIELD_FLOOR = 96
+-- Gen 1 back sheets bake a few transparent rows under the opaque feet
+-- (BattleState imagePadBottom is typically ~4). Without this inset the pic
+-- sits a scaled pad above the lip and reads as mid-field.
+local ALLY_FOOT_INSET = 4
 
--- ...except the far side, a little.
---
--- Two 56-pixel pics in the 72 each pair is given means a pair overlaps itself,
--- and the foes' pair is the one that suffers for it: it sits at the top of the
--- screen with the trainer's panel beside it, so the overlap reads as one shape
--- rather than two monsters. Fifteen percent off is enough to open a gap between
--- them and to say "those two are further away", and it is small enough that the
--- art is still recognisably itself -- which a half-scale foe would not be.
---
--- **Baselines hold.** A sprite is anchored at its top-left, so scaling it in
--- place lifts its feet off the ground; every draw below therefore pushes it
--- back down by the height it lost and in by half the width, and the monster
--- stands exactly where it stood.
-local FOE_SCALE = 0.85
+-- Columns reserved on the level row for Lxx / status (left of the HP
+-- numbers). "L100" / "PSN" at the ROM 8px face; the 5px HUD sheet fits in less.
+local LEVEL_COLS = 3
 
 -- Published for the suite, which cannot reach a file-local and has no graphics
 -- device to measure a drawn pixel with.
 M.FOE_SCALE = FOE_SCALE
+M.ALLY_SCALE = ALLY_SCALE
+M.FIELD_FLOOR = FIELD_FLOOR
+M.ALLY_FOOT_INSET = ALLY_FOOT_INSET
+M.LEVEL_COLS = LEVEL_COLS
+M.BOX_COLS = BOX_COLS
+M.wrapBoxLines = wrapBoxLines
+M.pageBoxText = pageBoxText
+-- List / move layout (pixels). Published so the suite can pin "fits the box"
+-- without a graphics device: fourth row ends at LIST_TOP + 3*LIST_LINE + 8
+-- = 136, which is the bottom border, not past it.
+M.LIST_LINE = 8
+M.LIST_TOP = 104
+M.LIST_TOP_TITLED = 112
+M.MOVE_NAME_Y = function(i) return 96 + i * 8 end
+-- Left move pane: cursor at x=8, names at x=16, shared border with TYPE at
+-- x=96. That is ten tiles -- an eleventh glyph (and any 12-char name like
+-- QUICK ATTACK) painted through TYPE/. Long names scale horizontally to fit.
+M.MOVE_NAME_X = 16
+M.MOVE_NAME_MAX_W = 80
+-- Right-pane TYPE/PP strip (same 6-tile bottom box). Last inner row is 128;
+-- 136 is the bottom border -- PP used to paint through it.
+M.MOVE_TYPE_LABEL_Y = 112
+M.MOVE_TYPE_NAME_Y = 120
+M.MOVE_PP_Y = 128
+-- Left command prompt pane (tiles 1..7 inside the 9-tile box).
+-- Full-width command box (tiles 0..19). Classic Gen 1 parked it at tile 8
+-- beside "What will X do?"; co-op has no left prompt, so the box spans the
+-- bottom strip and the 2x2 sits in two clear columns.
+M.CMD_BOX_TX = 0
+M.CMD_BOX_TW = 20
+M.CMD_COL0_X = 24
+M.CMD_COL1_X = 112
+M.CMD_CUR0_X = 16
+M.CMD_CUR1_X = 104
+-- Name columns inside a status panel (ROM-font fallback). Borders eat 2;
+-- the name keeps the full inner width (level + HP share the meta row).
+M.nameBudget = function(tw, mine, status)
+  return (tw or 0) - 2
+end
 
--- The Gen 3 double-battle arrangement: each side's readouts and each side's
--- monsters sit on *opposite* diagonals.
---
---   [foe 1 name + bar]
---   [foe 2 name + bar]          foe1 foe2
---
---   ally1 ally2                 [ally 1 name + bar]
---                               [ally 2 name + bar]
---
--- This is what buys the diagonal that a single row could not. The screen above
--- the command box is two 48-pixel halves; in each half the panel takes one
--- side and the monsters the other, so nothing is drawn over anything and the
--- two pairs still sit on a genuine diagonal, bottom-left to top-right.
---
--- Two 56-pixel pics do not fit the 72 each pair is given, so a pair overlaps
--- itself. That is deliberate -- which of the two is in front is the turn
--- indicator (see M:spotlight) -- and it is why real size costs nothing here.
--- x starts at 2, not 0: at 0 the screen border shaves the first column off,
--- which is what clipped CHARIZARD's left side. y drops the pair clear of the
--- foes' panel above them.
--- Pushed out into the space each pair actually has.
---
--- A Gen 1 battle pic carries several rows and columns of transparent border,
--- so a pair placed by its *bounding boxes* leaves a visible gap at the edges
--- and looks huddled in the middle of its quarter. These are placed by where
--- the monsters read: your pair sits low, close to the command box, and theirs
--- spreads right into the corner. The pairs also stand further apart than the
--- minimum, so each of the two is legible rather than one hiding the other.
--- Clear of the panels, not merely near them.
---
--- The panels are drawn *after* the monsters, so anything that strays under one
--- is cut off by it -- which is what sliced WEEDLE's left side: their pair
--- started at 84 and the foes' panel runs to 88. Their pair now starts past the
--- panel edge and spreads into the corner; yours sits low and right, as far
--- into its quarter as the readouts beside it allow.
-local SLOT_POS = {
-  [1] = { x = 8,   y = 58 },   -- yours, bottom-left
-  [2] = { x = 30,  y = 58 },
-  [3] = { x = 92,  y = 2 },    -- theirs, top-right
-  [4] = { x = 110, y = 2 },
-}
+-- Truncate a label to a pixel budget via `widthOf`, or to `maxCols` glyphs
+-- when no measurer is given. Pure for the suite.
+function M.fitHudName(text, maxCols, widthOf)
+  text = tostring(text or "")
+  if type(widthOf) == "function" then
+    local maxW = tonumber(maxCols) or 0
+    if maxW <= 0 then return "" end
+    if widthOf(text) <= maxW then return text end
+    local ell = "..."
+    if widthOf(ell) > maxW then
+      ell = "."
+      if widthOf(ell) > maxW then return "" end
+    end
+    local lo, hi = 0, #text
+    while lo < hi do
+      local mid = math.floor((lo + hi + 1) / 2)
+      if widthOf(text:sub(1, mid) .. ell) <= maxW then
+        lo = mid
+      else
+        hi = mid - 1
+      end
+    end
+    if lo <= 0 then return ell end
+    return text:sub(1, lo) .. ell
+  end
+  maxCols = math.floor(tonumber(maxCols) or 0)
+  if maxCols <= 0 then return "" end
+  if #text <= maxCols then return text end
+  if maxCols == 1 then return text:sub(1, 1) end
+  return text:sub(1, maxCols - 1) .. "."
+end
 
--- Back to front: the second of each pair is drawn first so the first sits in
--- front of it, matching the order of the readouts beside them.
-local DEPTH_ORDER = { 4, 3, 2, 1 }
+-- ImageFonts for status names (5×7) and level/HP nums (4×5). Cached;
+-- `false` means load failed once. Meta is its own sheet: scaling the name
+-- face by 0.75 mushing pixels on the GB canvas.
+local battleHudFont
+local battleHudMetaFont
 
--- Half the screen wide, six tiles tall: two readouts of two rows each (a name
--- row and a bar row -- the engine's HP bar is a full row and will not fit
--- beside a name at this width) plus the border.
--- The two panels are sized differently on purpose.
---
--- Yours is twelve tiles because it has to hold a nine-glyph name -- eleven
--- shipped CHARIZAR. Theirs is eleven, because every pixel it gives back is a
--- pixel their pair can occupy without being sliced by it, and an eight-glyph
--- cap costs the enemy side far less than a monster with its head cut off.
-local FOE_PANEL = { tx = 0, ty = 0, tw = 11, th = 6 }
-local ALLY_PANEL = { tx = 8, ty = 6, tw = 12, th = 6 }
-local PANEL_SLOTS = { [1] = { 3, 4 }, [2] = { 1, 2 } }
+local function loadHudImageFont(rel)
+  if not (love and love.graphics and love.graphics.newImageFont) then
+    return nil
+  end
+  local path
+  local assets = mod and mod.assets
+  if assets and assets.path then
+    local ok, resolved = pcall(function() return assets:path(rel) end)
+    if ok and type(resolved) == "string" and resolved ~= "" then path = resolved end
+  end
+  if not path then return nil end
+  local glyphs = Config.BATTLE_HUD_GLYPHS
+    or " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./-'?!"
+  local ok, font = pcall(love.graphics.newImageFont, path, glyphs)
+  if not (ok and font) then
+    if mod and mod.log then
+      mod.log:warn("could not load %s; co-op status readout falls back to the "
+        .. "ROM font -- reinstall the mod so assets/fonts is present",
+        tostring(rel))
+    end
+    return nil
+  end
+  pcall(font.setFilter, font, "nearest", "nearest")
+  return font
+end
+
+local function loadBattleHudFont()
+  if battleHudFont ~= nil then return battleHudFont or nil end
+  battleHudFont = loadHudImageFont(
+    Config.BATTLE_HUD_FONT or "assets/fonts/battle_hud.png") or false
+  return battleHudFont or nil
+end
+
+local function loadBattleHudMetaFont()
+  if battleHudMetaFont ~= nil then return battleHudMetaFont or nil end
+  battleHudMetaFont = loadHudImageFont(
+    Config.BATTLE_HUD_META_FONT or "assets/fonts/battle_hud_meta.png") or false
+  return battleHudMetaFont or nil
+end
+
+-- Map a label onto the HUD sheet (uppercase; unknown → '.').
+function M.hudSanitize(text)
+  text = tostring(text or ""):upper()
+  local glyphs = Config.BATTLE_HUD_GLYPHS
+    or " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./-'?!"
+  local out = {}
+  for i = 1, #text do
+    local c = text:sub(i, i)
+    if glyphs:find(c, 1, true) then
+      out[#out + 1] = c
+    else
+      out[#out + 1] = "."
+    end
+  end
+  return table.concat(out)
+end
+
+-- Classic 1v1 center stage: one ally back and one foe front, with side strips
+-- for the other living field seats. `y` on STAGE_ALLY is informational; ally
+-- feet still anchor on FIELD_FLOOR. Foe pic sits just past FOE_HUD's right
+-- edge (not under it). Ally x is the strip-clear floor; picOriginFor
+-- right-aligns the scaled back against the ally HUD.
+local STAGE_ALLY = { x = 16, y = 40 }
+local STAGE_FOE = { x = 88, y = 0 }
+local SLIDE_FRAMES = 10
+-- How far a focus change travels (screen px). Must clear a ~56px pic so the
+-- swap reads as a slide rather than a twitch.
+local SLIDE_PX = 48
+local STRIP_W = 16
+local STRIP_ICON = 16
+-- Single-mon HUDs: name; level + HP nums; slim bar. th=5 = border + 3
+-- content + border so ~2px can sit between the three lines. The bar stays
+-- flush to the bottom content edge (no empty band under it).
+-- Ally HUD starts at tile 9 (x=72) so its right edge is at x=136: that leaves
+-- the right strip column (144..160) and its focus arrow (136..144) clear when
+-- the foe strip grows downward. picOriginFor right-aligns the back against
+-- this box, so the ally sprite shifts left with it. ty=7 keeps ty+th == 12.
+local FOE_HUD = { tx = 3, ty = 0, tw = 8, th = 5 }
+local ALLY_HUD = { tx = 9, ty = 7, tw = 8, th = 5 }
+
+M.STAGE_ALLY = STAGE_ALLY
+M.STAGE_FOE = STAGE_FOE
+M.SLIDE_FRAMES = SLIDE_FRAMES
+M.SLIDE_PX = SLIDE_PX
+M.STRIP_W = STRIP_W
+M.STRIP_ICON = STRIP_ICON
+M.FOE_HUD_TW = FOE_HUD.tw
+M.ALLY_HUD_TW = ALLY_HUD.tw
+M.FOE_HUD_TH = FOE_HUD.th
+M.ALLY_HUD_TH = ALLY_HUD.th
+M.FOE_HUD_TX = FOE_HUD.tx
+M.FOE_HUD_TY = FOE_HUD.ty
+M.ALLY_HUD_TX = ALLY_HUD.tx
+M.ALLY_HUD_TY = ALLY_HUD.ty
+M.FOE_PANEL_TW = FOE_HUD.tw
+M.ALLY_PANEL_TW = ALLY_HUD.tw
+M.FOE_PANEL_TH = FOE_HUD.th
+M.ALLY_PANEL_TH = ALLY_HUD.th
 
 -- The HP the *readout* shows, which trails `mon.hp` while a drain plays.
 --
@@ -2341,6 +2871,144 @@ end
 local function hidden(slot, battler)
   if not slot or slot.gone then return true end
   return battler == nil or battler.fainted == true
+end
+
+-- Living field seats on one side, in sim slot order (for the side strips).
+--
+-- A seat that has fainted with **no reserve** drops off the strip once its
+-- fall finishes -- there is nobody left to put there. During the sink the
+-- icon stays so the strip does not blink empty a frame early. Seats that
+-- still have a bench keep their strip slot (the send-out fills it again).
+function M:stripShows(slot)
+  if not slot or slot.gone then return false end
+  if self:sinkingAt(slot.index) then return true end
+  local battler = self:shownBattlerAt(slot.index)
+  if hidden(slot, battler) then return false end
+  if self.sim and self.sim:isDown(slot) and not self.sim:hasReserve(slot) then
+    return false
+  end
+  return true
+end
+
+function M:stripSeats(theirs)
+  local seats = {}
+  for _, slot in ipairs((self.sim and self.sim.slots) or {}) do
+    if self:foeSide(slot.index) == (theirs and true or false)
+       and self:stripShows(slot) then
+      seats[#seats + 1] = slot.index
+    end
+  end
+  return seats
+end
+
+function M:desiredAllyFocus()
+  local phase = self.phase
+  if phase == "choose" or phase == "move" or phase == "switch"
+     or phase == "target" or phase == "item" or phase == "item_party"
+     or phase == "item_move" then
+    return self.mine
+  end
+  if phase == "messages" or self.anim or self.draining or self.faintFx then
+    local acting = self.acting
+    if acting and not self:foeSide(acting) then return acting end
+    local hit = self.hitSlot
+    if hit and not self:foeSide(hit) then return hit end
+    return self.mine
+  end
+  return self.mine
+end
+
+function M:desiredFoeFocus()
+  local focus
+  if self.phase == "target" then
+    local mine = self:mySlot()
+    local targets = mine and self.sim:targetsFor(mine) or {}
+    local pick = targets[self.targetIndex or 1]
+    focus = pick and pick.index
+  elseif self.phase == "messages" or self.anim or self.draining or self.faintFx then
+    local acting = self.acting
+    if acting and self:foeSide(acting) then
+      focus = acting
+    elseif self.hitSlot and self:foeSide(self.hitSlot) then
+      focus = self.hitSlot
+    else
+      focus = self.lastFoeFocus
+    end
+  else
+    focus = self.lastFoeFocus
+  end
+  if not focus then
+    local strip = self:stripSeats(true)
+    focus = strip[1]
+  end
+  if focus then self.lastFoeFocus = focus end
+  return focus
+end
+
+function M:allyFocus()
+  return self.stageAlly or self:desiredAllyFocus()
+end
+
+function M:foeFocus()
+  return self.stageFoe or self:desiredFoeFocus()
+end
+
+local function slideDx(slide, index, ally)
+  if not slide then return 0 end
+  local dur = slide.dur or SLIDE_FRAMES
+  if dur <= 0 then return 0 end
+  local t = (slide.t or 0) / dur
+  local span = SLIDE_PX
+  if index == slide.out then
+    return ally and (-t * span) or (t * span)
+  end
+  if index == slide.into then
+    return ally and ((1 - t) * span) or (-(1 - t) * span)
+  end
+  return 0
+end
+
+function M:onStage(index)
+  if self:foeSide(index) then
+    local focus = self:foeFocus()
+    local slide = self.slideFoe
+    return index == focus
+      or (slide and (index == slide.out or index == slide.into))
+  end
+  local focus = self:allyFocus()
+  local slide = self.slideAlly
+  return index == focus
+    or (slide and (index == slide.out or index == slide.into))
+end
+
+function M:stepFocusSlides()
+  if not self.sim then return end
+  local da = self:desiredAllyFocus()
+  local df = self:desiredFoeFocus()
+  if not self.stageAlly then self.stageAlly = da end
+  if not self.stageFoe then self.stageFoe = df end
+  if da ~= self.stageAlly and not self.slideAlly then
+    self.slideAlly = { out = self.stageAlly, into = da, t = 0, dur = SLIDE_FRAMES }
+  end
+  if df ~= self.stageFoe and not self.slideFoe then
+    self.slideFoe = { out = self.stageFoe, into = df, t = 0, dur = SLIDE_FRAMES }
+  end
+  local slide = self.slideAlly
+  if slide then
+    slide.t = (slide.t or 0) + 1
+    if slide.t >= slide.dur then
+      self.stageAlly = slide.into
+      self.slideAlly = nil
+    end
+  end
+  slide = self.slideFoe
+  if slide then
+    slide.t = (slide.t or 0) + 1
+    if slide.t >= slide.dur then
+      self.stageFoe = slide.into
+      self.slideFoe = nil
+    end
+  end
 end
 
 -- A monster on its way off the field.
@@ -2389,45 +3057,175 @@ local function statusTag(battler)
   return status:sub(1, 3)
 end
 
+-- Draw `text` at (x, y), scaling on X only when it would run past `maxW`.
+-- Shared by move names (TYPE pane) and status readouts (level on the right).
+local function drawFittedText(Font, text, x, y, maxW)
+  text = tostring(text or "")
+  local w = 0
+  if Font.width then
+    local ok, measured = pcall(Font.width, text)
+    if ok and type(measured) == "number" then w = measured end
+  end
+  if w <= 0 then w = #text * 8 end
+  if w <= maxW then
+    Font.draw(text, x, y)
+    return
+  end
+  -- Below ~3/4 width the glyphs smash into each other (CHARIZARD -> "CHRIZRI");
+  -- truncate with a dot instead of an unreadable squash.
+  local minScale = 0.75
+  if maxW / w < minScale then
+    local budget = math.max(1, math.floor(maxW / 8))
+    if budget > 1 then
+      Font.draw(text:sub(1, budget - 1) .. ".", x, y)
+    else
+      Font.draw(text:sub(1, 1), x, y)
+    end
+    return
+  end
+  local g = love and love.graphics
+  if not (g and g.push and g.scale and g.translate and g.pop) then
+    local budget = math.max(1, math.floor(maxW / 8))
+    Font.draw(text:sub(1, budget), x, y)
+    return
+  end
+  local s = maxW / w
+  g.push()
+  g.translate(x, y)
+  g.scale(s, 1)
+  Font.draw(text, 0, 0)
+  g.pop()
+end
+
 local function drawReadout(self, battler, panel, row, mine)
   local Font, HudTiles = engine.Font, engine.HudTiles
   if not battler or not battler.mon then return end
   local tx = panel.tx + 1
   local ty = panel.ty + row
+  local ox, oy = tx * 8, ty * 8
   love.graphics.setColor(0, 0, 0, 1)
-  if mine then Font.drawCode(0xED, tx * 8, ty * 8) end
-  -- ------- what the row spends its columns on
-  --
-  -- Cut to the panel's real inner width rather than a written-down number, so
-  -- resizing one never leaves a stale cap behind -- and the status takes its
-  -- four columns (" SLP") out of the *name's* budget rather than out of the
-  -- panel, so the row is exactly as wide as it always was. A healthy monster
-  -- gets every column back, which is the common case and the one the eleven-
-  -- and twelve-tile panel widths were chosen for.
-  --
-  -- Drawn at the end of the reserved space rather than after the name, so the
-  -- badge sits in the same column on both rows of a panel instead of jittering
-  -- with the length of whoever is standing there.
-  local budget = panel.tw - 3
+  -- Name, level + cur/max, then slim HP bar. Bar is flush to the bottom
+  -- content edge (no empty band under it); pads open air between the lines.
+  -- displayHP tracks shownHP through drains/heals the way classic BattleState does.
   local status = statusTag(battler)
-  if status then budget = budget - 4 end
-  Font.draw(tostring(battler.name or "?"):sub(1, budget), tx * 8 + 8, ty * 8)
+  local level
   if status then
-    Font.draw(" " .. status, (tx + 1 + budget) * 8, ty * 8)
+    level = status
+  else
+    local lv = battler.mon.level
+    level = "L" .. tostring(lv ~= nil and lv or "?")
   end
+  level = M.hudSanitize(level)
+  local nameRaw = M.hudSanitize(battler.name or "?")
   local hp = displayHP(battler)
-  local ok = pcall(HudTiles.drawHPBar, self.game.data, tx, ty + 1,
-    { hp = hp, stats = battler.mon.stats },
-    nil, false, panel.tw - 4)
-  if not ok then
-    Font.draw(("%d/%d"):format(hp,
-      (battler.mon.stats and battler.mon.stats.hp) or 0), tx * 8, (ty + 1) * 8)
+  local maxHp = (battler.mon.stats and battler.mon.stats.hp) or 0
+  local hpNums = M.hudSanitize(("%d/%d"):format(hp, maxHp))
+  local borderR = (panel.tx + panel.tw - 1) * 8
+  local nameLeft = ox
+  local g = love and love.graphics
+  local hud = loadBattleHudFont()
+  local meta = loadBattleHudMetaFont()
+  local metaH = Config.BATTLE_HUD_META_HEIGHT or 5
+  -- th=5 → 24px content. ~2px name→meta and meta→bar; bar on the bottom lip.
+  local META_PAD = 2
+  local BAR_GAP = 2
+  local BAR_H = 3
+  local CONTENT_H = 24
+  if hud and g and g.print and g.setFont then
+    local prev = g.getFont and g.getFont()
+    local ok, err = pcall(function()
+      g.setFont(hud)
+      local nameMax = math.max(1, borderR - nameLeft - 2)
+      local name = M.fitHudName(nameRaw, nameMax, function(s)
+        return hud:getWidth(s)
+      end)
+      g.setColor(0, 0, 0, 1)
+      g.print(name, nameLeft, oy)
+
+      local face = meta or hud
+      local faceH = meta and metaH or 7
+      g.setFont(face)
+      local levelW = face:getWidth(level)
+      local hpW = face:getWidth(hpNums)
+      local inner = math.max(0, borderR - ox)
+      -- Name at top, bar flush at bottom; park meta in the middle so the
+      -- two gaps stay even (not a tight name/meta pair over a tall empty).
+      local nameH = 7
+      local barY = oy + CONTENT_H - BAR_H
+      local metaY = oy + nameH + META_PAD
+      local maxMetaY = barY - BAR_GAP - faceH
+      if maxMetaY > metaY then
+        metaY = math.floor((metaY + maxMetaY) / 2)
+      elseif maxMetaY >= oy + nameH + 1 then
+        metaY = maxMetaY
+      end
+      g.print(level, ox, metaY)
+      local numsX = math.max(ox + levelW + 2, borderR - hpW)
+      g.print(hpNums, numsX, metaY)
+
+      local barX = ox
+      local barW = inner
+      local barH = BAR_H
+      local minBarY = metaY + faceH + BAR_GAP
+      if barY < minBarY then barY = minBarY end
+      if barY + barH > oy + CONTENT_H then
+        barY = oy + CONTENT_H - barH
+      end
+      if barW >= 8 then
+        local fillInner = barW - 2
+        local fill = 0
+        if maxHp > 0 and hp > 0 then
+          fill = math.max(1, math.floor(hp * fillInner / maxHp))
+        end
+        local fr, fg, fb = 0, 189 / 255, 0
+        if fill < math.ceil(10 * fillInner / 48) then
+          fr, fg, fb = 230 / 255, 0, 0
+        elseif fill < math.ceil(27 * fillInner / 48) then
+          fr, fg, fb = 230 / 255, 198 / 255, 0
+        end
+        g.setColor(0, 0, 0, 1)
+        g.rectangle("fill", barX, barY, barW, 1)
+        g.rectangle("fill", barX, barY + barH - 1, barW, 1)
+        g.rectangle("fill", barX, barY, 1, barH)
+        g.rectangle("fill", barX + barW - 1, barY, 1, barH)
+        if fill > 0 then
+          g.setColor(fr, fg, fb, 1)
+          g.rectangle("fill", barX + 1, barY + 1, fill, math.max(1, barH - 2))
+        end
+        g.setColor(0, 0, 0, 1)
+      end
+    end)
+    if prev then pcall(g.setFont, g, prev) end
+    if not ok then
+      mod.log:warn("status readout failed (%s); the battle continues",
+        tostring(err))
+    end
+  else
+    -- Headless / missing sheet: ROM font, truncate by column budget.
+    local budget = math.max(1, panel.tw - 2)
+    Font.draw(M.fitHudName(nameRaw, budget), nameLeft, oy)
+    Font.draw(level, ox, oy + 8)
+    local nums = ("%d/%d"):format(hp, maxHp)
+    local rightW = 0
+    if Font.width then
+      local measuredOk, measured = pcall(Font.width, nums)
+      if measuredOk and type(measured) == "number" then rightW = measured end
+    end
+    if rightW <= 0 then rightW = #nums * 8 end
+    Font.draw(nums, math.max(ox + LEVEL_COLS * 8, borderR - rightW), oy + 8)
+    local segments = math.max(1, panel.tw - 2 - 3)
+    local barOk = pcall(HudTiles.drawHPBar, self.game.data, tx, ty + 2,
+      { hp = hp, stats = battler.mon.stats },
+      nil, false, segments)
+    if not barOk then
+      Font.draw(("%d/%d"):format(hp, maxHp), ox, oy + 16)
+    end
   end
 end
 
 function M:drawPanel(panel, which)
   local Font = engine.Font
-  local rows = PANEL_SLOTS[which]
+  local rows = self:panelSlots(which)
   local any = false
   for _, index in ipairs(rows) do
     if not hidden(self.sim:slot(index), self:shownBattlerAt(index)) then
@@ -2455,28 +3253,38 @@ function M:spotlight()
   return self.acting or self.mine
 end
 
--- Whether the trainer is still standing where their monsters will be. Held
--- through the opening lines and gone the moment anybody is asked to choose --
--- the original scrolls the picture off before the first menu, and a picture
--- that outstays that reads as a rendering fault rather than an entrance.
+-- Whether the trainer is still standing where their monsters will be.
+--
+-- Classic Gen 1 scrolls the picture off before the first menu. Co-op NPC
+-- fights already seat both foe mons before the opening line, so keeping the
+-- pic up through `phase == "messages"` hid WEEDLE/CATERPIE while their HP
+-- bars were already drawn -- the entrance read as a stuck trainer. Show the
+-- picture only while the foe quarter is still empty (and only before anyone
+-- has chosen).
 function M:showingTrainer()
-  return self.trainerPic ~= nil and (self.turnCount or 0) == 0
-    and self.phase == "messages"
+  if not self.trainerPic then return false end
+  if (self.turnCount or 0) ~= 0 then return false end
+  if self.phase ~= "messages" then return false end
+  if self.sim then
+    for _, slot in ipairs(self.sim.slots or {}) do
+      if self:foeSide(slot.index) then
+        local battler = self:shownBattlerAt(slot.index)
+        if battler and not hidden(slot, battler) then
+          return false
+        end
+      end
+    end
+  end
+  return true
 end
 
 -- Is this slot on the other side of the field from mine?
 --
--- **Viewer-relative, and deliberately nothing to do with the layout.** "foe"
--- here means one thing: not side "b", not the NPC's -- the side that is not the
--- side my own slot stands on. It is what a *label* should answer to.
---
--- It is emphatically **not** what the layout is keyed off. `SLOT_POS` and
--- `PANEL_SLOTS` are index-fixed constants -- 1 and 2 are the bottom-left pair
--- with the bottom-right panel, 3 and 4 the top-right pair with the top-left one
--- -- and they are the same on all four clients. A comment here used to claim
--- `PANEL_SLOTS` was keyed off this test; it never was, and anything that
--- believed it drew the far side's decoration over the near side's monsters for
--- the two players sitting in slots 3 and 4. See `M:scaleFor`.
+-- Viewer-relative: the side that is not the side my own slot stands on. Labels,
+-- hide-foes-during-trainer-pic, and (with `viewPos`) the whole screen layout
+-- answer to this -- Gen 1 players read "bottom = me", so a seat on field slots
+-- 3/4 must still see its own pair low-left or it looks like they are driving
+-- the wrong team's moves.
 function M:foeSide(index)
   local ours = self.sim and self.sim:slot(self.mine)
   ours = ours and ours.side
@@ -2484,59 +3292,103 @@ function M:foeSide(index)
   return (slot ~= nil and ours ~= nil and slot.side ~= ours) and true or false
 end
 
--- How big slot `index` draws. Its own function so the suite can ask without a
--- graphics device -- see FOE_SCALE for why the far pair is smaller.
---
--- ------- keyed off the **layout**, not off who is reading the screen
---
--- This used to ask `foeSide`, and that was a category error with a visible
--- consequence. FOE_SCALE exists for one reason: slots 3 and 4 sit in the 72
--- pixels at the top of the screen with the foes' panel beside them, and two
--- 56-pixel pics in that space read as one shape unless the far pair is opened
--- up a little. That is a fact about `SLOT_POS`, which is an index-fixed
--- constant identical on all four clients.
---
--- `foeSide` is viewer-relative. In a party battle the two players sitting in
--- slots 3 and 4 are on the far side of *nobody's* screen but their opponents',
--- so asking it shrank whichever pair the reader was not in -- which for half
--- the table was their own pair, drawn small in the bottom-left where there is
--- room for it at full size, while the opposition stood full size in the corner
--- the shrink exists to unclutter. Both halves wrong, and only for the clients
--- nobody tests from.
+-- Visual lane for a field slot: 1-2 = your pair (bottom-left), 3-4 = theirs
+-- (top-right). Field indices stay a1,a2,b1,b2 on the wire; only drawing keys
+-- off this remapping so every client still sees itself on the Gen 1 "player"
+-- half of the screen.
+function M:viewPos(index)
+  if type(index) ~= "number" or not self.sim then return index end
+  local mine = self:mySlot()
+  local mySide = mine and mine.side
+  if not mySide then return index end
+  local ally, foe = {}, {}
+  for _, slot in ipairs(self.sim.slots or {}) do
+    if slot.side == mySide then
+      ally[#ally + 1] = slot.index
+    else
+      foe[#foe + 1] = slot.index
+    end
+  end
+  for i, id in ipairs(ally) do
+    if id == index then return i end
+  end
+  for i, id in ipairs(foe) do
+    if id == index then return i + 2 end
+  end
+  return index
+end
+
+-- Logical field indices that belong in a status panel, in readout order.
+-- which 1 = foes (top-left panel), 2 = allies (bottom-right panel).
+function M:panelSlots(which)
+  local mine = self:mySlot()
+  local mySide = mine and mine.side
+  if not mySide then return {} end
+  local rows = {}
+  for _, slot in ipairs(self.sim.slots or {}) do
+    local theirs = slot.side ~= mySide
+    if (which == 1 and theirs) or (which == 2 and not theirs) then
+      rows[#rows + 1] = slot.index
+    end
+  end
+  return rows
+end
+
+-- How big slot `index` draws. Near pair (view lanes 1–2) uses ALLY_SCALE so
+-- the backs fill the field down to the text box; far pair stays FOE_SCALE.
 function M:scaleFor(index)
-  if index == 3 or index == 4 then return FOE_SCALE end
-  return PIC_SCALE
+  local pos = self:viewPos(index)
+  if not pos then return PIC_SCALE end
+  if pos <= 2 then return ALLY_SCALE end
+  return FOE_SCALE
 end
 
 -- ------- where slot `index` actually lands, in screen pixels
 --
 -- **One anchor, three callers.** The pic itself, the target picker's cursor and
--- the animation translation are all in the same space, and until now only the
--- pic knew about it: `drawField` worked the shrink offsets out inline while
--- `drawTarget` and `animOffset` used raw `SLOT_POS`. The two of them therefore
--- pointed four to eight pixels above and to the left of the foe they were about
--- -- the exact size of the FOE_SCALE offsets, which is the tell.
+-- the animation translation are all in the same space. Position comes from
+-- `viewPos` → `SLOT_POS`, so a side-b seat draws its own monsters on the
+-- classic player half of the screen.
 --
--- The rule, which is FOE_SCALE's own promise kept: a sprite is anchored at its
--- top-left, so scaling it in place would lift its feet off the ground. Pushing
--- it back down by the height it lost and in by half the width it lost leaves
--- its feet and its centre line exactly where a full-size pic had them.
+-- Ally rows carry `feet = true`: SLOT_POS.y is the ground line (FIELD_FLOOR),
+-- and the top-left is `y - height * scale` so scaling up grows toward the
+-- sky instead of through the command box. Foe rows keep the old top-left
+-- anchor; if they ever scale away from 1x, feet and centre are preserved the
+-- FOE_SCALE way.
 --
--- Returns `x, y, scale`, or nil for a slot with no position. A sprite that
--- cannot be measured -- or one that was not handed in at all -- falls back to
--- PIC_SCALE and the raw position rather than to offsets nobody can compute,
--- which is what `drawField` has always done. The measurement is behind a pcall
--- for the same reason every other sprite call on this screen is.
+-- Returns `x, y, scale`, or nil for a slot that is not on the center stage.
 function M:picOriginFor(index, sprite)
-  local at = SLOT_POS[index]
-  if not at then return nil end
-  local scale, x, y = self:scaleFor(index), at.x, at.y
-  if scale ~= PIC_SCALE then
-    local sw, sh
-    if sprite then
-      local ok, w, h = pcall(sprite.getDimensions, sprite)
-      if ok then sw, sh = w, h end
+  if not self:onStage(index) then return nil end
+  local ally = not self:foeSide(index)
+  local anchor = ally and STAGE_ALLY or STAGE_FOE
+  local scale = ally and ALLY_SCALE or FOE_SCALE
+  local slide = ally and self.slideAlly or self.slideFoe
+  local dx = slideDx(slide, index, ally)
+  local x = anchor.x + dx
+  local y = ally and FIELD_FLOOR or anchor.y
+  local sw, sh
+  if sprite then
+    local ok, w, h = pcall(sprite.getDimensions, sprite)
+    if ok then sw, sh = w, h end
+  end
+  if ally then
+    local w = sw or 56
+    local h = sh or 56
+    -- Keep the back out of the left strip and out of the ally HUD: grow up
+    -- to ALLY_SCALE, then right-align against the box so it reads close to
+    -- the status panel without painting through it.
+    local stripRight = STRIP_ICON
+    local hudLeft = ALLY_HUD.tx * 8
+    local lane = math.max(8, hudLeft - stripRight)
+    if w > 0 then
+      scale = math.min(scale, lane / w)
     end
+    x = hudLeft - w * scale + dx
+    if x < stripRight + dx then x = stripRight + dx end
+    local inset = ALLY_FOOT_INSET
+    if inset > h - 8 then inset = 0 end
+    y = FIELD_FLOOR - (h - inset) * scale
+  elseif scale ~= PIC_SCALE then
     if sw and sh then
       x = x + (1 - scale) * sw / 2
       y = y + (1 - scale) * sh
@@ -2547,21 +3399,8 @@ function M:picOriginFor(index, sprite)
   return x, y, scale
 end
 
--- ------- back to front, and what outranks what
---
--- Three claims on "who is in front", in order:
---
---   1. the **hovered target**, while the target picker is open. It is the one
---      question on this screen whose answer is a monster on the field, and two
---      overlapping foes are exactly when a name in a list is not enough -- so
---      the one about to be hit comes clear of the other while the cursor is on
---      it. Outranks the spotlight because the spotlight is nobody's during a
---      pick: it falls back to your own monster, which is not what is being
---      chosen between.
---   2. the **spotlight**, whoever is being narrated (M:spotlight).
---   3. `DEPTH_ORDER`, the resting arrangement.
---
--- Returned as a list so it can be asserted against without drawing anything.
+-- Back to front among on-stage slots only. Whoever should read as "in front"
+-- paints last: hovered foe while targeting, otherwise the spotlight slot.
 function M:paintOrder()
   local top = self:spotlight()
   if self.phase == "target" and self.sim then
@@ -2570,41 +3409,122 @@ function M:paintOrder()
     local hovered = targets[self.targetIndex or 1]
     if hovered then top = hovered.index end
   end
-  local order = {}
-  for _, index in ipairs(DEPTH_ORDER) do
-    if index ~= top then order[#order + 1] = index end
+  local seen, order = {}, {}
+  local function add(index)
+    if not index or seen[index] then return end
+    seen[index] = true
+    order[#order + 1] = index
   end
-  order[#order + 1] = top
+  local function addSlide(slide)
+    if not slide then return end
+    add(slide.out)
+    add(slide.into)
+  end
+  addSlide(self.slideAlly)
+  addSlide(self.slideFoe)
+  if not self.slideAlly then add(self:allyFocus()) end
+  if not self.slideFoe then add(self:foeFocus()) end
+  if top and seen[top] then
+    for i, index in ipairs(order) do
+      if index == top then
+        table.remove(order, i)
+        break
+      end
+    end
+    order[#order + 1] = top
+  end
   return order
 end
 
+local function drawStripIcon(self, battler, x, y)
+  local Font = engine.Font
+  local g = love and love.graphics
+  local sprite = battler and battler.sprite
+  if sprite and g and g.setScissor then
+    local sw, sh = 56, 56
+    local ok, w, h = pcall(sprite.getDimensions, sprite)
+    if ok and type(w) == "number" and w > 0 then sw, sh = w, h end
+    local scale = STRIP_ICON / math.max(sw, sh, 1)
+    local dw, dh = sw * scale, sh * scale
+    local ox = x + math.floor((STRIP_ICON - dw) / 2)
+    local oy = y + math.floor((STRIP_ICON - dh) / 2)
+    g.setColor(1, 1, 1, 1)
+    g.setScissor(x, y, STRIP_ICON, STRIP_ICON)
+    pcall(g.draw, sprite, ox, oy, 0, scale, scale)
+    g.setScissor()
+    return
+  end
+  if sprite then
+    love.graphics.setColor(1, 1, 1, 1)
+    local sw, sh = 56, 56
+    local ok, w, h = pcall(sprite.getDimensions, sprite)
+    if ok and type(w) == "number" and w > 0 then sw, sh = w, h end
+    local scale = STRIP_ICON / math.max(sw, sh, 1)
+    love.graphics.draw(sprite, x, y, 0, scale, scale)
+    return
+  end
+  local letter = "?"
+  if battler and battler.name and battler.name ~= "" then
+    letter = battler.name:sub(1, 1):upper()
+  end
+  love.graphics.setColor(0, 0, 0, 1)
+  Font.draw(letter, x + 4, y + 4)
+end
+
+local function drawSideStrip(self, seats, left, focused)
+  if not seats or #seats == 0 then return end
+  local Font = engine.Font
+  local g = love and love.graphics
+  -- Start below the foe HUD row so strip icons do not sit under the name box.
+  local top = left and 48 or 8
+  local x = left and 0 or (160 - STRIP_ICON)
+  -- Solid white rail behind the icons so a wide stage pic cannot show
+  -- through (strips draw after pics, but translucent / sparse sprites still
+  -- read as muddy without a paper backing).
+  local h = #seats * STRIP_ICON + math.max(0, #seats - 1) * 2
+  love.graphics.setColor(1, 1, 1, 1)
+  love.graphics.rectangle("fill", x, top, STRIP_ICON, h)
+  for i, index in ipairs(seats) do
+    local y = top + (i - 1) * (STRIP_ICON + 2)
+    local battler = self:shownBattlerAt(index)
+    drawStripIcon(self, battler, x, y)
+    if index == focused then
+      love.graphics.setColor(0, 0, 0, 1)
+      local ay = y + 4
+      if left then
+        -- 0xED is the right-pointing cursor; mirror it so the left strip's
+        -- arrow points at the icon (◀) rather than away into the field.
+        local ax = x + STRIP_ICON
+        if g and g.push and g.scale then
+          g.push()
+          g.translate(ax + 8, ay)
+          g.scale(-1, 1)
+          Font.drawCode(0xED, 0, 0)
+          g.pop()
+        else
+          Font.drawCode(0xED, ax, ay)
+        end
+      else
+        Font.drawCode(0xED, x - 8, ay)
+      end
+    end
+  end
+end
+
 function M:drawField()
-  -- Their side is the trainer until the trainer leaves. Drawing both puts a
-  -- WEEDLE through the sprite's chest.
   local hideFoes = self:showingTrainer()
 
   for _, index in ipairs(self:paintOrder()) do
     local slot = self.sim:slot(index)
-    -- What is on *screen* in this slot, which is the monster still being shown
-    -- out whenever one is -- not necessarily the one the field says is
-    -- standing there (M:shownBattlerAt).
     local battler = self:shownBattlerAt(index)
     local theirs = self:foeSide(index)
     local sinking = self:sinkingAt(index)
-    -- A sink is drawn from the battler its own row captured, so a slot whose
-    -- replacement has already landed still sinks the monster that fell.
     local sprite = (sinking and sinking.battler and sinking.battler.sprite)
       or (battler and battler.sprite)
-    -- Where this pic actually lands, at whatever scale its position draws at --
-    -- worked out by the one function the cursor and the animations also ask,
-    -- so all three agree to the pixel (M:picOriginFor).
     local x, y, scale = self:picOriginFor(index, sprite)
     if sprite and x and not (hideFoes and theirs) then
       if sinking then
         love.graphics.setColor(1, 1, 1, 1)
-        -- Behind a pcall for the reason the HP bar is: a sprite with
-        -- dimensions this cannot quad is a monster missing from the field for
-        -- one frame, not a battle that stops for four people.
         pcall(drawSinking, sprite, x, y, sinking.frames, scale)
       elseif not hidden(slot, battler) then
         love.graphics.setColor(1, 1, 1, 1)
@@ -2612,8 +3532,34 @@ function M:drawField()
       end
     end
   end
-  self:drawPanel(FOE_PANEL, 1)
-  self:drawPanel(ALLY_PANEL, 2)
+  if self:showingTrainer() and self.trainerPic then
+    love.graphics.setColor(1, 1, 1, 1)
+    local ok = pcall(love.graphics.draw, self.trainerPic, 100, 0)
+    if not ok then self.trainerPic = nil end
+  end
+  -- Strips after stage pics so a wide foe/ally sprite cannot cover an icon
+  -- or its focus arrow when they share the edge.
+  drawSideStrip(self, self:stripSeats(false), true, self:desiredAllyFocus())
+  drawSideStrip(self, self:stripSeats(true), false, self:desiredFoeFocus())
+  local foe = self:desiredFoeFocus()
+  local Font = engine.Font
+  if foe then
+    local battler = self:shownBattlerAt(foe)
+    local slot = self.sim:slot(foe)
+    if battler and not hidden(slot, battler) then
+      Font.drawBox(FOE_HUD.tx, FOE_HUD.ty, FOE_HUD.tw, FOE_HUD.th)
+      drawReadout(self, battler, FOE_HUD, 1, foe == self.mine)
+    end
+  end
+  local ally = self:desiredAllyFocus()
+  if ally then
+    local battler = self:shownBattlerAt(ally)
+    local slot = self.sim:slot(ally)
+    if battler and not hidden(slot, battler) then
+      Font.drawBox(ALLY_HUD.tx, ALLY_HUD.ty, ALLY_HUD.tw, ALLY_HUD.th)
+      drawReadout(self, battler, ALLY_HUD, 1, ally == self.mine)
+    end
+  end
 end
 
 -- This screen resolves its own colours.
@@ -2642,8 +3588,8 @@ end
 -- pieces.
 
 -- Where the classic layout puts the two pics an animation was authored around.
-local CLASSIC_PLAYER = { x = 8, y = 40 }
-local CLASSIC_ENEMY = { x = 88, y = 0 }
+local CLASSIC_PLAYER = { x = STAGE_ALLY.x, y = 40 }
+local CLASSIC_ENEMY = { x = STAGE_FOE.x, y = STAGE_FOE.y }
 
 function M:startAnim(row)
   self.anim = row
@@ -2653,9 +3599,19 @@ function M:startAnim(row)
     self.anim = nil
     return false
   end
-  local slot = self.sim:slot(row.from)
-  local ok = pcall(self.animPlayer.start, self.animPlayer, row.anim,
-                   slot and slot.side == "a")
+  -- Face the flash the way *this* screen lays out the field. Host-sim rows
+  -- carry the engine's absolute `attackerIsPlayer`, which is wrong for a
+  -- side-b guest whose own pair sits on the player half; `from` + foeSide is
+  -- always viewer-true when present.
+  local isPlayer
+  if row.from ~= nil then
+    isPlayer = not self:foeSide(row.from)
+  elseif row.attackerIsPlayer ~= nil then
+    isPlayer = row.attackerIsPlayer
+  else
+    isPlayer = true
+  end
+  local ok = pcall(self.animPlayer.start, self.animPlayer, row.anim, isPlayer)
   if not ok then self.anim = nil end
   return ok
 end
@@ -2666,16 +3622,27 @@ end
 -- slot that draws at FOE_SCALE has its flash land on the monster rather than
 -- four to eight pixels above and left of it (M:picOriginFor). The sprite is
 -- looked up for the same reason the pic does: the offsets depend on how big it
--- is, and only it can say.
+-- is, and only it can say. Classic player vs enemy anchors follow the viewer
+-- (foeSide), matching `viewPos`, not raw side "a".
+--
+-- **Ally Y is not shifted.** Coop parks back pics near y=50 (clear of the foe
+-- panel); AnimPlayer authors every player-side effect against the classic
+-- back-pic anchor at y=40. Adding that delta to the flash buried it under the
+-- message box -- foe attacks (anchored near y=0) kept working, player attacks
+-- looked like they never played. X still tracks the 2-on-2 slot so a partner
+-- at x=34 does not flash over the lead at x=2.
 function M:animOffset(row)
   local index = row and row.from
   if not index then return 0, 0 end
   local battler = self:shownBattlerAt(index)
   local x, y = self:picOriginFor(index, battler and battler.sprite)
   if not x then return 0, 0 end
-  local slot = self.sim and self.sim:slot(index)
-  local from = (slot and slot.side == "a") and CLASSIC_PLAYER or CLASSIC_ENEMY
-  return x - from.x, y - from.y
+  local foe = self:foeSide(index)
+  local from = foe and CLASSIC_ENEMY or CLASSIC_PLAYER
+  if foe then
+    return x - from.x, y - from.y
+  end
+  return x - from.x, 0
 end
 
 function M:drawAnim()
@@ -2885,8 +3852,60 @@ end
 -- live in Config.lua, which this change does not own.)
 local WEDGE_GRACE = Config.COOP_ASK_GRACE
 
+-- Real seconds for stall / wait clocks.
+--
+-- `update` is handed FixedStep's logic dt (always 1/60 per step). GameSpeed
+-- multiplies how *many* steps run per real second, not the dt value -- so at
+-- 10X the countdown used to burn ten display-seconds per real second while a
+-- Node hub (Date.now) still had a wall minute left. Prefer love.timer wall
+-- time for ordinary steps. Multi-second `dt` arguments (the suite's scripted
+-- jumps) stay authoritative so headless tests can advance a clock without a
+-- timer.
+local STEP = 1 / 60
+local function stallDelta(self, dt)
+  dt = dt or 0
+  if dt > STEP * 2 then return dt end
+  local timer = rawget(_G, "love")
+  timer = timer and timer.timer
+  local getTime = timer and timer.getTime
+  if type(getTime) ~= "function" then
+    return dt
+  end
+  local ok, now = pcall(getTime)
+  if not ok or type(now) ~= "number" then
+    return dt
+  end
+  local prev = self._stallWall
+  self._stallWall = now
+  if prev == nil then return 0 end
+  local elapsed = now - prev
+  if elapsed < 0 then return 0 end
+  -- Same anti-spiral ceiling FixedStep uses after a hitch / alt-tab.
+  if elapsed > 0.25 then elapsed = 0.25 end
+  return elapsed
+end
+
 function M:tickStalls(dt)
   if self.result or self.phase == "over" then return end
+  dt = stallDelta(self, dt)
+  -- ------- and none of these clocks belong to a refereed fight
+  --
+  -- All three of them are about a *client* that has stopped answering, and all
+  -- three act over mmo.coop_relay -- the forced send-out, the resync request,
+  -- the "cut short" draw. On the mediated path the relay is cut at the hub, the
+  -- client that used to decide decides nothing, and the two clocks that matter
+  -- (BATTLE_CHOICE_TIMEOUT and BATTLE_RECONNECT_GRACE) are the
+  -- intermediator's -- which is also the only party that can see whether
+  -- somebody has really gone. What is left here would be a screen declaring a
+  -- battle over that the referee is still running, and then hearing the outcome.
+  --
+  -- The one thing kept is the number on screen: `waitShown` is what the wait
+  -- line counts, and a player waiting on a refereed turn is owed it just as
+  -- much.
+  if self.mediated then
+    self.waitShown = (self.waitShown or 0) + (dt or 0)
+    return
+  end
 
   -- ------- the clock the *screen* reads, and it starts at the handover
   --
@@ -3057,8 +4076,15 @@ end
 -- Host-only. It is the host that enforces it; the number the other three see
 -- is a display of the same budget (see `waitLine`), started from their own
 -- side of the same event.
+--
+-- Never on the mediated path: the deadline it arms is enforced by
+-- `autoPickLate`, which resolves a turn, and the intermediator is already
+-- holding its own BATTLE_CHOICE_TIMEOUT over the same turn. Two deadlines
+-- racing decide the turn on whichever fires first.
 function M:openTurn()
-  if not self.host or self.result then return end
+  if not self.host or self.result or self.mediated then return end
+  -- Refereed modes wait for the hub; do not arm a host-sim choice clock.
+  if M.mediates(self.mode) then return end
   self.turnOpened = 0
 end
 
@@ -3081,6 +4107,11 @@ end
 function M:autoPickLate()
   if not (self.host and self.sim) then return false end
   if self.result then return false end
+  -- The intermediator's clock, not ours -- see `openTurn`. Belt to that brace:
+  -- `tickStalls` is the only caller and it returns before reaching here, so this
+  -- is for the day something else fires the deadline.
+  if self.mediated then return false end
+  if M.mediates(self.mode) then return false end
   -- ------- nobody is late during the narration
   --
   -- The messages phase is not a wait for an answer: it is the turn *before*
@@ -3161,8 +4192,11 @@ function M:closePickers()
   local open = self.runAsk ~= nil
     or self.phase == "choose" or self.phase == "move"
     or self.phase == "target" or self.phase == "switch"
-    or self.phase == "item"
+    or self.phase == "item" or self.phase == "item_party"
+    or self.phase == "item_move"
   if not open then return false end
+  self.itemPick = nil
+  self.itemPartyIndex = nil
   -- A consent ask is a question too, and the clock has just answered it: the
   -- turn this client was going to spend on running has been spent on a move
   -- instead, so neither the wait nor the prompt has anything left to resolve.
@@ -3578,6 +4612,615 @@ function M:drainNet()
   end
 end
 
+-- ------- the intermediator, when there is one
+--
+-- The third path promised in the header, and the shape of it is deliberately the
+-- same three jobs src/MediatedBattle.lua does for a 1v1:
+--
+--   1. upload what we are bringing -- `mmo.battle_party` per seat, and on the
+--      host `mmo.battle_ruleset` -- before the fight opens;
+--   2. put a choice on the wire when a turn opens;
+--   3. apply the ordered `mmo.battle_event` stream to a screen.
+--
+-- What is *not* here is a second renderer. Every event is translated into the
+-- co-op event vocabulary `playEvents` already speaks and handed to it, so a
+-- refereed turn drains through the same queue, the same bar animations, the same
+-- faint slides and the same message dwell as a host-simulated one. That is the
+-- point: a player must not be able to tell which of the two ran their battle,
+-- and the way to guarantee that is for there to be one screen rather than two
+-- that look alike.
+--
+-- The translation is the whole of the risk, so the two readings that are easy to
+-- get backwards are named:
+--
+--   * a **field slot** on the wire is 0..3 (side a takes 0 and 1, side b takes 2
+--     and 3, per src/BattleSim/events.lua) while this screen numbers its slots
+--     1..4 in a1,a2,b1,b2 order. They are not the same number and the map
+--     between them is built from the hub's own roster, not from the arithmetic
+--     that happens to line up today -- see `medMap`.
+--   * a `switch` **choice** names a party index; a `send` **event** names a field
+--     slot. Same word, two numbers.
+--
+-- Batching matters as much as translation. Events arrive one per message, and
+-- `playEvents` closes every open menu -- so applying them one at a time would
+-- take the move list away from a player mid-decision every time the referee said
+-- anything. They are collected instead and played when the referee closes the
+-- batch (`turn`, or `over`), which makes an arriving turn look exactly like the
+-- single `res` the client-simulated path sends.
+
+-- Is this mode hub-refereed? Always for shipped coop_pvp / coop_npc — not a
+-- Config toggle. Host-sim for those modes was removed (BattleSim vs engine
+-- ItemEffects must not diverge). CoopSim remains for field layout / tests.
+function M.mediates(mode)
+  return mode == "coop_pvp" or mode == "coop_npc"
+end
+
+-- ------- 1. what we are bringing
+
+-- The NPC side's team, as one party in the order the trainer would send it out.
+--
+-- Re-interleaved, because that is how it was split: src/Coop.lua's `npcSide`
+-- deals the trainer's party alternately into the two ownerless slots so that a
+-- pair of players meets a pair of monsters. Taking one from each slot in turn
+-- gives back the original order -- and order is the whole of what is at stake
+-- here, because the referee sends the next living monster out in party order and
+-- never asks. Concatenating instead would have a gym leader lead with the
+-- monster it meant to finish on.
+--
+-- One party and not two, because the intermediator seats one npc: see
+-- Config.MEDIATED_COOP's first reason.
+function M:npcMons()
+  if not self.sim then return nil end
+  local parties = {}
+  for _, slot in ipairs(self.sim.slots or {}) do
+    if slot.owner == nil then parties[#parties + 1] = slot.party or {} end
+  end
+  if #parties == 0 then return nil end
+
+  local flat, index = {}, 1
+  while true do
+    local took = false
+    for _, party in ipairs(parties) do
+      local mon = party[index]
+      if mon then
+        flat[#flat + 1] = mon
+        took = true
+      end
+    end
+    if not took then break end
+    index = index + 1
+  end
+  return Mediated.snapshotMons(self.game, flat)
+end
+
+-- Offer this fight to the intermediator.
+--
+-- Idempotent, and silent about every reason it might decline: a mode that is not
+-- refereed, a screen with no hub connection, a battle the hub never named. Those
+-- leave `mediated` false. When the mode *is* refereed (Config.MEDIATED_COOP) but
+-- the party cannot be described, `medFailed` is set so the host-sim path is not
+-- used as a silent fidelity fork (BattleSim vs engine ItemEffects).
+--
+-- The party uploaded is the slot's, not `game.save.party`. They are the same
+-- table for our own slot (src/Coop.lua hands the live party in, so a co-op
+-- battle marks the save the way any trainer battle does) -- but the slot is what
+-- is actually on the field, and reading it is what lets a screen built with no
+-- save upload at all.
+function M:uploadMediated()
+  if self.medUploaded then return false end
+  if not (self.transport and self.battleId and self.sim) then return false end
+  if not M.mediates(self.mode) then return false end
+
+  local mine = self:mySlot()
+  if not (mine and mine.side) then return false end
+
+  local mons = Mediated.snapshotMons(self.game, mine.party)
+  if #mons == 0 then
+    -- Uploading nothing would leave the hub holding a seat open. Ending the
+    -- fight is better than host-sim with a different item/effect surface.
+    mod.log:warn("no POKeMON could be described for a refereed 2-on-2, so this "
+      .. "battle cannot be refereed; check the party from START > POKeMON and "
+      .. "report this if it is not empty")
+    self.medFailed = true
+    return false
+  end
+
+  self.medUploaded = true
+  local bag = Mediated.snapshotBag(self.game)
+  self.bagSheet = Mediated.bagCounts(bag)
+  if self.host then Mediated.sendRuleset(self.transport, self.game) end
+  Mediated.sendParty(self.transport, self.battleId, mons, mine.side, bag,
+    Mediated.badgesOf(self.game))
+
+  -- ...and the trainer's team, from the host alone. `Hub:battleSeat` maps a
+  -- side-"b" party from the host of a coop_npc onto the synthetic npc seat
+  -- rather than displacing the host's own, which is why this can be a second
+  -- mmo.battle_party on the same connection.
+  if self.host and self.mode == "coop_npc" then
+    local npc = self:npcMons()
+    if npc and #npc > 0 then
+      Mediated.sendParty(self.transport, self.battleId, npc, "b")
+    else
+      mod.log:warn("the trainer's party could not be described for a refereed "
+        .. "2-on-2 -- report which trainer it was")
+      self.medFailed = true
+    end
+  end
+  return not self.medFailed
+end
+
+-- Mediation was required but could not start: end as a draw rather than
+-- falling through to host-sim (different item/effect fidelity).
+function M:failMediation()
+  if self.result or self.mediationFailedSaid then return end
+  self.mediationFailedSaid = true
+  self.result = "draw"
+  self:say("The battle could not\nbe refereed.")
+  self.phase = "messages"
+  self.after = "over"
+end
+
+-- ------- 2. the field is assembled
+
+-- Which co-op slot each field slot is, and the reverse.
+--
+-- Built from the roster the hub broadcast rather than from `field + 1`, even
+-- though that is what it comes to for a four-player fight: the arithmetic is only
+-- right while both sides list their members in the order this screen's slots were
+-- built in, and neither the hub nor this file promises that -- the ids come from
+-- a party roster on one side and a co-op ask on the other.
+--
+-- **Side b of a coop_npc is deliberately not read off the roster.** The npc seat
+-- is not an id a client may address, so `tryStartSim` filters it out and
+-- advertises the host instead (a side emptied by the filter is announced as the
+-- connection any choice for it would arrive from). Taken literally that would
+-- map the trainer's field slot onto the host's own box. So an advertised id that
+-- does not own a slot *on that side* falls through to the ownerless slots on it,
+-- in field order, which is exactly what the npc seat is.
+function M:medMap(sides)
+  local byField, byIndex = {}, {}
+  if not self.sim then return byField, byIndex end
+  for _, side in ipairs({ "a", "b" }) do
+    local ids = (type(sides) == "table" and sides[side]) or {}
+    -- Config.COOP_SIDE is the same 2 that src/BattleSim/events.lua mirrors as
+    -- SIDE_SLOTS; one side's worth of field slots is what separates the bases.
+    local base = (side == "b") and Config.COOP_SIDE or 0
+    local spare = {}
+    for _, slot in ipairs(self.sim.slots or {}) do
+      if slot.side == side and slot.owner == nil then spare[#spare + 1] = slot.index end
+    end
+    for i = 1, #ids do
+      local field = base + i - 1
+      local owned = self:slotOwnedBy(ids[i])
+      local index = (owned and owned.side == side) and owned.index
+        or table.remove(spare, 1)
+      if index then
+        byField[field] = index
+        byIndex[index] = field
+      end
+    end
+  end
+  return byField, byIndex
+end
+
+-- The hub has the parties and the chart; from here it decides everything.
+--
+-- `mySide` is **not** re-derived from the roster, unlike src/MediatedBattle.lua's
+-- `onReady` -- for the coop_npc reason `medMap` gives, and because it does not
+-- have to be: this screen was built from a field description that already states
+-- which side every slot is on, agreed by all four clients before anybody
+-- uploaded anything.
+function M:onBattleReady(msg)
+  if self.mediated or self.result then return false end
+  if not (self.battleId and msg.battle == self.battleId) then return false end
+  if not (self.sim and M.mediates(self.mode)) then return false end
+
+  self.mediated = true
+  self.medSlots, self.medFields = self:medMap(msg.sides)
+
+  -- Everything the client-simulated path had in flight belongs to a turn that is
+  -- now never going to be resolved here. Dropped rather than left: `pending`
+  -- would be filed into a `resolveTurn` that no longer runs, `turnOpened` arms a
+  -- deadline the referee is already holding, and a consent ask has lost the relay
+  -- it was going to be answered over.
+  self.pending = {}
+  self.acted = nil
+  self.runAsks = nil
+  self.turnOpened = nil
+  self.runAsk = nil
+  return true
+end
+
+-- ------- 3. the event stream
+
+-- The reasons a refereed fight ends that this screen has a sentence for. An
+-- unknown token -- a newer intermediator naming something this build cannot
+-- phrase -- is silent rather than printed raw: the result is the part that
+-- matters and it has already landed.
+local MED_REASONS = {
+  timeout    = "Nobody answered\nin time.",
+  disconnect = "The link was lost.",
+  run        = "Someone ran away!",
+  forfeit    = "Someone gave up.",
+  agree      = "The battle was\ncalled off.",
+}
+
+-- One wire event, as rows `playEvents` understands.
+function M:medRows(msg)
+  local rows = {}
+  local function say(text)
+    if type(text) == "string" and text ~= "" then
+      rows[#rows + 1] = { kind = "msg", text = text }
+    end
+  end
+
+  local index = self:medSlotOf(msg)
+  local slot = index and self.sim:slot(index)
+  local kind = msg.t
+
+  if kind == "msg" then
+    say(msg.text)
+
+  elseif kind == "send" then
+    -- The referee narrates a monster by name and never by party position, so
+    -- the position is ours to find -- and it has to be found, because the row
+    -- `playEvents` wants is what tells `sim:sendOut` which battler to build.
+    -- A name that matches nothing is a send-out this screen cannot draw; the
+    -- line is still printed, so the field being one monster behind at least has
+    -- an explanation on it.
+    local at = slot and self:medPartyIndex(slot, msg.text)
+    say(("%s sent out\n%s!"):format(slot and slot.name or "Someone",
+      tostring(msg.text)))
+    if at then rows[#rows + 1] = { kind = "send", slot = index, index = at } end
+
+  elseif kind == "damage" or kind == "drain" then
+    -- The resulting HP and never the amount, which is the rule the co-op
+    -- `damage` row already follows and for the same reason: a dropped or
+    -- reordered event cannot leave a bar drifting away from the referee's. A
+    -- `drain` is HP that moved *onto* a slot, so it is the same row -- the
+    -- number is where that slot now stands either way.
+    if index and msg.hp then
+      rows[#rows + 1] = { kind = "damage", slot = index, hp = msg.hp }
+    end
+
+  elseif kind == "faint" then
+    if index then rows[#rows + 1] = { kind = "faint", slot = index } end
+    -- The referee's `faint` carries the species and no sentence of its own, so
+    -- the sentence is made here -- in the original's order, which prints the
+    -- line over the top of the monster already sliding down.
+    if msg.text then say(("%s fainted!"):format(tostring(msg.text))) end
+    -- Authoritative mustReplace: amount=1 means a living bench remains.
+    -- Empty bench omits amount so we never arm the replace picker. Absent
+    -- amount (older stream) falls back to a local bench check.
+    if index == self.mine then
+      if msg.amount == 1 then
+        self.medMustReplace = true
+      elseif msg.amount ~= nil then
+        self.medMustReplace = nil
+      else
+        local seat = self.sim and self.sim:slot(self.mine)
+        if seat and seat.active and seat.party and seat.party[seat.active] then
+          seat.party[seat.active].hp = 0
+        end
+        local hasBench = false
+        if seat then
+          for _, mon in ipairs(seat.party or {}) do
+            if (mon.hp or 0) > 0 then hasBench = true; break end
+          end
+        end
+        self.medMustReplace = hasBench or nil
+      end
+    end
+
+  elseif kind == "anim" then
+    -- Play via the existing AnimPlayer path; if mapping fails `startAnim`
+    -- no-ops safely. The "X used MOVE" line rides in the `msg` beside this.
+    if index then
+      rows[#rows + 1] = {
+        kind = "anim", anim = msg.text, from = index,
+        -- Viewer-relative: this client's ally side faces as the player.
+        attackerIsPlayer = not self:foeSide(index),
+      }
+    end
+
+  elseif kind == "switch" then
+    -- Already said in the `msg` beside it, and the `send` that follows every
+    -- switch -- printing `text` (a species) would say the same thing twice in
+    -- worse words.
+
+  elseif kind == "turn" or kind == "over" then
+    -- Neither draws anything. `turn` is the signal that the batch collected so
+    -- far is complete, and `over` says the field is done -- the outcome is a
+    -- separate message and is what this screen actually ends on.
+
+  elseif kind == "chose" or kind == "unchose" or kind == "moves" then
+    -- Applied in onBattleEvent (markActed / unmarkActed / medMoveList), never
+    -- narrated. Reaching here is a no-op so a queued copy cannot print the
+    -- trainer's name as a battle line.
+
+  else
+    -- status, stat, item, run, wait, reconnect: the referee's own sentence is
+    -- the whole of what they contribute to a screen today. The state they
+    -- describe rides on the events beside them -- a status that gated a move is
+    -- followed by the `damage` that did or did not happen.
+    say(msg.text)
+  end
+  return rows
+end
+
+function M:medSlotOf(msg)
+  if msg.slot == nil then return nil end
+  return (self.medSlots or {})[msg.slot]
+end
+
+function M:medFieldOf(index)
+  if index == nil then return nil end
+  return (self.medFields or {})[index]
+end
+
+-- Which of this slot's party the referee means by that name.
+--
+-- Matched through `Wire.name`, because that is what the *uploaded* species went
+-- through: comparing a raw nickname against a sanitised one would miss every
+-- monster whose name carries punctuation the sanitiser drops. A party holding two
+-- monsters with the same name matches the first, which is wrong only for a player
+-- who nicknamed two of their team identically -- and the alternative, counting
+-- faints to track send-outs, is wrong more often and more quietly.
+function M:medPartyIndex(slot, species)
+  if not (slot and type(species) == "string") then return nil end
+  local data = self.game and self.game.data
+  for i, mon in ipairs(slot.party or {}) do
+    local def = data and (data.pokemon or {})[mon.species]
+    local name = mon.nickname
+    if type(name) ~= "string" or name == "" then name = def and def.name end
+    if type(name) ~= "string" or name == "" then name = mon.species end
+    if Wire.name(name) == species then return i end
+  end
+  return nil
+end
+
+-- One thing that happened, in order.
+--
+-- `seq` is what makes the stream a stream, and it is read exactly as
+-- src/MediatedBattle.lua reads it: a sequence already passed is a duplicate and
+-- is dropped, and a jump forward is counted rather than refused. Refusing the
+-- jump would leave the screen waiting on a message that is not coming; counting
+-- it makes a lossy hub visible in a log while the fight -- whose state lives on
+-- the referee -- carries on from what did arrive.
+function M:onBattleEvent(msg)
+  if not self.mediated then return false end
+  if msg.battle ~= self.battleId then return false end
+  if msg.seq <= self.medSeq then return false end
+  if msg.seq > self.medSeq + 1 and self.medSeq > 0 then
+    self.medGaps = self.medGaps + 1
+  end
+  self.medSeq = msg.seq
+
+  -- A peer answered this turn. Applied now, not batched with narration: the
+  -- wait line has to drop their name the moment the hub accepts the choice,
+  -- and a `chose` queued until `turn` would land after the menu reopened.
+  if msg.t == "chose" then
+    local index = self:medSlotOf(msg)
+    if index then self:markActed(index) end
+    return true
+  end
+  if msg.t == "unchose" then
+    local index = self:medSlotOf(msg)
+    if index then self:unmarkActed(index) end
+    if index == self.mine then
+      self.pendingItem = nil
+      self.pendingItemSlot = nil
+    end
+    return true
+  end
+  -- Timeout / took-too-long lines: show immediately. Batched behind `turn`, a
+  -- client that left the choose menu the moment auto-pick landed (the player
+  -- who stalled) never saw the explanation before the next A-mash cleared the
+  -- queue -- which is exactly who the line is for.
+  if msg.t == "msg" and type(msg.text) == "string"
+     and (msg.text:find("ran out of time", 1, true)
+          or msg.text:find("took too long", 1, true)) then
+    self:say(msg.text)
+    return true
+  end
+  if msg.t == "item" and self:medSlotOf(msg) == self.mine then
+    self:confirmMediatedItem(msg.text, msg.amount)
+    -- Still narrate via medRows below.
+  end
+  if msg.t == "moves" then
+    local index = self:medSlotOf(msg)
+    if index == self.mine and type(msg.moves) == "table" then
+      self.medMoveList = msg.moves
+    end
+    return true
+  end
+  -- A send-out on our seat replaces the Transform/Mimic list: the new mon
+  -- fights with its uploaded moves until another `moves` event lands.
+  if (msg.t == "send" or msg.t == "switch") and self:medSlotOf(msg) == self.mine then
+    self.medMoveList = nil
+    self.medMustReplace = nil
+    if self.replacing then self.replacing = nil end
+  end
+
+  for _, row in ipairs(self:medRows(msg)) do
+    self.medPending[#self.medPending + 1] = row
+  end
+  if msg.t == "reconnect" then self.awaitingReconnect = false end
+  -- The two that close a batch. Everything between them is collected, for the
+  -- reason in this section's header: a menu taken away mid-decision is a turn
+  -- the player cannot answer.
+  if msg.t == "turn" then
+    self:medFlush()
+    -- Arm replace only after the faint/msg batch is queued: update() drains
+    -- `messages` before `replacing`, so pacing is faint line → picker → send.
+    if self.medMustReplace then
+      local seat = self.sim and self.sim:slot(self.mine)
+      local bench = seat and self:benchOf(seat) or {}
+      if #bench > 0 then
+        self.replacing = true
+        self.switchIndex = 1
+      else
+        -- Empty bench: do not open a dead picker; spectating / over owns this.
+        self.medMustReplace = nil
+        self.replacing = nil
+      end
+    end
+  elseif msg.t == "over" then
+    self.medMustReplace = nil
+    self.replacing = nil
+    self:medFlush()
+  end
+  return true
+end
+
+-- Debit inventory + bagSheet after the hub resolved our item choice.
+-- Vitamin save writeback only when amount==1 (hub applied Stat Exp).
+function M:confirmMediatedItem(itemId, amount)
+  local id = self.pendingItem
+  if not id then return false end
+  if itemId and itemId ~= id then return false end
+  local seatSlot = self.pendingItemSlot
+  self.pendingItem = nil
+  self.pendingItemSlot = nil
+  local Effects = need("BattleSim/Effects")
+  local effect = Effects.itemEffect(id)
+  if effect and effect.vitamin and amount == 1 then
+    local partyIndex = Mediated.vitaminPartyIndex(self.game, self:mySlot(), seatSlot)
+    Mediated.writebackVitamin(self.game, partyIndex, id)
+  end
+  if effect and effect.noConsume then
+    self.itemList = nil
+    return true
+  end
+  local inventory = self.game.save and self.game.save.inventory
+  if not (inventory and (inventory[id] or 0) > 0) then return false end
+  inventory[id] = inventory[id] - 1
+  if inventory[id] <= 0 then inventory[id] = nil end
+  if self.bagSheet and self.bagSheet[id] then
+    self.bagSheet[id] = self.bagSheet[id] - 1
+    if self.bagSheet[id] <= 0 then self.bagSheet[id] = nil end
+  end
+  -- No `owed`: hub already decremented; abandon must not refund.
+  self.itemList = nil
+  return true
+end
+
+function M:medFlush()
+  local rows = self.medPending
+  self.medPending = {}
+  -- Same boundary `applyTurn` draws for a host-sim `res`: the answers that
+  -- filled this batch belong to the turn that just closed. Left in place they
+  -- would keep the wait line naming people who already answered, for every
+  -- later turn of a refereed fight -- there is no `act` fan-out here to rewrite
+  -- `acted` the way the relayed path does. Cleared even when the batch is empty
+  -- so `acted` and the wait countdown do not stick across turn boundaries that
+  -- carried no narration rows (damage-only turns, reconnect waits, etc.).
+  self.acted = nil
+  self.waitShown = 0
+  -- Hub refused the pending item (never debited) or spend already landed.
+  self.pendingItem = nil
+  self.pendingItemSlot = nil
+  if #rows == 0 then return false end
+  self:playEvents(rows)
+  return true
+end
+
+-- How it ended, from the only party that knows.
+--
+-- **No mmo.result goes out for this fight** -- see the suppression in
+-- src/Coop.lua's `onBattleOver`. The four-client vote existed because no client
+-- in a host-simulated battle could be believed about its own win; the referee did
+-- every roll, and both hubs ignore a client's report about a battle they ran.
+--
+-- Read from this client's own id, because a 2-on-2 outcome names four players and
+-- two of them are allies -- there is no "the other side" to reason from. Turned
+-- back into a *side* so the ordinary `over` row does the rest: the victory
+-- theme, the unranked note, and the trainer's parting line all hang off it, and
+-- none of them should have a second implementation for a refereed fight.
+function M:onBattleOutcome(msg)
+  if not self.mediated then return false end
+  if msg.battle ~= self.battleId then return false end
+  if self.result then return false end
+
+  local mine = self:mySlot()
+  local mySide = mine and mine.side
+  local result = Mediated.resultForSelf(msg, self.selfId)
+  local winner = "draw"
+  if result == "win" then
+    winner = mySide or "draw"
+  elseif result == "loss" then
+    winner = (mySide == "a") and "b" or "a"
+  end
+
+  self.medPending[#self.medPending + 1] = { kind = "over", winner = winner }
+  local why = MED_REASONS[msg.reason]
+  if why then
+    self.medPending[#self.medPending + 1] = { kind = "msg", text = why }
+  end
+  self:medFlush()
+  return true
+end
+
+-- ------- one turn's intent
+
+-- A co-op action, as a mediated choice.
+--
+-- The three indices go from this screen's 1-based numbering to the wire's
+-- zero-based one, and `target` changes meaning as well as base: a co-op action
+-- names a slot 1..4 on this screen and a choice names a *field* slot. An
+-- unmapped target is sent as no target at all rather than as a guess -- the
+-- referee then aims at the first living foe, which is what a 1v1 does and is the
+-- only honest answer for a slot the roster never described.
+--
+-- `move` is an index into the live move list for this seat. The referee emits
+-- a `moves` event after Transform or Mimic; until then the uploaded party
+-- list is the one that counts.
+function M:sendMediatedChoice(action)
+  if not (self.mediated and self.battleId) then return false end
+  action = action or {}
+  local kind = action.kind or "move"
+  local fields
+  if kind == "switch" or kind == CoopSim.REPLACE then
+    fields = { action = "switch", slot = (action.index or 1) - 1 }
+  elseif kind == "item" then
+    -- `action.slot` is the co-op *field* seat (who is choosing). Party target
+    -- for heals/vitamins is optional `partySlot` (0-based wire) or omitted so
+    -- the referee applies to the active mon.
+    fields = { action = "item", item = action.item, move = action.move }
+    if action.partySlot ~= nil then fields.slot = action.partySlot end
+  elseif kind == "run" then
+    fields = { action = "run" }
+  else
+    fields = { action = "fight", move = (action.move or 1) - 1,
+               target = self:medFieldOf(action.target) }
+  end
+  return Mediated.submitChoice(self.transport, self.battleId, fields)
+end
+
+-- The hub link came back under a mediated co-op fight that is still open.
+-- Same message MediatedBattle sends for 1v1: both hubs already honour it.
+function M:onTransportReady()
+  if self.result or not self.mediated then return false end
+  if not (self.transport and self.battleId) then return false end
+  if self.reconnectSent then return false end
+  self.reconnectSent = true
+  self.awaitingReconnect = false
+  self.transport:send(Wire.BATTLE_RECONNECT, { battle = self.battleId })
+  return true
+end
+
+function M:notifyReconnect()
+  return self:onTransportReady()
+end
+
+function M:onTransportLost()
+  if self.result or not self.mediated then return end
+  if self.awaitingReconnect then return end
+  self.awaitingReconnect = true
+  self.reconnectSent = false
+  self:say("Connection lost.\nWaiting to reconnect...")
+end
+
 -- ------- drawing
 --
 -- Four monsters in 160x144, which the classic layout was never asked to hold.
@@ -3636,68 +5279,81 @@ function M:drawMessage()
   love.graphics.setColor(0, 0, 0, 1)
   local text = self:boxText()
   local y = 112
+  -- Cap at BOX_ROWS: say() pages longer copy, and a wait line is authored to
+  -- two rows. Drawing more would paint into the border.
+  local row = 0
   for line in tostring(text):gmatch("[^\n]+") do
-    Font.draw(line, 8, y)
+    Font.draw(tostring(line):sub(1, BOX_COLS), 8, y)
     y = y + 16
+    row = row + 1
+    if row >= BOX_ROWS then break end
   end
 end
 
--- A 2x2 list drawn in the message box, with the cursor on `index`. Every
--- picker here is one, so they look like one thing rather than four.
+-- A vertical list in the message box, cursor on `index`.
+--
+-- One name per row at full box width -- the old 2x2 clipped at nine glyphs and
+-- put SWITCH / ITEM party picks side by side (PIKACHU | PIDGEY), which both
+-- overflowed and read as a wrong choice set. Scrolls when the list is longer
+-- than the visible rows.
+--
+-- Rows are Gen 1's own 8px tile grid (104/112/120/128). The 10px spacing that
+-- shipped with the vertical rewrite put a fourth line at y=138, past the
+-- bottom border at 136 -- tops of glyphs bleeding through the box edge.
 function M:drawList(rows, index, title)
   local Font = engine.Font
   Font.drawBox(0, 12, 20, 6)
   love.graphics.setColor(0, 0, 0, 1)
-  if title then Font.draw(title, 8, 104) end
-  local shown = math.min(#rows, 4)
+  index = index or 1
+  local line = 8
+  local top = title and 112 or 104
+  local visible = title and 3 or 4
+  if title then Font.draw(tostring(title):sub(1, BOX_COLS), 8, 104) end
   local first = 1
-  if index > 4 then first = index - 3 end
+  if index > visible then first = index - visible + 1 end
+  local shown = math.min(#rows, visible)
   for i = 0, shown - 1 do
     local row = rows[first + i]
     if row then
-      local col = (i % 2) * 80
-      local line = math.floor(i / 2) * 16
-      Font.draw(tostring(row):sub(1, 9), 16 + col, 112 + line)
+      Font.draw(tostring(row):sub(1, BOX_COLS - 2), 16, top + i * line)
     end
   end
-  local at = index - first
-  Font.drawCode(0xED, 8 + (at % 2) * 80, 112 + math.floor(at / 2) * 16)
+  if #rows > 0 then
+    local cursor = index - first
+    if cursor < 0 then cursor = 0 end
+    if cursor >= visible then cursor = visible - 1 end
+    Font.drawCode(0xED, 8, top + cursor * line)
+  end
 end
 
--- ------- the same box, one name per row
---
--- A vertical variant of `drawList`, and a separate function rather than a mode
--- on it: the move menu and the command box are 2x2 because four short labels in
--- two columns is what fits, and nothing about the target picker should be able
--- to move them. Here the rows are *names* -- up to NAME_MAX of them, and a
--- second column would cut them in half exactly where two similar foes stop
--- being distinguishable.
---
--- Two rows are visible below the title, which is what the six-tile box has room
--- for; a longer list scrolls under the cursor rather than being clipped, so
--- this still works the day a field has more than two foes on a side.
+-- Target picker: same vertical list, titled. Kept as its own call so "Attack
+-- who?" stays a distinct question from SWITCH / ITEM.
 function M:drawColumn(rows, index, title)
-  local Font = engine.Font
-  Font.drawBox(0, 12, 20, 6)
-  love.graphics.setColor(0, 0, 0, 1)
-  if title then Font.draw(title, 8, 104) end
-  local shown = math.min(#rows, 2)
-  local first = 1
-  if index > 2 then first = index - 1 end
-  for i = 0, shown - 1 do
-    local row = rows[first + i]
-    if row then
-      -- Sixteen glyphs of room: the cursor takes the first column of the box
-      -- and the name starts at the second, so a full NAME_MAX name has six
-      -- columns to spare rather than the nine-glyph cut a 2x2 row has to make.
-      Font.draw(tostring(row):sub(1, 16), 16, 112 + i * 16)
-    end
-  end
-  Font.drawCode(0xED, 8, 112 + (index - first) * 16)
+  return self:drawList(rows, index, title)
 end
 
+-- Classic battle menu: full-width FIGHT / PKMN / ITEM / RUN. SWITCH shows
+-- as the engine's two-tile PKMN mark so it does not overlap FIGHT.
 function M:drawCommand()
-  self:drawList(M.COMMANDS, self.commandIndex or 1)
+  local Font = engine.Font
+  Font.drawBox(M.CMD_BOX_TX, 12, M.CMD_BOX_TW, 6)
+  love.graphics.setColor(0, 0, 0, 1)
+  for i, command in ipairs(M.COMMANDS) do
+    local row = math.floor((i - 1) / 2)
+    local col = (i - 1) % 2
+    local x = col == 0 and M.CMD_COL0_X or M.CMD_COL1_X
+    local y = 112 + row * 16
+    if command == "SWITCH" then
+      Font.drawCode(0xE1, x, y)
+      Font.drawCode(0xE2, x + 8, y)
+    else
+      Font.draw(command, x, y)
+    end
+  end
+  local i = self.commandIndex or 1
+  local row = math.floor((i - 1) / 2)
+  local col = (i - 1) % 2
+  Font.drawCode(0xED, col == 0 and M.CMD_CUR0_X or M.CMD_CUR1_X, 112 + row * 16)
 end
 
 -- The post-faint picker. Titled, because it is not the same question as the
@@ -3737,47 +5393,116 @@ function M:drawItem()
   self:drawList(rows, self.itemIndex or 1)
 end
 
+function M:drawItemParty()
+  local rows = {}
+  for _, row in ipairs(self:itemPartyRows()) do
+    rows[#rows + 1] = row.label .. (row.fainted and " *" or "")
+  end
+  self:drawList(rows, self.switchIndex or 1)
+end
+
+function M:drawItemMove()
+  local seat = self:mySlot()
+  local party = (seat and seat.party) or {}
+  local mon = party[self.itemPartyIndex or (seat and seat.active) or 1]
+  local moves = (mon and mon.moves) or {}
+  local rows = {}
+  for _, move in ipairs(moves) do
+    rows[#rows + 1] = tostring(move.id or "-")
+  end
+  self:drawList(rows, self.moveIndex or 1)
+end
+
 function M:drawText(text)
   local Font = engine.Font
   Font.drawBox(0, 12, 20, 6)
   love.graphics.setColor(0, 0, 0, 1)
   local y = 112
-  for line in tostring(text):gmatch("[^\n]+") do
+  local row = 0
+  for _, line in ipairs(wrapBoxLines(text, BOX_COLS)) do
     Font.draw(line, 8, y)
     y = y + 16
+    row = row + 1
+    if row >= BOX_ROWS then break end
   end
+end
+
+-- A move name that must share the bottom strip with TYPE/PP.
+--
+-- Fits at native size when it can; otherwise scales on X only so a twelve-
+-- glyph classic name (QUICK ATTACK) still reads inside the ten-tile pane
+-- instead of painting through the TYPE column. Y stays 1:1 so row spacing
+-- matches the cursor.
+local function drawMoveName(Font, text, x, y, maxW)
+  drawFittedText(Font, text, x, y, maxW)
 end
 
 function M:drawMoves()
   local Font = engine.Font
-  Font.drawBox(0, 12, 20, 6)
+  local TypeChart = engine.TypeChart
+  -- One bottom strip: moves on the left, TYPE/PP on the right. The classic
+  -- MoveSelectionMenu's TYPE box at tile row 8 sits on top of the ally pair
+  -- (y≈58) in a 2-on-2 layout and painted TYPE/NORMAL through the sprites.
+  Font.drawBox(0, 12, 13, 6)
+  Font.drawBox(12, 12, 8, 6)
+  if Font.BORDER then
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.rectangle("fill", 96, 96, 8, 8)
+    Font.drawCode(Font.BORDER.h, 96, 96)
+  end
   love.graphics.setColor(0, 0, 0, 1)
   local moves = self:liveMoves()
   -- Nothing left anywhere: say what is actually going to happen rather than
   -- listing four moves that cannot be used. The turn still resolves -- the sim
   -- substitutes STRUGGLE whatever was chosen -- so this is the menu telling
   -- the truth about it.
-  if not self.sim:hasPP(self:mySlot() and self:mySlot().battler) then
+  if not self:hasLivePP() then
     Font.draw("No moves left!", 16, 112)
     Font.draw("STRUGGLE", 16, 128)
     Font.drawCode(0xED, 8, 128)
     return
   end
+  local index = self.moveIndex or 1
+  local nameX, nameW = M.MOVE_NAME_X, M.MOVE_NAME_MAX_W
+  -- Clip to the move pane so a scale quirk cannot still ink the TYPE column.
+  local scx, scy, scw, sch
+  local clipped = love.graphics.getScissor ~= nil
+  if clipped then
+    scx, scy, scw, sch = love.graphics.getScissor()
+    love.graphics.setScissor(8, 104, 88, 32)
+  end
   for i, moveInst in ipairs(moves) do
     local def = (self.game.data.moves or {})[moveInst.id]
     local label = (def and def.name) or moveInst.id or "-"
-    local col = ((i - 1) % 2) * 80
-    local row = math.floor((i - 1) / 2) * 16
-    Font.draw(label:sub(1, 9), 16 + col, 112 + row)
+    drawMoveName(Font, label, nameX, M.MOVE_NAME_Y(i), nameW)
   end
-  local col = ((self.moveIndex - 1) % 2) * 80
-  local row = math.floor((self.moveIndex - 1) / 2) * 16
-  Font.drawCode(0xED, 8 + col, 112 + row)
-  -- PP on the move the cursor is on, because a move with none left is the one
-  -- thing about it a player has to know before pressing A.
-  local pick = moves[self.moveIndex]
+  if clipped then
+    if scx then love.graphics.setScissor(scx, scy, scw, sch)
+    else love.graphics.setScissor() end
+  end
+  if #moves > 0 then
+    Font.drawCode(0xED, 8, M.MOVE_NAME_Y(index))
+  end
+  local pick = moves[index]
   if pick then
-    Font.draw(("PP %2d"):format(pick.pp or 0), 112, 104)
+    local def = (self.game.data.moves or {})[pick.id]
+    if def then
+      Font.draw("TYPE/", 104, M.MOVE_TYPE_LABEL_Y)
+      local typeName = ""
+      if def.type then
+        if TypeChart and TypeChart.displayName then
+          typeName = TypeChart.displayName(def.type) or tostring(def.type)
+        else
+          typeName = tostring(def.type)
+        end
+      end
+      Font.draw(tostring(typeName):sub(1, 6), 104, M.MOVE_TYPE_NAME_Y)
+      local maxPP = (def.pp or 0)
+        + (pick.ppUps or 0) * math.floor((def.pp or 0) / 5)
+      Font.draw(("%2d/%2d"):format(pick.pp or 0, maxPP), 104, M.MOVE_PP_Y)
+    else
+      Font.draw(("PP %2d"):format(pick.pp or 0), 104, M.MOVE_PP_Y)
+    end
   end
 end
 
@@ -3793,29 +5518,14 @@ end
 -- box has. The two things being told apart are the names, and this is the
 -- layout that lets them be.
 function M:drawTarget()
-  local Font = engine.Font
   local targets = self.sim:targetsFor(self:mySlot())
   local rows = {}
   for _, entry in ipairs(targets) do
     rows[#rows + 1] = (entry.battler and entry.battler.name) or "?"
   end
   self:drawColumn(rows, self.targetIndex or 1, "Attack who?")
-  local pick = targets[self.targetIndex]
-  -- ...and the cursor also lands on the monster itself, because picking one of
-  -- two identical foes off a name alone is a guess.
-  --
-  -- Placed against the pic's drawn origin rather than its raw `SLOT_POS`
-  -- (M:picOriginFor): every hoverable target is on the far pair, which is
-  -- exactly the pair FOE_SCALE moves, so the raw position put the cursor beside
-  -- where the monster *would* have stood at full size.
-  if pick then
-    local battler = self:shownBattlerAt(pick.index)
-    local x, y = self:picOriginFor(pick.index, battler and battler.sprite)
-    if x then
-      love.graphics.setColor(0, 0, 0, 1)
-      Font.drawCode(0xED, x + 10, y + 28)
-    end
-  end
+  -- Focus arrow lives on the side strip only; a second cursor on the stage
+  -- pic duplicated it once the strip shipped.
 end
 
 -- Drawn behind a guard, and this is not belt-and-braces.
@@ -3842,13 +5552,8 @@ function M:drawSafe()
   love.graphics.setColor(1, 1, 1, 1)
   love.graphics.rectangle("fill", 0, 0, 160, 144)
   self:drawField()
-  -- The trainer stands where their monsters will, until the fight starts --
-  -- the original's ScrollTrainerPic moment, held rather than animated.
-  if self:showingTrainer() then
-    love.graphics.setColor(1, 1, 1, 1)
-    local ok = pcall(love.graphics.draw, self.trainerPic, 96, 4)
-    if not ok then self.trainerPic = nil end
-  end
+  -- Trainer is painted inside drawField (under the panels) while the opening
+  -- lines run; drawing it here again put the sprite over ally readouts.
   self:drawAnim()
   if self.replacing then
     self:drawReplace()
@@ -3867,6 +5572,10 @@ function M:drawSafe()
     self:drawSwitch()
   elseif self.phase == "item" then
     self:drawItem()
+  elseif self.phase == "item_party" then
+    self:drawItemParty()
+  elseif self.phase == "item_move" then
+    self:drawItemMove()
   else
     self:drawMessage()
   end

@@ -5,10 +5,17 @@
  *
  * This is what server/hub.js used to be, minus the socket. It owns who is
  * connected, where they last said they were, and which two players are
- * currently paired for a trade or a battle. It never simulates anything:
- * the trade state machine and the lockstep battle run inside the two game
- * clients on the engine's own link code, and mmo.relay payloads pass
- * through unread.
+ * currently paired for a trade or a battle.
+ *
+ * It simulates exactly one thing, and only since PROTOCOL 10: a **mediated
+ * battle**. A trade is still the engine's own state machine running inside
+ * the two clients with mmo.relay payloads passing through unread, but a fight
+ * this hub brokered is resolved here -- see the "mediated battles" section
+ * below -- because a battle decided by one of the two players is a battle
+ * decided by whichever of them modified their copy first. Every roll, the
+ * turn order and the sole win/loss verdict live in lib/battle/Turn.js; this
+ * file owns the plumbing around it: who is in which fight, whose party is
+ * still missing, and where the events go.
  *
  * **No sockets appear anywhere below.** Everything talks to *peer handles*
  * -- any object answering send(msg), close() and carrying a remoteAddress
@@ -29,12 +36,16 @@
 
 const {
   cleanText, cleanId, cleanSpriteId, cleanMapId, cleanInt, cleanHex,
-  cleanProfile, cleanOutcome, cleanPoints, cleanToken, payloadOk, FACINGS,
+  cleanProfile, cleanOutcome, cleanPoints, cleanPlayerId, payloadOk, FACINGS,
   KINDS, SCOPES, NAME_MAX, MESSAGE_MAX, MOTD_MAX, LOCAL_RADIUS,
   cleanBattleKey, cleanCoopReason, cleanLabel, cleanPartyEvent, PARTY_MAX,
+  cleanBattleRuleset, cleanBattleParty, cleanBattleChoice, cleanBattleReconnect,
+  BATTLE_MOVE_MAX,
 } = require('./sanitize');
+const { Turn } = require('./battle');
+const Effects = require('./battle/Effects');
 const {
-  Board, mintToken, keyOf, RANK_START, RANK_TOP, RANK_REPORT_GRACE_MS,
+  Board, keyOf, RANK_START, RANK_TOP, RANK_REPORT_GRACE_MS,
   RANK_QUERY_GATE_MS,
 } = require('./rank');
 const { createLog, safe } = require('./log');
@@ -68,16 +79,33 @@ const DEFAULT_SPRITE = 'SPRITE_RED';
 // ordinary quiet route. 9 is mmo.request_cancel -- the asker withdrawing a
 // trade/battle request before it is answered -- and a protocol-8 hub would
 // clear the asker's local wait while still holding pendingTo, so the other
-// player could accept into a session the asker thought they had left. The
-// rule every bump follows is unchanged: bump whenever a client can send
-// something a hub silently ignores. 10 is friends -- mmo.friend_ask,
-// mmo.friend_answer and mmo.friend_remove -- and it is the sharpest case yet:
-// a protocol-9 hub answers all three with silence, and this is the one feature
-// whose answer may legitimately arrive later (the hub holds an ask for a
-// player who is offline), so "nothing has happened yet" is an ordinary state
-// and a player would have no way at all to tell it from a hub that cannot do
-// this. Kept in step with Config.PROTOCOL on the mod side.
-const PROTOCOL = 10;
+// player could accept into a session the asker thought they had left. 10 is the
+// mediated battle -- mmo.battle_ruleset, _party, _ready, _choice, _event,
+// _outcome and _reconnect, the seven types a fight uses once an intermediator
+// owns the simulation rather than one of the two clients -- and it is the
+// clearest bump of the list: a protocol-9 hub has never heard any of them, so a
+// client would upload its party and its choices into silence and sit at a
+// battle screen that never opens, while the hub it is talking to is still
+// waiting for the two-client mmo.result vote that this path replaces. 11 is the
+// mediated battle event `chose` -- a seat filed this turn's answer, so peers
+// can keep the wait line accurate without an `act` fan-out -- and `unchose`,
+// which clears that mark when a player cancels a choice they already submitted.
+// A protocol-10 intermediator never emits either kind, so a newer client's
+// wait line would name players who have already answered, or keep naming players
+// who walked their answer back, and neither failure looks like lag -- both read
+// as "still choosing". 12 adds `moves` for mid-fight move-list sync after
+// Transform or Mimic. 13–15 extend ruleset / fight surface / bag proofs; 16 is
+// persistent playerId seating (claim tickets gone). 17 is friends --
+// mmo.friend_ask, mmo.friend_answer and mmo.friend_remove -- which landed as
+// PROTOCOL 10 on the parallel main line while this branch claimed 10–16 for
+// mediation; a protocol-16 intermediator answers all three with silence, and
+// this is the one feature whose answer may legitimately arrive later (the hub
+// holds an ask for a player who is offline), so "nothing has happened yet" is
+// an ordinary state and a player would have no way at all to tell it from a
+// hub that cannot do this. The rule every bump follows is unchanged: bump
+// whenever a client can send something a hub silently ignores. Kept in step
+// with Config.PROTOCOL on the mod side.
+const PROTOCOL = 17;
 
 // How long a four-way PARTY BATTLE ask waits for its three answers. Mirrors
 // Config.COOP_ASK_TIMEOUT: every one of the four is looking at a box right
@@ -97,6 +125,37 @@ const COOP_BATTLE_MAX_MS = 3600 * 1000;
 // A SHA-256 response is 64 hex characters; the slack is for a future digest,
 // not for an unbounded field.
 const RESPONSE_MAX = 128;
+
+/*
+ * The two clocks a mediated fight runs on, in **seconds** -- which is the unit
+ * lib/battle/Turn.js counts in, and the reason every call into it goes through
+ * battleSeconds() below rather than handing it a millisecond timestamp that
+ * would make a sixty-second grace expire in sixty milliseconds.
+ *
+ * Mirrors Config.BATTLE_CHOICE_TIMEOUT, Config.BATTLE_RECONNECT_GRACE and
+ * Config.BATTLE_RESOLVE_TIMEOUT.
+ * Named here rather than imported from Turn's own defaults because they are a
+ * *hub policy* -- the numbers a host could one day want to tune -- while
+ * Turn's are the floor it falls back to when a caller says nothing.
+ */
+const BATTLE_CHOICE_TIMEOUT = 60;
+const BATTLE_RECONNECT_GRACE = 60;
+const BATTLE_RESOLVE_TIMEOUT = 30;
+
+// How many fighters one side of a co-op field holds, which is Config.COOP_SIDE
+// and is written as PARTY_MAX for that file's reason: two parties meet, so the
+// day a party grows the side grows with it rather than a literal 2 having to be
+// remembered here. It is also how many synthetic seats a coop_npc trainer takes.
+const COOP_SIDE = PARTY_MAX;
+
+// The seed range an authority client may propose, mirrored from sanitize's
+// SEED_MAX so that a seed this hub deals itself is one a client's own
+// sanitiser would have accepted from it.
+const BATTLE_SEED_MAX = 1073741824;
+
+// Milliseconds are what this hub's clock speaks and seconds are what the turn
+// machine does. One conversion, in one place.
+const battleSeconds = (ms) => Math.floor(ms / 1000);
 // Smallest gap between two character changes from one player. The chat
 // gate's window (500ms), for a sharper reason than scrollback: an avatar
 // bakes its sheet when it spawns, so every other client in the game despawns
@@ -118,6 +177,13 @@ const SPRITE_GATE_MS = 500;
 const FRIEND_HOLD_MS = 7 * 24 * 3600 * 1000;
 const FRIEND_HOLD_PER_NAME = 8;
 const FRIEND_HOLD_MAX = 1024;
+
+// Trainer-name fold for friends (mirrors Wire.nameKey). Rank.keyOf is playerId
+// only under PROTOCOL 16+; friendships are still keyed by the name you play as.
+function nameKey(name) {
+  const cleaned = cleanText(name, NAME_MAX);
+  return cleaned ? cleaned.toUpperCase() : null;
+}
 
 // The name the hub itself speaks under. A message of the day and an
 // operator's broadcast both arrive as ordinary chat with this name on them
@@ -208,18 +274,22 @@ const handlers = Object.create(null);
 handlers['mmo.hello'] = (relay, client, msg) => {
   if (client.ready) return;
   if (cleanInt(msg.proto, 0, 9999) !== relay.protocol) {
-    return relay.refuse(client, `This hub speaks protocol ${relay.protocol}; ` +
-      `your mod speaks ${shortValue(msg.proto)}.`);
+    // Same sentence as src/Hub.lua: a client must not tell which hosting path
+    // refused it. Twin-checked by tests/fixtures/hub_protocol_parity.json.
+    return relay.refuse(client, `This game speaks protocol ${relay.protocol}; yours `
+      + `speaks ${shortValue(msg.proto)}.`);
   }
   const name = cleanText(msg.name, NAME_MAX);
-  if (!name) return relay.refuse(client, 'That trainer name cannot be used here.');
+  if (!name) return relay.refuse(client, "That trainer name can't be used here.");
+  const playerId = cleanPlayerId(msg.playerId);
+  if (!playerId) {
+    return relay.refuse(client, "That player id can't be used here.");
+  }
 
   // ...and one name is spoken for. The hub's own lines carry no sender id, so
   // a player wearing this name could put words in the hub's mouth and nothing
-  // on the receiving side could tell the two apart. Matched on the board's key
-  // rule, so HUB, hub and Hub are all the same name here, as they are
-  // everywhere else.
-  if (keyOf(name) === HUB_NAME) {
+  // on the receiving side could tell the two apart.
+  if (name.toUpperCase() === HUB_NAME) {
     return relay.refuse(client, 'That name belongs to the hub itself; ' +
       'pick another trainer name and connect again.');
   }
@@ -236,9 +306,7 @@ handlers['mmo.hello'] = (relay, client, msg) => {
   // anyone's roster, and it is not admitted until the challenge is answered.
   client.hello = {
     name,
-    // the ticket that says this name is theirs, if they have been here
-    // before; absent on a first visit and on a copy that lost its save
-    token: cleanToken(msg.rankToken),
+    playerId,
     sprite: cleanSpriteId(msg.sprite) || DEFAULT_SPRITE,
     profile: cleanProfile(msg.profile),
     map: cleanMapId(msg.map),
@@ -376,7 +444,7 @@ handlers['mmo.sprite'] = (relay, client, msg) => {
   // Last, because it is the one call here that reaches state this handler
   // does not own, and a leaderboard portrait is not worth anyone's
   // announcement.
-  if (client.ranked) relay.board.seen(client.name, client.sprite);
+  if (client.ranked) relay.board.seen(client.id, client.name, client.sprite);
 };
 
 handlers['mmo.chat'] = (relay, client, msg) => {
@@ -395,7 +463,7 @@ handlers['mmo.chat'] = (relay, client, msg) => {
   const payload = { from: client.id, name: client.name, scope, text };
 
   if (scope === 'private') {
-    const target = relay.clients.get(cleanId(msg.to));
+    const target = relay.get(cleanId(msg.to));
     if (target && target.ready) relay.send(target, 'mmo.chat', payload);
     return;
   }
@@ -430,7 +498,7 @@ handlers['mmo.chat'] = (relay, client, msg) => {
 handlers['mmo.request'] = (relay, client, msg) => {
   if (!client.ready || client.sessionId) return;
   const kind = KINDS.has(msg.kind) ? msg.kind : null;
-  const target = relay.clients.get(cleanId(msg.to));
+  const target = relay.get(cleanId(msg.to));
   if (!kind || !target || !target.ready || target.id === client.id) return;
 
   if (target.sessionId) {
@@ -443,7 +511,7 @@ handlers['mmo.request'] = (relay, client, msg) => {
 handlers['mmo.respond'] = (relay, client, msg) => {
   if (!client.ready) return;
   const kind = KINDS.has(msg.kind) ? msg.kind : null;
-  const asker = relay.clients.get(cleanId(msg.to));
+  const asker = relay.get(cleanId(msg.to));
   if (!kind || !asker || !asker.ready) return;
 
   // only the player who was actually asked can answer, and only while the
@@ -488,7 +556,7 @@ handlers['mmo.request_cancel'] = (relay, client) => {
 // busy stops you battling, not travelling together.
 handlers['mmo.party_invite'] = (relay, client, msg) => {
   if (!client.ready || client.partyId) return;
-  const target = relay.clients.get(cleanId(msg.to));
+  const target = relay.get(cleanId(msg.to));
   if (!target || !target.ready || target.id === client.id) return;
   // Answered here rather than forwarded: the asker learns at once that this
   // player is taken, instead of waiting on a prompt nobody will ever see.
@@ -503,7 +571,7 @@ handlers['mmo.party_invite'] = (relay, client, msg) => {
 
 handlers['mmo.party_respond'] = (relay, client, msg) => {
   if (!client.ready) return;
-  const asker = relay.clients.get(cleanId(msg.to));
+  const asker = relay.get(cleanId(msg.to));
   if (!asker || !asker.ready) return;
 
   // only the player who was actually asked can answer, and only while the
@@ -605,8 +673,8 @@ handlers['mmo.friend_ask'] = (relay, client, msg) => {
   const target = relay.clients.get(cleanId(msg.to));
   if (!target || !target.ready || target.id === client.id) return;
 
-  const mine = keyOf(client.name);
-  const theirs = keyOf(target.name);
+  const mine = nameKey(client.name);
+  const theirs = nameKey(target.name);
   // Two connections wearing one name on a hub that never claimed it. There is
   // no friendship to form between a name and itself, and the hold table is
   // keyed by name -- so an ask filed here would be one this player could
@@ -627,8 +695,8 @@ handlers['mmo.friend_ask'] = (relay, client, msg) => {
 
 handlers['mmo.friend_answer'] = (relay, client, msg) => {
   if (!client.ready) return;
-  const mine = keyOf(client.name);
-  const asker = keyOf(cleanText(msg.toName, NAME_MAX));
+  const mine = nameKey(client.name);
+  const asker = nameKey(msg.toName);
   if (!mine || !asker) return;
 
   // The gate: only somebody actually holding an ask from this name may answer
@@ -643,8 +711,8 @@ handlers['mmo.friend_answer'] = (relay, client, msg) => {
 
 handlers['mmo.friend_remove'] = (relay, client, msg) => {
   if (!client.ready) return;
-  const mine = keyOf(client.name);
-  const theirs = keyOf(cleanText(msg.toName, NAME_MAX));
+  const mine = nameKey(client.name);
+  const theirs = nameKey(msg.toName);
   if (!mine || !theirs || mine === theirs) return;
 
   // Anything still outstanding between the two of them goes with it, in both
@@ -689,7 +757,23 @@ handlers['mmo.coop_wait'] = (relay, client, msg) => {
 
 handlers['mmo.coop_cancel'] = (relay, client, msg) => {
   if (!client.ready) return;
-  relay.clearCoopOffer(client, cleanCoopReason(msg && msg.reason) || 'left');
+  const reason = cleanCoopReason(msg && msg.reason) || 'left';
+  // Own standing offer withdrawn (STOP / ALONE / timeout).
+  if (client.coopOffer) {
+    relay.clearCoopOffer(client, reason);
+    return;
+  }
+  // Partner declined our invite: clear the waiter's offer and tell them so
+  // they can go in alone. Only `no` takes this path.
+  if (reason === 'no') {
+    const partner = relay.partnerOf(client);
+    if (partner && partner.coopOffer) {
+      partner.coopOffer = null;
+      relay.send(partner, 'mmo.coop_decline', {
+        name: client.name, reason: 'no',
+      });
+    }
+  }
 };
 
 // "Yes, I'll join you." The one message that ends a wait.
@@ -700,13 +784,18 @@ handlers['mmo.coop_cancel'] = (relay, client, msg) => {
 // partner out of wherever they are into a battle they never walked up to.
 handlers['mmo.coop_join'] = (relay, client, msg) => {
   if (!client.ready || !client.partyId) return;
-  const host = relay.clients.get(cleanId(msg.to));
+  const host = relay.get(cleanId(msg.to));
   if (!host || !host.ready || host.id === client.id) return;
   if (host.partyId !== client.partyId) return;
 
   const battle = cleanBattleKey(msg.battle);
   const offer = host.coopOffer;
-  if (!offer || !battle || offer.battle !== battle) return;
+  if (!offer || !battle || offer.battle !== battle) {
+    // Too late: the waiter already went in alone (or walked off). Tell the
+    // joiner so a yes that raced a withdraw is not silence.
+    relay.send(client, 'mmo.coop_offer_end', { reason: 'alone' });
+    return;
+  }
 
   // Taken off the table before either side is told, so a second join racing
   // this one finds nothing to accept rather than starting the fight twice.
@@ -722,10 +811,24 @@ handlers['mmo.coop_join'] = (relay, client, msg) => {
   // The pair get a fan-out group of their own, on the same footing as a
   // four-player one: from here on the battle traffic does not care which of the
   // two ways it was agreed.
-  const battleId = String(relay.nextCoopAsk++);
-  relay.openCoopBattle(battleId, [host.id, client.id]);
+  // `coop_npc`, and it is the flow that decides it rather than a count: this
+  // pair agreed by one of them standing in front of a trainer, so the other
+  // side of the field is that trainer -- an opponent with a party and no
+  // connection. The four-way path below is the only one that makes a
+  // `coop_pvp`, because it is the only one where both sides are players.
+  // "c", for startSession's reason: sessions and co-op battles share the
+  // `battles` map and are numbered by two counters that know nothing of each
+  // other.
+  const battleId = `c${relay.nextCoopAsk++}`;
+  relay.openCoopBattle(battleId, [host.id, client.id],
+    { mode: 'coop_npc', hostId: host.id });
 
-  relay.send(host, 'mmo.coop_joined', { id: client.id, name: client.name });
+  // `plan` is the hub's mediated battle id (`c*`). Without it the waiting
+  // host's CoopBattle has no battleId, uploadMediated is a no-op, and the
+  // fight silently stays on host CoopSim while the joiner alone holds `c*`.
+  // `id` remains the joiner (who joined), matching what clients already read.
+  relay.send(host, 'mmo.coop_joined',
+    { id: client.id, name: client.name, plan: battleId });
   // `host` names the client that simulates: the player who was already standing
   // at the fight, since they are the one guaranteed to have walked into the
   // trainer -- the joiner usually has too, but a join taken from the ACTIONS
@@ -740,6 +843,27 @@ handlers['mmo.coop_join'] = (relay, client, msg) => {
 // that can be judged, and payloadOk is what judges it.
 handlers['mmo.coop_relay'] = (relay, client, msg) => {
   if (!client.ready || !client.coopBattleId) return;
+
+  /*
+   * ...unless the hub is running this one, in which case the same cut
+   * mmo.relay gets applies and for the same reason.
+   *
+   * **The cut engages when the sim does, not when the group opens**, and that
+   * is the one place the co-op path deliberately differs from the 1v1. A group
+   * exists from the moment two players agree; the fight only becomes mediated
+   * when a ruleset and every party have arrived. Cutting at the group would
+   * take the legacy CoopSim path away from a client that has not been rewritten
+   * to upload one yet (that is Wave 3's I3c), and would take it away *silently*
+   * -- a partner watching a battle screen that never advances. So the two paths
+   * are allowed to coexist for exactly as long as it takes one fight to become
+   * mediated, and no longer: the moment an intermediator owns the rolls, a
+   * second set of them fanned out from a client is the desync it looks like.
+   */
+  const mediated = relay.battles.get(client.coopBattleId);
+  if (mediated && mediated.sim) {
+    return noteDrop(relay, client,
+      'this co-op battle is mediated -- the battle_* types are the way in');
+  }
 
   if (!payloadOk(msg.payload)) {
     return noteDrop(relay, client, 'the co-op payload is not a shape we forward');
@@ -760,12 +884,22 @@ handlers['mmo.coop_relay'] = (relay, client, msg) => {
 // group with nothing left to carry.
 handlers['mmo.coop_leave'] = (relay, client) => {
   if (!client.ready || !client.coopBattleId) return;
+  // ...except while the hub is refereeing it, where one player walking out is
+  // a disconnection and not a verdict. The three left keep fighting, and the
+  // leaver's grace decides whether they come back or forfeit -- ending the
+  // whole thing on their say-so would hand any of the four a way to void a
+  // battle they were losing.
+  const record = relay.battles.get(client.coopBattleId);
+  if (record && record.sim) {
+    if (record.sim.disconnect(client.id)) relay.flushBattle(record);
+    return;
+  }
   relay.closeCoopBattle(client.coopBattleId);
 };
 
 handlers['mmo.coop_challenge'] = (relay, client, msg) => {
   if (!client.ready || !client.partyId || client.coopAskId) return;
-  const target = relay.clients.get(cleanId(msg.to));
+  const target = relay.get(cleanId(msg.to));
   if (!target || !target.ready || target.id === client.id) return;
   // No party, or *our* party: a party cannot challenge itself. The client
   // refuses both with a sentence of its own; this is the hub declining to take
@@ -777,7 +911,7 @@ handlers['mmo.coop_challenge'] = (relay, client, msg) => {
   const theirs = relay.partyMembers(target.partyId);
   if (mine.length !== PARTY_MAX || theirs.length !== PARTY_MAX) return;
 
-  const id = String(relay.nextCoopAsk++);
+  const id = `c${relay.nextCoopAsk++}`;
   const sideA = mine.map((m) => m.id);
   const sideB = theirs.map((m) => m.id);
   const everyone = sideA.concat(sideB);
@@ -843,9 +977,137 @@ function noteDrop(relay, client, reason) {
   }
 }
 
+// ------- mediated battles
+//
+// The four things a client says during a fight this hub is running. What comes
+// back -- mmo.battle_ready, mmo.battle_event, mmo.battle_outcome -- is sent
+// from the Relay methods further down, because it is the sim's word rather
+// than an answer to any one message.
+//
+// Every one of them finds its battle through `client.battleId` rather than
+// through the id on the message. The id is still checked where the sanitiser
+// carries one, but it is checked *against* the connection's own fight: a
+// client naming somebody else's battle is naming a fight it is not in, and the
+// alternative -- trusting the field -- would let a spectator file choices into
+// a match they were never at.
+
+// The fight this connection is in, when the hub is the one running it. Null
+// for a player who is not fighting, and for a co-op group that is still on the
+// legacy client-simulated path.
+function mediatedOf(relay, client) {
+  if (!client.ready || !client.battleId) return null;
+  return relay.battles.get(client.battleId) || null;
+}
+
+/*
+ * The ephemeral ruleset: the type chart this one match runs under.
+ *
+ * A `seed` still parses, because the field has ridden this message since the
+ * lockstep days, but tryStartSim does not read it -- see the note there for why
+ * the RNG is the intermediator's alone.
+ *
+ * The host's to upload and nobody else's -- the asker in a 1v1, the player who
+ * was already standing at the trainer in a co-op fight. Not because a guest's
+ * chart would be worse, but because two charts is a fight with no answer to
+ * "which", and picking the second to arrive would let either side re-roll the
+ * matchups by sending one late.
+ */
+handlers['mmo.battle_ruleset'] = (relay, client, msg) => {
+  const record = mediatedOf(relay, client);
+  if (!record || record.sim) return;
+  if (client.id !== record.hostId) return;
+
+  const ruleset = cleanBattleRuleset(msg);
+  if (!ruleset) {
+    return noteDrop(relay, client, 'the ruleset is not a shape we can fight under');
+  }
+  record.ruleset = ruleset;
+  relay.tryStartSim(record);
+};
+
+// One combatant's team. Stored under the seat it belongs to -- normally the
+// sender's own -- and the fight opens on the message that completes the set.
+handlers['mmo.battle_party'] = (relay, client, msg) => {
+  const record = mediatedOf(relay, client);
+  if (!record || record.sim) return;
+
+  const party = cleanBattleParty(msg);
+  if (!party) {
+    return noteDrop(relay, client, 'the party is not a shape we can fight with');
+  }
+  // The battle it names has to be the one this connection is in. A party for
+  // another fight is not a party that was mis-addressed, it is a sheet its
+  // sender believes is being used somewhere else.
+  if (party.battle !== record.id) return;
+
+  if (!relay.fillBattleParty(record, client, party)) return;
+  relay.tryStartSim(record);
+};
+
+// One turn's intent. Who it is from is the connection it arrived on and never
+// a field, so there is nothing here for a modified client to spend somebody
+// else's turn with.
+handlers['mmo.battle_choice'] = (relay, client, msg) => {
+  const record = mediatedOf(relay, client);
+  if (!record || !record.sim) return;
+
+  const choice = cleanBattleChoice(msg);
+  if (!choice || choice.battle !== record.id) return;
+  // Item choices are proved against the bag uploaded with the party
+  // (PROTOCOL 15). A missing stack costs the message and nothing else —
+  // same silence as a refused choice — so the turn clock keeps running.
+  // The stack is *held* until the turn resolves; cancel clears the hold.
+  if (choice.action === 'item'
+      && !relay.canSpendBag(record, client.id, choice.item)) {
+    return;
+  }
+  if (!record.sim.submitChoice(client.id, choice)) return;
+  if (choice.action === 'item') {
+    relay.holdBag(record, client.id, choice.item);
+  } else if (choice.action === 'cancel') {
+    relay.clearBagHold(record, client.id);
+  }
+  relay.flushBattle(record);
+};
+
+/*
+ * Back inside the grace.
+ *
+ * What this covers is a client that left the *field* -- backed out to the
+ * overworld, dropped its session, lost the battle screen to a crash it
+ * recovered from -- and still holds the connection it was fighting on. A peer
+ * whose socket actually died cannot come back through here at all until they
+ * greet again with the same playerId: identity on this hub is the persistent
+ * id, so a returning process is rekeyed to it on admit and may reattach to a
+ * fight still inside reconnect grace.
+ */
+handlers['mmo.battle_reconnect'] = (relay, client, msg) => {
+  const record = mediatedOf(relay, client);
+  if (!record || !record.sim) return;
+  const rejoin = cleanBattleReconnect(msg);
+  if (!rejoin || rejoin.battle !== record.id) return;
+  record.sim.reconnect(client.id);
+  relay.flushBattle(record);
+};
+
 handlers['mmo.relay'] = (relay, client, msg) => {
   if (!client.ready || !client.sessionId) {
     return noteDrop(relay, client, 'sender is not in a session');
+  }
+  /*
+   * PROTOCOL 10's hard cut, and it is a cut rather than a preference.
+   *
+   * A mediated battle exists for every battle session this hub brokers, so
+   * from here on the engine's lockstep vocabulary has nowhere to go: the two
+   * clients would agree a seed between themselves and fight a second,
+   * invisible battle beside the one the hub is resolving, and the first
+   * disagreement would be a player watching their own screen contradict the
+   * outcome they are about to be sent. Trade sessions are untouched -- there
+   * is no trade sim here and there is not going to be one.
+   */
+  if (relay.battles.has(client.sessionId)) {
+    return noteDrop(relay, client,
+      'this battle is mediated -- the battle_* types are the way in');
   }
   const peer = relay.peerOf(client);
   if (!peer) return noteDrop(relay, client, 'the session has no other side');
@@ -874,6 +1136,24 @@ handlers['mmo.result'] = (relay, client, msg) => {
   const id = cleanId(msg.session);
   const outcome = cleanOutcome(msg.outcome);
   if (!id || !outcome) return;
+
+  /*
+   * A fight the hub itself resolved has no use for a vote.
+   *
+   * mmo.result exists because neither peer in a relayed battle could be
+   * believed about its own win, so two agreeing claims stood in for a witness.
+   * Here there *is* a witness -- it did every roll -- and settleMediated pays
+   * out from its verdict alone. A client's report about a mediated fight is
+   * ignored rather than weighed: honest ones are redundant and dishonest ones
+   * are the whole thing this path removes.
+   *
+   * Gated on the sim rather than on the record, because a record exists for
+   * every battle session from the moment it opens. Until a ruleset and both
+   * parties arrive, the two clients are still on the legacy lockstep path and
+   * their vote is still the only account of it there is.
+   */
+  const mediated = relay.battles.get(id);
+  if (mediated && mediated.sim) return;
 
   // A co-op battle files under its own paperwork: four players report one
   // battle rather than two.
@@ -988,6 +1268,19 @@ class Relay {
     // two, so it is kept apart from `matches` instead of folded in.
     this.coopMatches = new Map();
     /*
+     * The fights this hub is *running*: id -> the record openMediatedBattle
+     * builds. Keyed by the id the fight was already known under -- a session id
+     * for a 1v1, a co-op group id for a 2v2 -- rather than by an id of its own,
+     * because every message about a battle already carries one of those and a
+     * second numbering would be a mapping to keep in step for no gain.
+     *
+     * A record exists from the moment the fight is agreed and holds nothing but
+     * a roster until the ruleset and the parties arrive; `sim` is what says the
+     * hub has taken it over, and it is the flag every hard cut in this file is
+     * gated on.
+     */
+    this.battles = new Map();
+    /*
      * Friend traffic this hub is holding for somebody who is not here:
      * nameKey -> [{ kind, name, accept, at }], oldest first.
      *
@@ -1017,10 +1310,10 @@ class Relay {
    * misdelivered box, never a friendship: the receiving client answers under
    * its own name, and the answer is matched back against the hold by name.
    */
-  byName(nameKey) {
-    if (!nameKey) return null;
+  byName(key) {
+    if (!key) return null;
     for (const client of this.clients.values()) {
-      if (client.ready && keyOf(client.name) === nameKey) return client;
+      if (client.ready && nameKey(client.name) === key) return client;
     }
     return null;
   }
@@ -1058,19 +1351,19 @@ class Relay {
    * one player ignoring eight people, and the newest is the one still worth
    * asking.
    */
-  holdFriend(nameKey, hold) {
-    if (!nameKey) return false;
+  holdFriend(key, hold) {
+    if (!key) return false;
     this.sweepFriendHolds();
-    let holds = this.friendHolds.get(nameKey);
+    let holds = this.friendHolds.get(key);
     if (!holds) {
       if (this.friendHeld >= FRIEND_HOLD_MAX) return false;
       holds = [];
-      this.friendHolds.set(nameKey, holds);
+      this.friendHolds.set(key, holds);
     }
 
-    const fromKey = keyOf(hold.name);
+    const fromKey = nameKey(hold.name);
     const already = holds.findIndex(
-      (held) => held.kind === hold.kind && keyOf(held.name) === fromKey);
+      (held) => held.kind === hold.kind && nameKey(held.name) === fromKey);
     if (already >= 0) {
       holds.splice(already, 1);
       this.friendHeld -= 1;
@@ -1080,7 +1373,7 @@ class Relay {
       this.friendHeld -= 1;
     }
     if (this.friendHeld >= FRIEND_HOLD_MAX) {
-      if (!holds.length) this.friendHolds.delete(nameKey);
+      if (!holds.length) this.friendHolds.delete(key);
       return false;
     }
 
@@ -1097,21 +1390,21 @@ class Relay {
    * ask was actually addressed to is holding it, so a client answering a
    * question nobody asked it finds nothing here and is dropped.
    */
-  takeFriendHold(nameKey, kind, fromKey) {
-    const holds = nameKey ? this.friendHolds.get(nameKey) : null;
+  takeFriendHold(key, kind, fromKey) {
+    const holds = key ? this.friendHolds.get(key) : null;
     if (!holds) return null;
     const index = holds.findIndex(
-      (held) => held.kind === kind && keyOf(held.name) === fromKey);
+      (held) => held.kind === kind && nameKey(held.name) === fromKey);
     if (index < 0) return null;
     const [held] = holds.splice(index, 1);
     this.friendHeld -= 1;
-    if (!holds.length) this.friendHolds.delete(nameKey);
+    if (!holds.length) this.friendHolds.delete(key);
     return held;
   }
 
   /** Send one notification now, or hold it until that name is next seen. */
-  deliverFriend(nameKey, kind, type, payload, hold) {
-    const target = this.byName(nameKey);
+  deliverFriend(key, kind, type, payload, hold) {
+    const target = this.byName(key);
     if (target) {
       this.send(target, type, payload);
       // An ask stays held even when it was delivered: the player it reached
@@ -1120,7 +1413,7 @@ class Relay {
       // is spent on delivery.
       if (kind !== 'ask') return true;
     }
-    return this.holdFriend(nameKey, hold);
+    return this.holdFriend(key, hold);
   }
 
   /*
@@ -1137,7 +1430,7 @@ class Relay {
    * is news that has now been delivered.
    */
   flushFriendHolds(client) {
-    const key = keyOf(client.name);
+    const key = nameKey(client.name);
     if (!key || !this.friendHolds.has(key)) return 0;
     this.sweepFriendHolds();
     const holds = this.friendHolds.get(key);
@@ -1149,7 +1442,7 @@ class Relay {
         // No `from` id: the asker may not be here, and inventing one would
         // give the receiving client an id to answer to that means somebody
         // else's connection. The name is what an answer travels by anyway.
-        const asker = this.byName(keyOf(hold.name));
+        const asker = this.byName(nameKey(hold.name));
         this.send(client, 'mmo.friend_ask',
           { from: asker ? asker.id : undefined, name: hold.name });
         kept.push(hold);
@@ -1178,14 +1471,23 @@ class Relay {
 
   isFull() { return this.players >= this.maxPlayers; }
 
-  has(id) { return this.clients.has(id); }
+  has(id) { return this.get(id) != null; }
 
-  get(id) { return this.clients.get(id) || null; }
+  get(id) {
+    return this.clients.get(id)
+      || (this.byEphemeral && this.byEphemeral.get(id))
+      || null;
+  }
 
   clientIds() { return Array.from(this.clients.keys()); }
 
+  // Via get(), not clients.get(): after PROTOCOL 16 rekey the socket layer
+  // still holds the ephemeral accept-id, and that id lives only in
+  // byEphemeral. Looking in clients alone left every admitted player
+  // looking ungreeted, so limits.sweep killed them with handshake_timeout
+  // ten seconds later -- exactly the Node-hub LOVE mass-drop.
   greeted(id) {
-    const client = this.clients.get(id);
+    const client = this.get(id);
     return Boolean(client && client.ready);
   }
 
@@ -1248,23 +1550,82 @@ class Relay {
   }
 
   /*
-   * Is somebody else on this hub *ranked* under this name right now?
-   *
-   * Board.claim will hand an unproved, unscored claim to whoever is
-   * connecting -- which is the whole fix for a lost ticket -- and this is the
-   * one thing the board cannot see: that the holder is sitting right here,
-   * still playing under it. Without this, a second player typing the same
-   * name (two copies that never changed the default one is enough) takes the
-   * claim, and the first player's next settled win is recorded against the
-   * taker's ticket. Matched on the board's own key, so it is the same
-   * "same name" the claim is about.
+   * Is somebody else on this hub connected under this playerId right now?
+   * Duplicate live connections with the same id are refused at admit.
    */
-  nameInUse(client) {
-    const key = keyOf(client.name);
+  idInUse(client, playerId) {
+    const key = keyOf(playerId);
     if (!key) return false;
     for (const other of this.clients.values()) {
-      if (other.id === client.id || !other.ready || !other.ranked) continue;
-      if (keyOf(other.name) === key) return true;
+      if (other.id === client.id || !other.ready) continue;
+      if (keyOf(other.id) === key) return true;
+    }
+    return false;
+  }
+
+  /*
+   * Replace the ephemeral connection id with the persistent playerId. Every
+   * reference the hub may already hold is rewritten so sessions and fights
+   * stay coherent after admit.
+   */
+  rekeyClient(client, playerId) {
+    const oldId = client.id;
+    if (oldId === playerId) return;
+    this.clients.delete(oldId);
+    client.ephemeralId = oldId;
+    client.id = playerId;
+    this.clients.set(playerId, client);
+    if (!this.byEphemeral) this.byEphemeral = new Map();
+    this.byEphemeral.set(oldId, client);
+
+    for (const other of this.clients.values()) {
+      if (other === client) continue;
+      if (other.pendingTo === oldId) other.pendingTo = playerId;
+      if (other.partyPendingTo === oldId) other.partyPendingTo = playerId;
+    }
+    for (const session of this.sessions.values()) {
+      if (session.a === oldId) session.a = playerId;
+      if (session.b === oldId) session.b = playerId;
+    }
+    for (const match of this.matches.values()) {
+      if (match.a === oldId) match.a = playerId;
+      if (match.b === oldId) match.b = playerId;
+    }
+    for (const record of this.battles.values()) {
+      record.memberIds = record.memberIds.map((id) => (id === oldId ? playerId : id));
+      record.sides.a = record.sides.a.map((id) => (id === oldId ? playerId : id));
+      record.sides.b = record.sides.b.map((id) => (id === oldId ? playerId : id));
+      if (record.hostId === oldId) record.hostId = playerId;
+    }
+    for (const coop of this.coopMatches.values()) {
+      coop.everyone = coop.everyone.map((id) => (id === oldId ? playerId : id));
+      if (coop.reports.has(oldId)) {
+        coop.reports.set(playerId, coop.reports.get(oldId));
+        coop.reports.delete(oldId);
+      }
+      for (const side of ['a', 'b']) {
+        coop[side] = coop[side].map((member) => {
+          if (member.id === oldId) return Object.assign({}, member, { id: playerId });
+          return member;
+        });
+      }
+    }
+  }
+
+  /*
+   * A player reconnected with the same playerId while a mediated fight is
+   * still inside reconnect grace. Reattach them so choices and events flow
+   * again without opening a second record.
+   */
+  reattachBattle(client) {
+    for (const record of this.battles.values()) {
+      if (!record.sim || record.settled) continue;
+      if (!record.memberIds.includes(client.id)) continue;
+      if (record.sim.reconnect(client.id)) {
+        client.battleId = record.id;
+        this.flushBattle(record);
+        return true;
+      }
     }
     return false;
   }
@@ -1290,6 +1651,9 @@ class Relay {
       pendingTo: null,
       partyId: null,
       partyPendingTo: null,
+      // The mediated fight this connection is in, if any. Holds a session id
+      // for a 1v1 and a co-op group id for a 2v2 -- see `battles`.
+      battleId: null,
       // -Infinity, not 0: an injected clock that starts at zero would
       // otherwise gate the very first message a player ever sends.
       lastChat: -Infinity,
@@ -1302,8 +1666,8 @@ class Relay {
       // else's screen, so it is rationed like the other things that are
       lastFriendAsk: -Infinity,
       points: RANK_START,
-      // until a hello says otherwise, nobody is scored: `ranked` is decided
-      // in admit(), where the name is claimed
+      // until hello says otherwise, nobody is scored: `ranked` is always true
+      // once admitted under PROTOCOL 16
       ranked: false,
       hello: null,
       nonce: null,
@@ -1336,6 +1700,14 @@ class Relay {
     }
 
     const hello = client.hello || {};
+    const playerId = hello.playerId;
+    if (!playerId || !keyOf(playerId)) {
+      return this.refuse(client, "That player id can't be used here.");
+    }
+    if (this.idInUse(client, playerId)) {
+      return this.refuse(client, "You're already connected.");
+    }
+
     client.name = hello.name;
     client.sprite = hello.sprite || DEFAULT_SPRITE;
     client.profile = hello.profile || null;
@@ -1345,107 +1717,28 @@ class Relay {
     client.facing = hello.facing || 'down';
     client.hello = null;
     client.nonce = null;
-    client.ready = true;
-    /*
-     * Who is behind the name.
-     *
-     * A first visit claims it and is handed the ticket to come back with; a
-     * returning player presents theirs and gets their rating; anybody else
-     * typing that name plays as normal and scores nothing. `minted` goes out
-     * in the welcome and is then forgotten -- only the digest is kept, so
-     * this is the one moment the token exists on the hub.
-     *
-     * The claim as it stood before is read first, because the verdict alone
-     * does not say what changed: 'claimed' is a first mint on a free name and
-     * a transfer of a provisional one, and those read differently in a log.
-     */
-    const before = this.board.get(client.name);
-    const wasClaimed = Boolean(before && before.tokenHash);
-    const wasConfirmed = Boolean(before && before.confirmed);
-    const minted = mintToken();
-    const verdict = this.board.claim(client.name, hello.token, minted,
-      this.nameInUse(client));
-    client.ranked = verdict !== 'impostor';
-    if (verdict === 'impostor') {
-      this.log.info(`${safe(client.name)} (${client.id}) joined without the ` +
-        'claim token for that name, so their battles will not be scored');
-    } else if (verdict === 'claimed' && wasClaimed) {
-      // Not an impostor: the claim on this name was never proved, the name
-      // has never scored, and nobody was connected under it, so it follows
-      // the player who is here now. Worth a line, because it is the one path
-      // where a name changes hands.
-      this.log.info(`${safe(client.name)} (${client.id}) took over an ` +
-        'unconfirmed claim on that name -- nothing had scored under it, so a ' +
-        'fresh ticket goes out with the welcome');
-    }
-    /*
-     * A claim changed *in a way the file can hold*, so the file that outlives
-     * this process should say so before the first battle does. That is one
-     * case and not three: a ticket proved for the first time, which is what
-     * stops the claim being transferable and what Board.export() starts
-     * writing the row for.
-     *
-     * A mint and a transfer are deliberately not flushed. Both leave a row
-     * that is unproved, unplayed and at the starting rating, which export()
-     * drops on purpose -- so the write would produce a file byte-identical to
-     * the one already on disk, once per hello, on a hub anybody can dial in a
-     * loop. The claim they made still holds for this session, and the moment
-     * it is worth persisting -- proved, or scored -- it is written.
-     */
-    if (verdict === 'owner' && !wasConfirmed) {
-      this.noteRankChange(null);
-    }
 
-    // The rating this name already carries on this hub, and the character it
-    // is wearing today -- so the leaderboard can draw a portrait for a
-    // player who is offline, and a returning player is not silently zeroed.
-    // An unranked player shows as zero rather than wearing the rating of the
-    // name they typed: it is not theirs. Gated on `ranked` for that same
-    // reason: a player who does not own the name has no business writing to
-    // its row, portrait included -- and this row outlives the session.
-    if (client.ranked) this.board.seen(client.name, client.sprite);
-    client.points = client.ranked ? this.board.points(client.name) : RANK_START;
+    this.rekeyClient(client, playerId);
+    client.ready = true;
+    client.ranked = true;
+
+    this.board.seen(client.id, client.name, client.sprite);
+    client.points = this.board.points(client.id);
+    this.reattachBattle(client);
     this.players += 1;
 
     const players = [];
     for (const other of this.clients.values()) {
       if (other.ready && other.id !== client.id) players.push(presenceOf(other));
     }
-    // Read now, not at construction: an operator who edits the message and
-    // sends a HUP expects the next player through the door to see it.
     const motd = cleanText(this.motd, MOTD_MAX);
 
-    // `points` is this player's own rating, spelled out rather than left to
-    // be fished out of the roster: the roster a client keeps deliberately
-    // has no entry for itself, so the welcome is the only place your own
-    // score can arrive from.
     this.send(client, 'mmo.welcome', {
       id: client.id,
       players,
       points: client.points,
-      // Sent on the visit that claimed the name, and only then -- including
-      // the visit that took over a claim nobody had proved, which is a claim
-      // like any other and needs its ticket. A confirmed name never re-sends
-      // one: a hub that handed the ticket to whoever asked would not be
-      // checking anything.
-      rankToken: verdict === 'claimed' ? minted : undefined,
-      // Said out loud rather than left to be inferred from a zero: "your
-      // battles will not score here" is something a player can act on.
       ranked: client.ranked,
-      // The hub's greeting, when it has one to give. Absent rather than empty
-      // when it does not, and absent is also what every older client sees:
-      // this rides on the welcome instead of arriving as a new message type
-      // precisely so a build that has never heard of a MOTD reads past the
-      // key and joins exactly as it always did. Nothing new travels the other
-      // way, which is why the protocol number does not move for it.
       motd: motd || undefined,
-      // Told to the operator about themselves, and to nobody else. Present
-      // only when true, the same way motd and rankToken are: a build that has
-      // never heard of it reads past the key, and an ordinary player's welcome
-      // is byte-identical to the one 0.8.0 sent. Hub->client only, derived
-      // from the credential server-side -- nothing a client sends can set it
-      // -- and nothing new travels the other way, which is why the protocol
-      // number does not move for it.
       admin: client.admin || undefined,
     });
     this.broadcast('mmo.join', { player: presenceOf(client) }, client.id);
@@ -1461,7 +1754,7 @@ class Relay {
   }
 
   drop(id) {
-    const client = this.clients.get(id);
+    const client = this.get(id);
     if (!client) return false;
     this.endSession(client, 'peer_left');
     // Before endParty, deliberately: clearCoopOffer finds the partner *through*
@@ -1469,25 +1762,36 @@ class Relay {
     // leave the partner holding an offer from somebody who has left the game.
     this.clearCoopOffer(client, 'gone');
     this.clearCoopAsks(client, 'gone');
-    // A four-way that loses a player cannot finish, and the group goes with
-    // them: the three left would otherwise relay into an id that includes
-    // somebody who is not there.
-    if (client.coopBattleId) this.closeCoopBattle(client.coopBattleId);
+    /*
+     * A fight the hub is running does not end because one of its players
+     * vanished: it pauses, on the reconnect grace, and forfeits when that runs
+     * out. leaveBattle answers true only in that case, and only then is the
+     * group left standing -- everything else (a fight still collecting parties,
+     * a co-op group on the legacy path) closes exactly as it always did, so the
+     * three players left are never relaying into an id that includes somebody
+     * who is not there.
+     */
+    const fighting = this.leaveBattle(client);
+    if (client.coopBattleId && !fighting) this.closeCoopBattle(client.coopBattleId);
     // A party outlives a trade but not a connection: the other member is told
     // while this one is still in the table, so the presence that goes out
     // with it is the one where they are no longer in a party.
     this.endParty(client, 'peer_left');
-    this.clients.delete(id);
+    const playerId = client.id;
+    this.clients.delete(playerId);
+    if (client.ephemeralId && this.byEphemeral) {
+      this.byEphemeral.delete(client.ephemeralId);
+    }
     if (client.ready) this.players -= 1;
     // an outstanding request pointed at a player who just left would leave
     // the asker waiting forever for an answer nobody can give
     for (const other of this.clients.values()) {
-      if (other.pendingTo === id) other.pendingTo = null;
-      if (other.partyPendingTo === id) other.partyPendingTo = null;
+      if (other.pendingTo === playerId) other.pendingTo = null;
+      if (other.partyPendingTo === playerId) other.partyPendingTo = null;
     }
     if (client.ready) {
-      this.broadcast('mmo.part', { id }, id);
-      this.log.info(`- ${safe(client.name)} (${id}) -- ${this.players} online`);
+      this.broadcast('mmo.part', { id: playerId }, playerId);
+      this.log.info(`- ${safe(client.name)} (${playerId}) -- ${this.players} online`);
       this.noteRosterChange();
     }
     return true;
@@ -1505,6 +1809,8 @@ class Relay {
     this.clients.clear();
     this.sessions.clear();
     this.parties.clear();
+    // A fight in progress does not survive the process that was refereeing it.
+    this.battles.clear();
     this.players = 0;
     // The board survives a shutdown -- it is the hub's record, not the
     // connection's, and it is what lib/server.js writes to disk. The
@@ -1663,9 +1969,18 @@ class Relay {
     }
   }
 
-  // Open a co-op battle's fan-out group. One id however the battle was agreed,
-  // so mmo.coop_relay has one routing rule rather than two to keep in step.
-  openCoopBattle(id, memberIds) {
+  /*
+   * Open a co-op battle's fan-out group. One id however the battle was agreed,
+   * so mmo.coop_relay has one routing rule rather than two to keep in step.
+   *
+   * `plan` is what the mediated record is built from -- the mode, who the
+   * authority is, and which side each member is on. It is passed by the caller
+   * rather than worked out here because only the caller knows: the four-way
+   * knows its two parties from the ask it just settled, and the pair knows
+   * which of them walked up to the trainer. When it is absent the shape is
+   * inferred, and openMediatedBattle says how.
+   */
+  openCoopBattle(id, memberIds, plan) {
     const members = [];
     for (const memberId of memberIds || []) {
       const member = this.clients.get(memberId);
@@ -1683,6 +1998,11 @@ class Relay {
       }
     }
     this.coopBattles.set(id, { members, startedAt: now });
+    // ...and the hub's own record of the fight, on the same id. Built even
+    // though nothing may ever arrive for it: a client that never uploads a
+    // ruleset simply leaves `sim` null, which is exactly how the legacy path
+    // stays open underneath this one.
+    this.openMediatedBattle(id, Object.assign({ memberIds: members }, plan || {}));
     return id;
   }
 
@@ -1696,6 +2016,12 @@ class Relay {
       const member = this.clients.get(memberId);
       if (member && member.coopBattleId === id) member.coopBattleId = null;
     }
+    // The group and the fight are the same event seen from two sides, so they
+    // end together. A sim still holding a field here is one whose players have
+    // all gone (the max-age sweep, a member dropping mid-setup); the fight is
+    // called off rather than left refereeing an empty room.
+    const record = this.battles.get(id);
+    if (record) this.abortMediatedBattle(record, 'gone');
     return true;
   }
 
@@ -1741,8 +2067,13 @@ class Relay {
 
     // The membership outlives the ask, because the battle traffic is about to
     // need it: mmo.coop_relay goes to exactly these four and nobody else, and
-    // the hub is the only party that knows who they are.
-    this.openCoopBattle(id, ask.everyone);
+    // the hub is the only party that knows who they are. The two sides go with
+    // it -- this is the moment they are known, and a mediated field cannot be
+    // assembled from a flat list of four.
+    this.openCoopBattle(id, ask.everyone, {
+      mode: 'coop_pvp', hostId: ask.asker,
+      sides: { a: ask.sideA.slice(), b: ask.sideB.slice() },
+    });
 
     // **Two sides, not two pairs.** A four-way is scored as one team match --
     // each player against the other pair's combined strength -- because that
@@ -1838,19 +2169,17 @@ class Relay {
       if (!member.ranked) return null;
     }
 
-    const names = (members) => members.map((member) => member.name);
+    const names = (members) => members.map((member) => member.id);
     const settled = this.board.recordTeam(names(winners), names(losers),
                                           this.now());
     if (!settled) return null;
 
-    // Everyone's new number goes out, winners and losers alike: four ratings
-    // moved, and a hub that announced two would leave two screens stale.
-    const byName = new Map();
-    for (const row of settled.winners) byName.set(row.name, row.points);
-    for (const row of settled.losers) byName.set(row.name, row.points);
+    const byKey = new Map();
+    for (const row of settled.winners) byKey.set(row.key, row.points);
+    for (const row of settled.losers) byKey.set(row.key, row.points);
     for (const member of [...winners, ...losers]) {
-      if (byName.has(member.name)) {
-        this.publishPoints(member.id, byName.get(member.name));
+      if (byKey.has(member.id)) {
+        this.publishPoints(member.id, byKey.get(member.id));
       }
     }
     return settled;
@@ -1908,9 +2237,8 @@ class Relay {
   /*
    * Remove everybody playing under a name.
    *
-   * Everybody, not somebody: a name is unique only among *ranked* players
-   * (see nameInUse), so two copies that never changed the default one can
-   * both be here as RED and an operator kicking RED means both. The count and
+   * Everybody, not somebody: two copies with the same trainer name can both
+   * be here as RED and an operator kicking RED means both. The count and
    * the names actually removed go back so the caller can say what happened
    * rather than assuming one.
    *
@@ -1919,16 +2247,18 @@ class Relay {
    * exactly the one that would quietly survive the kick.
    */
   kickByName(name, reason) {
-    const key = keyOf(cleanText(name, NAME_MAX));
+    const target = cleanText(name, NAME_MAX);
     const out = { kicked: 0, names: [] };
-    if (!key) return out;
+    if (!target) return out;
+    const targetKey = target.toUpperCase();
     // Capped like a chat line, and for the same reason: it is drawn in the
     // client's error box, which was never sized for an essay.
     const message = cleanText(reason, MESSAGE_MAX) || KICK_REASON;
 
     const targets = [];
     for (const client of this.clients.values()) {
-      if (client.ready && keyOf(client.name) === key) targets.push(client);
+      if (client.ready && client.name
+          && client.name.toUpperCase() === targetKey) targets.push(client);
     }
     for (const client of targets) {
       // The same three steps a refused hello gets -- tell them why, close the
@@ -1983,6 +2313,10 @@ class Relay {
   endSession(client, reason) {
     const id = client.sessionId;
     if (!id) return;
+    // Leaving the session is leaving the field. A mediated fight starts its
+    // reconnect grace here rather than ending on the spot, so a player who
+    // backed out by accident has the same window a dropped socket gets.
+    this.leaveBattle(client);
     const session = this.sessions.get(id);
     this.sessions.delete(id);
     client.sessionId = null;
@@ -2015,7 +2349,18 @@ class Relay {
   }
 
   startSession(a, b, kind) {
-    const id = String(this.nextSession++);
+    /*
+     * Prefixed, because two counters mint into one `battles` map.
+     *
+     * A session and a co-op battle are numbered independently and both open a
+     * mediated record under their own id, so the plain "1" the second of them
+     * minted used to land on the first one's record -- a co-op fight inheriting
+     * a 1v1's parties, or a battle_choice from one filed into the other. The
+     * letter keeps the two id spaces apart, and it is a letter rather than a
+     * colon because these ids cross the wire and cleanId refuses anything
+     * outside [\w-].
+     */
+    const id = `s${this.nextSession++}`;
     this.sessions.set(id, { a: a.id, b: b.id, kind });
     a.sessionId = id;
     b.sessionId = id;
@@ -2027,16 +2372,7 @@ class Relay {
     if (kind === 'battle') {
       this.matches.set(id, {
         a: a.id, b: b.id, aName: a.name, bName: b.name,
-        // taken now, from the players in the battle: whether a result may
-        // touch the board is a fact about who they are, not about what they
-        // report afterwards
         aRanked: a.ranked !== false, bRanked: b.ranked !== false,
-        // ...and *which* claim each name was, for the same reason. A claim can
-        // move between the first turn and the last report -- a hub restart
-        // aside, that is exactly what an unproved claim is allowed to do --
-        // and paying a settled result into a claim that has since changed
-        // hands would put one player's win on another player's name.
-        aHash: this.claimHash(a.name), bHash: this.claimHash(b.name),
         reports: new Map(), startedAt: this.now(), endedAt: null,
       });
       this.sweepMatches();
@@ -2054,19 +2390,589 @@ class Relay {
     this.broadcast('mmo.move', presenceOf(b), b.id);
     this.noteRosterChange();
     this.log.info(`session ${id}: ${safe(a.name)} <-> ${safe(b.name)} (${kind})`);
+
+    // A battle session is also a mediated fight from the moment it opens.
+    // Trade is untouched: there is no trade sim here.
+    if (kind === 'battle') {
+      this.openMediatedBattle(id, {
+        mode: '1v1',
+        hostId: a.id,
+        memberIds: [a.id, b.id],
+        sides: { a: [a.id], b: [b.id] },
+      });
+    }
+  }
+
+  // ------- mediated battles (Turn.js plumbing)
+
+  /*
+   * Open the hub's record of a fight. The sim is still null: a ruleset and
+   * every required party have to arrive before tryStartSim takes it over.
+   *
+   * `npcIds` is set for coop_npc (two synthetic seats) and wild (one seat).
+   * Coop_npc: two players meet two monsters. Wild: one player meets one wild
+   * mon on a hub NPC seat (protocol-only — no overworld divert). The host
+   * uploads the NPC team as side "b".
+   *
+   * They are ids a client could in principle type, and that is safe rather than
+   * sloppy: client ids are minted as decimal counters, these carry a letter and
+   * the battle's own id, and nothing addresses a seat by name anyway -- a choice
+   * is attributed to the connection it arrived on. It has to be spellable,
+   * because tryStartSim advertises them and cleanId refuses a colon.
+   */
+  openMediatedBattle(id, plan) {
+    const p = plan || {};
+    const memberIds = [];
+    for (const memberId of p.memberIds || []) {
+      if (typeof memberId === 'string' && memberIds.indexOf(memberId) < 0) {
+        memberIds.push(memberId);
+      }
+    }
+    if (!memberIds.length) return null;
+
+    let mode = p.mode;
+    if (mode !== '1v1' && mode !== 'coop_npc' && mode !== 'coop_pvp'
+        && mode !== 'wild') {
+      mode = memberIds.length <= 2 ? '1v1' : 'coop_pvp';
+    }
+
+    const hostId = p.hostId || memberIds[0];
+    let npcIds = null;
+    if (mode === 'coop_npc') {
+      npcIds = [];
+      for (let i = 0; i < COOP_SIDE; i += 1) {
+        npcIds.push(`n${id}${String.fromCharCode(97 + i)}`);
+      }
+    } else if (mode === 'wild') {
+      // One human, one synthetic wild seat. Protocol-only: nothing here
+      // diverts an overworld encounter onto this path.
+      npcIds = [`n${id}a`];
+    }
+
+    let sides = p.sides;
+    if (!sides || typeof sides !== 'object') {
+      if (mode === '1v1') {
+        sides = { a: [memberIds[0]], b: [memberIds[1] || memberIds[0]] };
+      } else if (mode === 'coop_npc' || mode === 'wild') {
+        sides = { a: memberIds.slice(), b: npcIds.slice() };
+      } else {
+        const mid = Math.ceil(memberIds.length / 2);
+        sides = { a: memberIds.slice(0, mid), b: memberIds.slice(mid) };
+      }
+    }
+
+    const record = {
+      id,
+      mode,
+      hostId,
+      memberIds,
+      sides: {
+        a: (sides.a || []).slice(),
+        b: (sides.b || []).slice(),
+      },
+      npcIds,
+      ruleset: null,
+      parties: new Map(),
+      bags: new Map(),
+      bagHold: Object.create(null),
+      sim: null,
+      settled: false,
+    };
+    this.battles.set(id, record);
+    for (const memberId of memberIds) {
+      const member = this.clients.get(memberId);
+      if (member) member.battleId = id;
+    }
+    return record;
+  }
+
+  // Is this seat one of the trainer's rather than a player's?
+  isNpcSeat(record, seat) {
+    return !!(record && record.npcIds && record.npcIds.includes(seat));
+  }
+
+  /*
+   * Which seat a party fills. Normally the sender's own id. For coop_npc the
+   * host may also upload the trainer party under side "b", which is dealt across
+   * the synthetic npc seats rather than displacing their own team -- so this
+   * answers the *first* of them, and fillBattleParty below does the dealing.
+   */
+  battleSeat(record, client, party) {
+    if (!record.memberIds.includes(client.id)) return null;
+    if (record.mode === 'coop_npc' && party.side === 'b'
+        && client.id === record.hostId && record.npcIds) {
+      return record.npcIds[0];
+    }
+    if (record.mode === 'wild' && party.side === 'b'
+        && client.id === record.hostId && record.npcIds) {
+      return record.npcIds[0];
+    }
+    return client.id;
+  }
+
+  /*
+   * Store an uploaded party against the seat or seats it fills.
+   *
+   * The trainer's team arrives as one list, because that is what it is on the
+   * host's screen -- CoopBattle's `npcMons` re-interleaves the two ownerless
+   * slots back into the order the trainer would send them out. Two seats fight
+   * it, so it is dealt back out here, alternately, which is the inverse of that
+   * interleave: the deal Coop.lua made when it built the field is the deal the
+   * field gets back.
+   *
+   * A trainer with fewer monsters than seats leaves one empty, and an empty seat
+   * is a field Turn.attempt refuses -- so the spare seat is given up instead and
+   * the fight opens as the 2-on-1 the trainer actually brought. Refusing would
+   * mean a lone-monster trainer could not be fought at all.
+   */
+  fillBattleParty(record, client, party) {
+    const seat = this.battleSeat(record, client, party);
+    if (!seat) return false;
+    if (!this.isNpcSeat(record, seat)) {
+      record.parties.set(seat, party);
+      // Bag always keys off the connection: a host uploading side b for an NPC
+      // never reaches this branch, so their own bag is not wiped by that upload.
+      if (!record.bags) record.bags = new Map();
+      record.bags.set(client.id, this.bagMap(party.bag));
+      return true;
+    }
+
+    const dealt = record.npcIds.map(() => []);
+    party.mons.forEach((mon, index) => {
+      dealt[index % record.npcIds.length].push(mon);
+    });
+
+    const kept = [];
+    const dropped = new Set();
+    record.npcIds.forEach((npcId, at) => {
+      if (dealt[at].length) {
+        kept.push(npcId);
+        record.parties.set(npcId, {
+          battle: party.battle,
+          side: party.side,
+          badges: party.badges,
+          mons: dealt[at],
+        });
+      } else {
+        dropped.add(npcId);
+        record.parties.delete(npcId);
+      }
+    });
+    record.npcIds = kept;
+    // Filtered rather than replaced: the side is the caller's description of the
+    // field and may hold more than these seats one day, so only the seats
+    // actually given up are taken out of it.
+    record.sides.b = record.sides.b.filter((s) => !dropped.has(s));
+    return true;
+  }
+
+  // List of `{id, count}` → lookup map. Empty / null → empty map (no items).
+  bagMap(entries) {
+    const map = Object.create(null);
+    for (const entry of entries || []) {
+      if (entry && typeof entry.id === 'string'
+          && typeof entry.count === 'number' && entry.count > 0) {
+        map[entry.id] = entry.count;
+      }
+    }
+    return map;
+  }
+
+  // Shallow copy of an id→count bag map (null when empty / absent).
+  cloneBagMap(src) {
+    if (!src || typeof src !== 'object') return null;
+    const out = Object.create(null);
+    let any = false;
+    for (const id of Object.keys(src)) {
+      const count = src[id];
+      if (typeof id === 'string' && typeof count === 'number' && count > 0) {
+        out[id] = count;
+        any = true;
+      }
+    }
+    return any ? out : null;
+  }
+
+  canSpendBag(record, clientId, itemId) {
+    if (typeof itemId !== 'string') return false;
+    const bag = record && record.bags && record.bags.get(clientId);
+    if (!bag) return false;
+    return (bag[itemId] || 0) >= 1;
+  }
+
+  spendBag(record, clientId, itemId) {
+    if (!this.canSpendBag(record, clientId, itemId)) return false;
+    const effect = Effects.itemEffect(itemId);
+    if (effect && effect.noConsume) return true;
+    const bag = record.bags.get(clientId);
+    bag[itemId] -= 1;
+    if (bag[itemId] <= 0) delete bag[itemId];
+    return true;
+  }
+
+  // Item stacks are held on choice accept and spent only when the turn leaves
+  // the choice phase — so cancel/unchose drops the hold and never refunds.
+  commitBagHolds(record) {
+    const holds = record.bagHold;
+    if (!holds) return;
+    record.bagHold = Object.create(null);
+    for (const clientId of Object.keys(holds)) {
+      this.spendBag(record, clientId, holds[clientId]);
+    }
+  }
+
+  // After the sim leaves choice, fighter.bag is authoritative (auto-pick and
+  // human items both spend there). Mirror it onto the hub sheet and drop holds
+  // so we never double-spend with commitBagHolds.
+  syncBagsFromSim(record) {
+    record.bagHold = Object.create(null);
+    if (!record || !record.sim || !record.bags) return;
+    for (const fighter of record.sim.fighters || []) {
+      record.bags.set(fighter.playerId, this.cloneBagMap(fighter.bag) || Object.create(null));
+    }
+  }
+
+  clearBagHold(record, clientId) {
+    if (record && record.bagHold) delete record.bagHold[clientId];
+  }
+
+  holdBag(record, clientId, itemId) {
+    if (!record.bagHold) record.bagHold = Object.create(null);
+    record.bagHold[clientId] = itemId;
+  }
+
+  seatsNeeded(record) {
+    const seats = record.memberIds.slice();
+    for (const npcId of record.npcIds || []) seats.push(npcId);
+    return seats;
+  }
+
+  tryStartSim(record) {
+    if (!record || record.sim || record.settled) return false;
+    if (!record.ruleset) return false;
+    for (const seat of this.seatsNeeded(record)) {
+      if (!record.parties.has(seat)) return false;
+    }
+
+    const fighterOf = (seat) => {
+      const party = record.parties.get(seat);
+      if (!party) return null;
+      const client = this.clients.get(seat);
+      // Seed NPC seats with a gym-style kit when the host uploaded no bag.
+      if (!record.bags) record.bags = new Map();
+      if (!record.bags.has(seat) && this.isNpcSeat(record, seat)) {
+        record.bags.set(seat, this.cloneBagMap(Turn.DEFAULT_NPC_BAG));
+      }
+      const bag = record.bags.get(seat);
+      const bagCopy = this.cloneBagMap(bag);
+      return {
+        playerId: seat,
+        name: (client && client.name)
+          || (this.isNpcSeat(record, seat) ? 'TRAINER' : seat),
+        mons: party.mons,
+        badges: party.badges,
+        bag: bagCopy || undefined,
+      };
+    };
+
+    const sideRoster = (keys) => {
+      const out = [];
+      for (const seat of keys || []) {
+        const fighter = fighterOf(seat);
+        if (fighter) out.push(fighter);
+      }
+      return out;
+    };
+
+    /*
+     * The seed is the intermediator's and nobody else's.
+     *
+     * A client may still *send* one -- the message has carried the field since
+     * the lockstep days and refusing it now would drop the whole ruleset over a
+     * value nothing reads -- but a fight whose seed came off the wire is a fight
+     * the authority can replay offline until it finds a run it likes, and then
+     * ask for that run. Every roll in a mediated battle is drawn from this
+     * stream, so choosing it is the whole of what the intermediator is for.
+     *
+     * `forceBattleSeed` is the one way in, and it is a *relay* field rather than
+     * a message: a suite that needs a reproducible fight sets it on the relay it
+     * constructed, which is not something a connection can reach.
+     */
+    const seed = typeof this.forceBattleSeed === 'number'
+      ? this.forceBattleSeed
+      : (1 + Math.floor(Math.random() * BATTLE_SEED_MAX));
+    const created = Turn.attempt({
+      id: record.id,
+      mode: record.mode,
+      seed,
+      chart: record.ruleset.chart,
+      specialTypes: record.ruleset.specialTypes,
+      metronomePool: record.ruleset.metronomePool,
+      choiceTimeout: BATTLE_CHOICE_TIMEOUT,
+      reconnectGrace: BATTLE_RECONNECT_GRACE,
+      resolveTimeout: BATTLE_RESOLVE_TIMEOUT,
+      now: battleSeconds(this.now()),
+      sides: {
+        a: sideRoster(record.sides.a),
+        b: sideRoster(record.sides.b),
+      },
+    });
+    if (!created.battle) {
+      this.log.warn(`mediated battle ${record.id} refused: ${safe(created.reason)}`);
+      return false;
+    }
+    record.sim = created.battle;
+
+    /*
+     * The npc seats are advertised under their own ids, not hidden behind the
+     * host's.
+     *
+     * They used to be filtered out and the emptied side announced as the host,
+     * because the seat was not an id a client could address -- and CoopBattle's
+     * `medMap` then had to guess that an advertised id owning no slot on that
+     * side meant the ownerless ones. Two seats is one guess too many: with both
+     * named, the map is a lookup again and the trainer's second box has a field
+     * slot rather than being drawn and never spoken about. Nothing is opened up
+     * by naming them, because a choice is attributed to the connection it
+     * arrived on and no connection is either of these.
+     */
+    const ready = {
+      battle: record.id,
+      mode: record.mode,
+      sides: { a: record.sides.a.slice(), b: record.sides.b.slice() },
+    };
+    // cleanBattleReady refuses an empty side, so a side that somehow lost every
+    // seat is announced as the host rather than as a message no client reads.
+    if (!ready.sides.b.length && record.hostId) {
+      ready.sides.b = [record.hostId];
+    }
+    if (!ready.sides.a.length && record.hostId) {
+      ready.sides.a = [record.hostId];
+    }
+    this.broadcastBattle(record, 'mmo.battle_ready', ready);
+    this.flushBattle(record);
+    this.log.info(`mediated battle ${record.id} started (${record.mode})`);
+    return true;
+  }
+
+  broadcastBattle(record, type, payload) {
+    for (const memberId of record.memberIds) {
+      const member = this.clients.get(memberId);
+      if (member && member.ready) this.send(member, type, payload);
+    }
+  }
+
+  /*
+   * Answer for the trainer, for as long as it owes an answer.
+   *
+   * The npc seats have no connection to send mmo.battle_choice, so without this
+   * every turn of a coop_npc would sit out BATTLE_CHOICE_TIMEOUT and then be
+   * auto-picked anyway -- a minute a turn, which is not a battle. The pick is the
+   * turn machine's own (first move with PP, at the first living foe), so what
+   * happens here is exactly what used to happen a minute later.
+   *
+   * The loop is what carries the fight forward rather than a retry: filing the
+   * last outstanding choice resolves the turn and opens the next one, where the
+   * trainer owes again. It is bounded because a machine that opened a turn it
+   * cannot close is a hub that stops answering anything, and that is a worse
+   * failure than a fight that pauses.
+   */
+  fillNpcChoices(record) {
+    if (!record || !record.sim || record.settled) return false;
+    const seats = record.npcIds;
+    if (!seats || !seats.length) return false;
+
+    let filed = false;
+    const bound = Turn.MONS_PER_PARTY * COOP_SIDE * 2;
+    for (let pass = 0; pass < bound; pass += 1) {
+      let any = false;
+      for (const seat of seats) {
+        if (record.sim.autoPick(seat)) { any = true; filed = true; }
+      }
+      if (!any) break;
+    }
+    return filed;
+  }
+
+  flushBattle(record) {
+    if (!record || !record.sim || record.settled) return;
+    // Before the drain rather than after it: the trainer's answer can be the one
+    // that closes the turn, and the events that turn produced have to go out in
+    // this same pass or nothing else would send them until somebody else spoke.
+    // Nothing here calls back into this function, so the two cannot chase each
+    // other.
+    this.fillNpcChoices(record);
+    // Fighter bags are authoritative after resolve (Turn spends on item use,
+    // including NPC auto-pick). Sync the hub sheet and drop holds so we never
+    // double-spend with commitBagHolds.
+    if (record.sim.phase !== 'choice') {
+      this.syncBagsFromSim(record);
+    }
+    const events = record.sim.drainEvents();
+    for (const event of events) {
+      this.broadcastBattle(record, 'mmo.battle_event', event);
+    }
+    const outcome = record.sim.outcome();
+    if (outcome) this.settleMediated(record, outcome);
+  }
+
+  tickBattles(nowMs) {
+    const now = battleSeconds(
+      typeof nowMs === 'number' ? nowMs : this.now());
+    for (const record of this.battles.values()) {
+      if (!record.sim || record.settled) continue;
+      record.sim.tick(now);
+      this.flushBattle(record);
+    }
+  }
+
+  /*
+   * A connection left the field. Returns true when a live sim started its
+   * reconnect grace (the fight continues); false when the record was aborted
+   * or there was nothing to leave.
+   */
+  leaveBattle(client) {
+    if (!client || !client.battleId) return false;
+    const record = this.battles.get(client.battleId);
+    if (!record) {
+      client.battleId = null;
+      return false;
+    }
+    if (record.sim && !record.settled) {
+      if (record.sim.disconnect(client.id)) this.flushBattle(record);
+      return true;
+    }
+    // Still collecting parties / ruleset: call the fight off.
+    this.abortMediatedBattle(record, 'gone');
+    return false;
+  }
+
+  abortMediatedBattle(record, reason) {
+    if (!record || record.settled) return;
+    if (record.sim) {
+      // Force a draw-ish end by disconnecting everyone still owed a grace.
+      for (const memberId of record.memberIds) {
+        record.sim.disconnect(memberId);
+      }
+      // Expire grace immediately.
+      record.sim.tick(battleSeconds(this.now()) + BATTLE_RECONNECT_GRACE + 1);
+      this.flushBattle(record);
+      if (record.settled) return;
+    }
+    record.settled = true;
+    // Omit empty winners/losers: Wire.battleOutcome refuses an empty id list,
+    // and a refused outcome would leave the client with no way out.
+    const abortPayload = {
+      battle: record.id,
+      outcome: 'draw',
+      reason: reason || 'gone',
+    };
+    this.broadcastBattle(record, 'mmo.battle_outcome', abortPayload);
+    this.clearBattle(record);
+  }
+
+  settleMediated(record, outcome) {
+    if (!record || record.settled) return null;
+    record.settled = true;
+    /*
+     * Present only when there is somebody in them, which is the same rule
+     * abortMediatedBattle follows and for the same reason: cleanBattleOutcome
+     * refuses an empty id list, so a draw carrying two of them is a message no
+     * client reads -- a battle screen with no way out. A null `reason` is
+     * omitted on the same grounds.
+     */
+    const payload = { battle: record.id, outcome: outcome.outcome };
+    if (outcome.winners && outcome.winners.length) {
+      payload.winners = outcome.winners;
+    }
+    if (outcome.losers && outcome.losers.length) {
+      payload.losers = outcome.losers;
+    }
+    if (outcome.reason) payload.reason = outcome.reason;
+    if (outcome.caught) payload.caught = outcome.caught;
+    this.broadcastBattle(record, 'mmo.battle_outcome', payload);
+
+    // Rank from the intermediator alone -- no dual mmo.result vote.
+    const match = this.matches.get(record.id);
+    if (match && record.mode === '1v1') {
+      this.matches.delete(record.id);
+      const winners = payload.winners || [];
+      const losers = payload.losers || [];
+      if (payload.outcome === 'win' || payload.outcome === 'loss'
+          || payload.outcome === 'forfeit') {
+        let winnerId = null;
+        let loserId = null;
+        if (winners[0] === match.a) {
+          winnerId = match.a;
+          loserId = match.b;
+        } else if (winners[0] === match.b) {
+          winnerId = match.b;
+          loserId = match.a;
+        } else if (losers[0] === match.a) {
+          loserId = match.a;
+          winnerId = match.b;
+        } else if (losers[0] === match.b) {
+          loserId = match.b;
+          winnerId = match.a;
+        }
+        if (winnerId && loserId && match.aRanked && match.bRanked) {
+          const settled = this.board.record(winnerId, loserId, this.now());
+          if (settled) {
+            this.publishPoints(winnerId, settled.winner.points);
+            this.publishPoints(loserId, settled.loser.points);
+            this.noteRankChange(settled);
+            this.noteMatchSettled({
+              at: this.now(),
+              startedAt: match.startedAt,
+              repeats: settled.repeats,
+              winner: {
+                id: settled.winner.key,
+                name: settled.winner.name,
+                points: settled.winner.points,
+                gained: settled.winner.gained,
+              },
+              loser: {
+                id: settled.loser.key,
+                name: settled.loser.name,
+                points: settled.loser.points,
+                lost: settled.loser.lost,
+              },
+            });
+          }
+        }
+      }
+    } else if (this.coopMatches.has(record.id) && record.mode === 'coop_pvp') {
+      // Trust intermediator for team settle: synthesise unanimous reports.
+      const coop = this.coopMatches.get(record.id);
+      if (coop) {
+        const winSet = new Set(payload.winners || []);
+        for (const memberId of coop.everyone) {
+          coop.reports.set(memberId,
+            winSet.has(memberId) ? 'win' : 'loss');
+        }
+        // If draw/forfeit unclear, leave reports alone and drop paperwork.
+        if (payload.outcome === 'draw') {
+          this.coopMatches.delete(record.id);
+        } else {
+          this.settleCoopMatch(record.id);
+        }
+      }
+    }
+
+    this.clearBattle(record);
+    return payload;
+  }
+
+  clearBattle(record) {
+    if (!record) return;
+    for (const memberId of record.memberIds) {
+      const member = this.clients.get(memberId);
+      if (member && member.battleId === record.id) member.battleId = null;
+    }
+    this.battles.delete(record.id);
   }
 
   // ------- ranked PVP
-
-  /*
-   * Which claim a name is carrying, as one comparable value. Null for a name
-   * with no claim on it at all, which is a legitimate state (a hub that could
-   * not mint) and has to compare equal to itself rather than being missing.
-   */
-  claimHash(name) {
-    const entry = this.board.get(name);
-    return (entry && entry.tokenHash) || null;
-  }
 
   /*
    * Finished battles nobody ever agreed on. Dropped rather than guessed at:
@@ -2107,12 +3013,11 @@ class Relay {
    * makes it worth more is a second, independent claim that agrees. So a
    * lone report scores nothing and two reports that disagree score nothing.
    *
-   * What that leaves open is stated rather than papered over: a player who
-   * quits mid-battle is a draw for the side still standing (the engine's own
-   * LinkBattle ends a dead link that way), so rage-quitting avoids the loss.
-   * Deciding otherwise would mean believing one side alone, which is the
-   * larger hole -- anyone could then mint wins against a player who never
-   * connected.
+   * What that leaves open is stated rather than papered over: a ranked
+   * mid-battle drop after reconnect grace is a forfeit loss scored via the
+   * intermediator (settleMediated), not a dual-report draw. A link battle
+   * still draws when the connection dies with no witness -- paying for one
+   * would pay for pulling the cable out.
    */
   settleMatch(id) {
     const match = this.matches.get(id);
@@ -2121,58 +3026,36 @@ class Relay {
     const second = match.reports.get(match.b);
     if (!first || !second) return null;
 
-    // One match, one settlement: the paperwork goes whatever the verdict is,
-    // so a pair cannot re-report their way to a second payout.
     this.matches.delete(id);
 
     let winner = null;
     let loser = null;
     if (first === 'win' && second === 'loss') {
-      winner = match.aName;
-      loser = match.bName;
+      winner = match.a;
+      loser = match.b;
     } else if (first === 'loss' && second === 'win') {
-      winner = match.bName;
-      loser = match.aName;
+      winner = match.b;
+      loser = match.a;
     } else {
-      // An agreed draw, or two clients telling different stories. Neither is
-      // worth points, and neither is worth a sentence on anybody's screen.
       return null;
     }
 
-    // A battle is only worth points when both players are who they say they
-    // are. One impostor and the whole match scores nothing: paying out half
-    // of it would move a rating belonging to somebody who was not playing.
     if (!match.aRanked || !match.bRanked) return null;
-
-    // ...and only while both names are still the *same* claims they were when
-    // the battle started. A claim that moved in between belongs to somebody
-    // else now, and record() would confirm it into permanence on the way past.
-    // Dropped rather than redirected: there is no honest name to pay.
-    if (this.claimHash(match.aName) !== match.aHash
-        || this.claimHash(match.bName) !== match.bHash) {
-      this.log.info(`a claim changed hands mid-battle (${safe(match.aName)} ` +
-        `vs ${safe(match.bName)}), so the result is not scored`);
-      return null;
-    }
 
     const settled = this.board.record(winner, loser, this.now());
     if (!settled) return null;
 
-    const winnerId = winner === match.aName ? match.a : match.b;
-    const loserId = winnerId === match.a ? match.b : match.a;
-    this.publishPoints(winnerId, settled.winner.points);
-    this.publishPoints(loserId, settled.loser.points);
+    this.publishPoints(winner, settled.winner.points);
+    this.publishPoints(loser, settled.loser.points);
     this.log.info(`ranked: ${safe(settled.winner.name)} ` +
       `${settled.winner.points} (+${settled.winner.gained}) beat ` +
       `${safe(settled.loser.name)} ${settled.loser.points} ` +
       `(-${settled.loser.lost})`);
     this.noteRankChange(settled);
     // Told here and nowhere else, while `match` is still in scope: this is
-    // the one point where a result is known to be real -- both sides agreed,
-    // both were ranked, both claims held -- and the only place the battle's
-    // own clock is still readable. Every earlier return above is a battle
-    // that scored nothing, and a history of those would be a history of
-    // arguments.
+    // the one point where a result is known to be real -- both sides agreed
+    // and both were ranked -- and the only place the battle's own clock is
+    // still readable.
     this.noteMatchSettled({
       // When it ended: the moment the session came down, or -- for a pair
       // that both reported before either left the session, which is a normal
@@ -2183,11 +3066,13 @@ class Relay {
       startedAt: match.startedAt,
       repeats: settled.repeats,
       winner: {
+        id: settled.winner.key,
         name: settled.winner.name,
         points: settled.winner.points,
         gained: settled.winner.gained,
       },
       loser: {
+        id: settled.loser.key,
         name: settled.loser.name,
         points: settled.loser.points,
         lost: settled.loser.lost,
@@ -2197,13 +3082,13 @@ class Relay {
   }
 
   /*
-   * The board moved: a rating, or a claim. Whoever owns the file is told, and
+   * The board moved: a rating changed. Whoever owns the file is told, and
    * whatever they do about it is their business -- the board in memory is
    * already correct, so a hook that throws is a full disk and not a lost
    * result.
    *
-   * `settled` is the match that moved the ratings, or null for a claim
-   * change, which has no match behind it.
+   * `settled` is the match that moved the ratings, or null when only the
+   * board was touched without a finished fight.
    */
   noteRankChange(settled) {
     if (!this.onRankChange) return;
@@ -2237,17 +3122,22 @@ class Relay {
    * not survive the trip is fixed here rather than silently dropped there.
    */
   leaderboard() {
-    return this.board.top(RANK_TOP).map((row) => ({
-      name: row.name,
-      sprite: cleanSpriteId(row.sprite) || DEFAULT_SPRITE,
-      points: cleanPoints(row.points),
-    }));
+    return this.board.top(RANK_TOP).map((row) => {
+      const out = {
+        name: row.name,
+        sprite: cleanSpriteId(row.sprite) || DEFAULT_SPRITE,
+        points: cleanPoints(row.points),
+      };
+      const id = cleanPlayerId(row.id);
+      if (id) out.id = id;
+      return out;
+    });
   }
 
   // ------- entry point
 
   handle(id, msg) {
-    const client = this.clients.get(id);
+    const client = this.get(id);
     if (!client) return;
     if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') return;
     const handler = handlers[msg.type];

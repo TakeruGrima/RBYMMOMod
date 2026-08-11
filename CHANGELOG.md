@@ -4,10 +4,267 @@ All notable changes to this mod are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 here must match `manifest.version`.
 
+## [Unreleased]
+
+### Added
+
+- **Friends hold keys use `Wire.nameKey` / relay `nameKey`, not `Rank.keyOf`.** PROTOCOL 16 made `Rank.keyOf` playerId-only; friendships stay trainer-name pairs, so the merge wires friend routing through the name fold.
+- **Friends (from main) under PROTOCOL 17.** Parallel main shipped friends as PROTOCOL 10 while this line claimed 10–16 for mediated battles + playerId; the merge keeps both feature sets and bumps `Config.PROTOCOL` / `relay.js` to **17** so a protocol-16 hub cannot silently ignore `mmo.friend_*`. Lists stay client-side (`src/Friends.lua`); the hub only holds offline asks.
+
+- **Hub twin-parity harness.** `tests/drivers/hub_protocol_parity.lua` +
+  `tests/fixtures/hub_protocol_parity.json` ↔ `server/hub_protocol_parity.test.js`
+  pin admit / duplicate playerId / protocol refuse / mediated KO + disconnect
+  forfeit / relay hard-cut / ranking ids / bag proofs / sprite+chat gates /
+  coop 2v2 settle / coop_npc settle across Hub.lua and relay.js.
+  `server/twin_parity.test.js` gates PROTOCOL, PLAYER_ID_HEX, battle clocks,
+  default sprite, shared hello refuse wording, and the inbound client→hub
+  type list. Process notes in `docs/plans/hub-twin-parity.md` (Node-only
+  live-ops carved out on purpose).
+
+### Changed
+
+- **RANK / CLI / history name collisions.** Leaderboard rows carry `id`
+  (playerId). In-game RANK and `rby-mmo-hub ranking` append `#aaaa` when two
+  display names collide; history always tags when an id is present.
+  `server/README.md` ranking docs updated for PROTOCOL 16 (no claim tickets).
+  `mod.card` protocol note names PROTOCOL 16 instead of the 6→8 fossil.
+- **Claim-ticket board APIs removed.** `Board:claim` / `claimed`, `mintToken`,
+  Hub `claimHash` / `newToken` / match `aHash`/`bHash`, and HostServer `onClaim`
+  are gone — PROTOCOL 16 identity is playerId only.
+- **Client no longer speaks claim tickets.** `rankToken` is off hello/welcome;
+  `Client.rankToken` / `RANK_TOKEN_FILE` / `Wire.token` / `cleanToken` are gone.
+  RANK empty copy drops the claim-era “name taken” branch; `mod.card` and the
+  hub wire table match playerId identity.
+- **Coop always mediated.** `CoopBattle.mediates` hard-codes `coop_pvp` /
+  `coop_npc`; `Config.MEDIATED_COOP` is documentation, not a host-sim toggle.
+- **Plan docs indexed.** `docs/plans/README.md` marks living vs historical;
+  stale plans carry a historical banner (old PROTOCOL citations are archive).
+
+## [1.0.0] - 2026-08-09
+
+First stable release line. Hub-mediated battles (0.11.x) are the supported
+path for MMO 1v1 / co-op; BattleSim locked decisions and the UX/fidelity
+fixes below ship as the 1.0 floor. **`experimental: false`** — the mod is
+enabled by default when installed (F10 still disables it). Hosting or joining
+is what opens a socket, not merely having the mod loaded.
+
+### Changed
+
+- **`experimental: false`.** Ordinary loader default: present in `mods/` means
+  on unless the player disables it.
+- **Mediated BattleSim residuals locked as standing decisions** (docs only):
+  sheet trust (party/bag uploads are claims; bag proofs stop mid-fight free
+  heals only), forced multi-turn `skip` injection (not full engine UI), and
+  hand-authored BattleSim vs engine `move_effects` / `ItemEffects` (not
+  byte-identical; hub never ships ROM tables). See Locked decisions in
+  `docs/plans/battle-sim-move-effects.md`.
+
+### Fixed
+
+- **Persistent player UUID (PROTOCOL 16).** The mod mints a 32-hex player id
+  once (`rby_mmo_player_id.json` + `mod.save`), sends it on every hello, and
+  the hub seats you under that id (rank board key + wire presence id). Duplicate
+  live connections with the same id are refused. Claim tickets no longer gate
+  scoring — display names are cosmetic. Mid-ranked-battle drop after reconnect
+  grace remains a forfeit loss scored by the intermediator (not a dual-report
+  draw). Legacy name-keyed `ranking.json` rows without `id` are skipped (season
+  reset).
+- **Faint replacement asks the player.** BattleSim no longer auto-sends the
+  next living mon; the seat owes a `switch`. `faint` carries `amount=1` when a
+  bench remains (authoritative for MediatedBattle + mediated CoopBattle —
+  no local `medMustReplace` guess). Pacing is faint msg → uncancellable picker
+  → send. Empty-bench omits `amount`; both-faint on the same action (KO +
+  recoil / explode) or residual batch is a draw; empty-bench KO still ends
+  before the foe moves. No
+  PROTOCOL bump (`amount` already on the event whitelist).
+- **Forced multi-turn narration.** Trap victim / bide / thrash / rage inject-skips
+  emit `msg` lines (recharge already did); trapper emits continue `msg` + `anim`
+  without re-rolling damage (Gen1 residual store). Clients keep the menu closed
+  via own-seat `chose`.
+- **Ruleset Special + Metronome guarantees.** `snapshotRuleset` asserts/warns when
+  a live type chart has no Gen1 Special name matches or the Metronome pool is
+  empty despite a non-empty move table — so Light Screen / Spc and Metronome
+  cannot silently degrade in real play.
+- **Richer timeout / NPC auto-pick.** Bag cures / heals (≤50% HP) / X-items
+  when a sheet is present (NPC seats get a default gym kit); SE damage;
+  status / setup reading that skips Substitute and boosted foes; low-HP and
+  mid-HP SE bench switches. Shared Lua/JS twin — not a full TrainerAI port.
+  Fighter bags spend on resolve; hub sheets sync from the sim (no double-spend
+  with holds).
+- **Mediated 1v1 presentation.** Classic Gen1 field: foe front pic + top-left
+  HUD (name / LV|status / HP bar), ally back pic + bottom HUD with HP
+  numbers, split "What will X do?" command box; optional AnimPlayer for
+  `anim` events. Sprites via `BattleState.makeBattler` when engine art is
+  reachable; HUD chrome alone when it is not.
+- **Mediated 1v1 forced-turn menu flash.** Own-seat `chose` (recharge / trap
+  skip) clears `pendingTurn` so the command box never opens for a turn the hub
+  already spent.
+- **Vitamin writeback without `Stats`.** If engine `Stats.calc` is unreachable,
+  writeback still applies the Gen1 √EV contribution delta to live `stats` / HP.
+- **`mod.card` co-op doctrine.** Known jank / feature blurb now describe
+  hub-refereed BattleSim instead of host-sim replay.
+- **Mediated co-op ITEM targeting.** Potion / Revive / Ether / vitamins open the
+  same party (and Ether move) pickers as MediatedBattle instead of always
+  committing on A to the active mon; `partySlot` / `move` ride the wire.
+- **Vitamin writeback recalcs live party stats.** After a successful vitamin
+  `item` event, clients bump `save.statExp` and run `Stats.calc` so max HP /
+  battle stats update immediately (not only on the next local fight rebuild).
+- **Timeout / NPC auto-pick** now prefers status / setup / an SE bench switch
+  when there is no super-effective damaging option (still deterministic; twin
+  Lua/JS heuristics, not full TrainerAI).
+- **Battle item catalog docs.** PP Up, stones, Rare Candy, Repels, Escape Rope,
+  HM/TM stay non-battle (omitted from bag upload; unknown ids fail in-fight).
+- **Gen1 badge boosts in BattleSim** from uploaded `party.badges` (parity with
+  host-sim CoopSim).
+- **A JOIN address with no port on it lands on 7788, however it was left
+  off.** A bare `MYBOX.LAN` was already completed, but the check was "does
+  this end in `:<digits>`" — so `MYBOX.LAN:`, typed by anyone who reached for
+  the colon and then remembered they were never told a port, became
+  `MYBOX.LAN::7788` and was dialled at host `MYBOX.LAN:`. That resolves to
+  nothing, and it fails the way a hub that is switched off fails, so the
+  player goes and asks the host to check their end. The port slot after the
+  last colon is now read rather than merely spotted: empty, not a number, or
+  a number no socket can bind, and `Config.DEFAULT_PORT` fills it in. A port
+  that was actually typed is still dialled exactly as typed.
+- **Spaces in a JOIN address are removed, wherever they are.** The naming
+  grid carries a space glyph and no address has any use for one — neither a
+  hostname nor an IP may contain a space — so `MYBOX.LAN ` and `MYBOX . LAN`
+  are both just what the grid made easy to type, and both used to be dialled
+  with the spaces still in the hostname. They also disagreed with the
+  passcode key, which strips whitespace: the code was filed under one string
+  and the connection made to another, so a saved passcode stopped being
+  found. Both now see the same string. It also means a port held off its
+  colon — `MYBOX.LAN: 7788` — keeps the value it plainly means instead of
+  reading as a port that was never given. An address that is only a port
+  (`:7788`) is refused rather than dialled at an empty host, which is the
+  answer an empty address already got.
+
 ## [0.11.0] - 2026-08-08
 
 ### Added
 
+- **Server-authoritative (mediated) battles.** MMO 1v1 and party-vs-party fights
+  are resolved by the hub — Node dedicated or in-game LAN Host — not by either
+  client's local rolls. Clients upload battler sheets and (from the host) an
+  ephemeral type chart; the intermediator owns hit/crit/damage/status and emits
+  `mmo.battle_event` / a sole `mmo.battle_outcome`. **`PROTOCOL` 9 → 10.**
+  Formula + turn twins live in `src/BattleSim/` and `server/lib/battle/` with
+  shared synthetic fixtures (no ROM tables shipped). Solo wild/trainer battles
+  stay on the local engine.
+- **Party-vs-NPC mediated battles**, on by default
+  (`Config.MEDIATED_COOP.coop_npc`). Both intermediators seat the trainer twice
+  (`n<battle>a` / `n<battle>b`) rather than once, so a pair of players meets the
+  pair of monsters the co-op screen draws; the host uploads the trainer's team as
+  one list in send-out order and the hub deals it back across the two seats. Both
+  answer for those seats the moment a turn opens, using the turn machine's own
+  auto-pick — the previous seat took a full `BATTLE_CHOICE_TIMEOUT` per turn.
+- **BattleSim move-effect layer.** Clients upload each move's `effect` and
+  `chance`; the intermediator runs all **68** Gen1 effect ids in mirrored
+  `src/BattleSim/Effects.lua` and `server/lib/battle/Effects.js`. Metronome
+  picks from an optional host-uploaded `metronomePool` (PROTOCOL 13).
+- **Struggle when every move is out of PP.** An empty movepool substitutes a
+  synthetic STRUGGLE (power 50, typeless) with self-recoil on both
+  intermediators.
+- **Chart-aware timeout and NPC auto-pick.** Choice deadlines and NPC seats
+  prefer a super-effective damaging move against the uploaded type chart over
+  raw power.
+- **Mediated co-op move animations.** `CoopBattle` plays intermediator `anim`
+  events through the engine's `AnimPlayer` so mediated fight screens show real
+  battle anims, not text-only.
+- **`PROTOCOL` 11** on the wire (`10 → 11` wait-line `chose`/`unchose`; see
+  Fixed). Mediated battle resolution itself shipped at **`PROTOCOL` 9 → 10**
+  (first bullet).
+
+### Changed
+
+- Session ids and co-op battle ids are namespaced (`s1`, `c1`). They index one
+  `battles` table from two independent counters, so plain integers let a co-op
+  fight land on a 1v1's record.
+- A mediated battle's RNG seed is always the intermediator's. A `seed` in
+  `mmo.battle_ruleset` still parses but is no longer used — an authority that
+  chose it could replay a fight offline until it liked the run.
+- `mmo.battle_ready` advertises the npc seats under their own ids instead of
+  hiding them behind the host's, so `CoopBattle:medMap` maps each trainer box to
+  a field slot by lookup rather than by falling through.
+
+### Fixed
+
+- **`PROTOCOL` 14 → 15** (`src/Config.lua`, `server/lib/relay.js`). Optional
+  `bag` on `mmo.battle_party` — BattleSim-known `{id, count}` stacks (vitamins
+  included). Hub *holds* on `item` accept and spends on turn resolve (cancel
+  drops the hold). Clients upload a battle-usable snapshot; ITEM menus follow
+  that sheet; inventory debits after the hub `item` event. Vitamins mutate
+  fight-local sheet Stat Exp; clients writeback `save.statExp` on confirm
+  only when the `item` event carries `amount=1` (applied). Failed vitamins
+  still spend the bag. Co-op modes in `MEDIATED_COOP` no longer fall back to
+  host-sim on upload failure (draw instead). Battler sheets and bag *counts*
+  remain upload claims (residual surface).
+- **`PROTOCOL` 13 → 14** (`src/Config.lua`, `server/lib/relay.js`). Mediated
+  `1v1` screens gain FIGHT/ITEM/SWITCH/RUN; item choices may name a party
+  `slot` and Ether `move`; Revive/Ether/Elixer apply in BattleSim; wire mode
+  `wild` seats one hub NPC (protocol-only — no overworld divert); catch outcomes
+  may carry a `caught` sheet and MediatedBattle grants via kept engine mon.
+  Parity driver covers wild catch + vitamin use (`battle_turn_parity.json`
+  regenerated). Metronome plan bullet no longer claims a v1 gap. Unknown item
+  ids say "But it failed"; Poké Flute wakes sleep; forced-only turns pace on
+  `tick`.
+- **`PROTOCOL` 12 → 13** (`src/Config.lua`, `server/lib/relay.js`). Ruleset may
+  carry `specialTypes` (Gen1 Special type indices) and `metronomePool` (ephemeral
+  move sheets). Damage uses spc/spc for Special types; Reflect/Light Screen split
+  physically vs specially; Metronome picks from the pool; trapping locks the
+  attacker as well as the victim; mediated items apply a hand-authored Gen1
+  heal/status table. X-items / Dire Hit / Guard Spec raise stages or set
+  volatiles; vitamins apply fight-local Stat Exp; balls catch in `wild` mode and
+  fail in trainer/PvP; optional `catchRate` on battler sheets; outcome reason
+  `catch`.
+- **`PROTOCOL` 11 → 12** (`src/Config.lua`, `server/lib/relay.js`). Mid-fight
+  move-list sync via battle event `moves` after Transform or Mimic.
+- **Disable** targets the foe's last-used move (not the attacker's slot);
+  disabled moves are refused at choice time, skipped by auto-pick, and tick down
+  at turn end. Cleared on switch/faint.
+- **Leech Seed** residual drains the seeded mon and heals the seeder (tracked
+  by `fromSlot`); cleared on switch/faint.
+- **Transform/Mimic** emit `moves` so mediated clients (`MediatedBattle`,
+  `CoopBattle`) draw and submit choices against the live move list.
+
+- **`PROTOCOL` 10 → 11** (`src/Config.lua`, `server/lib/relay.js`). Mediated
+  battle events `chose` (wait-line peer accuracy) and `unchose` (cancel clears
+  a filed answer on peers).
+- Mediated co-op wait lines name who still owes a choice. The referee emits a
+  sequenced `chose` event when a seat answers; clients apply it immediately via
+  `markActed` instead of waiting for the next `turn` (mediated fights have no
+  `act` fan-out). `unchose` clears the mark when a player backs out of a filed
+  choice.
+- The mediated/host-sim wait line rotates which outstanding name it shows every
+  `COOP_WAIT_ROTATE` seconds (3) when several players are still choosing.
+- Mediated choice countdowns use `BATTLE_CHOICE_TIMEOUT`, not the co-op turn
+  clock.
+- `medFlush` always clears `acted`, so a turn boundary cannot leave stale
+  wait-line marks from the previous round.
+- Mediated battle clients now send `mmo.battle_reconnect` when the hub link
+  returns under a live 1v1 or mediated co-op screen, so a drop inside the grace
+  can resume instead of riding every disconnect to forfeit.
+- The Lua LAN Hub `receive` path pcall-wraps handlers (matching Node), so a
+  Turn/Damage throw logs and continues rather than killing the host.
+- A turn left in `resolving` aborts on `BATTLE_RESOLVE_TIMEOUT` (30s) as a draw
+  with reason `timeout`, on both Turn twins.
+- JS Damage/Accuracy/Crit/Status coerce edge inputs the way the Lua twins do
+  (bare `typeEffect`, `atk`/`def`/`typeEff` aliases, missing level/accuracy/roll,
+  `paralysisStop(undefined)`).
+
+- The Node hub no longer sends empty `winners` / `losers` lists (or a null
+  `reason`) on a draw. `cleanBattleOutcome` refuses an empty id list, so the
+  message was one no client could read — a battle screen with no way out.
+- A `switch` choice is matched against the party position its monster claims
+  rather than counted off the sim's array, so a party that lost a monster to the
+  sanitiser still switches to the one the player picked.
+
+- MMO 1v1 no longer hands off to engine `LinkBattle` / fingerprint `canBattle`
+  refuse for mediated fights (Red vs Yellow and honest mod mismatches can fight
+  under the host's ruleset). Trade is unchanged (still `SessionNet` + engine
+  trade session).
+- Ranked payout for mediated fights trusts the intermediator outcome; dual
+  `mmo.result` votes are ignored once a sim is live.
 - **Friends: the people you keep, per hub, between sessions.** A party is who
   you are travelling with *right now* and ends with the connection. This is the
   opposite kind of thing — a standing list that is still there tomorrow, that
@@ -193,33 +450,6 @@ here must match `manifest.version`.
 
 - **The web dashboard is removed.** The operator surface is the CLI/admin
   socket, so tests and docs now exercise that path directly.
-
-## [Unreleased]
-
-### Fixed
-
-- **A JOIN address with no port on it lands on 7788, however it was left
-  off.** A bare `MYBOX.LAN` was already completed, but the check was "does
-  this end in `:<digits>`" — so `MYBOX.LAN:`, typed by anyone who reached for
-  the colon and then remembered they were never told a port, became
-  `MYBOX.LAN::7788` and was dialled at host `MYBOX.LAN:`. That resolves to
-  nothing, and it fails the way a hub that is switched off fails, so the
-  player goes and asks the host to check their end. The port slot after the
-  last colon is now read rather than merely spotted: empty, not a number, or
-  a number no socket can bind, and `Config.DEFAULT_PORT` fills it in. A port
-  that was actually typed is still dialled exactly as typed.
-- **Spaces in a JOIN address are removed, wherever they are.** The naming
-  grid carries a space glyph and no address has any use for one — neither a
-  hostname nor an IP may contain a space — so `MYBOX.LAN ` and `MYBOX . LAN`
-  are both just what the grid made easy to type, and both used to be dialled
-  with the spaces still in the hostname. They also disagreed with the
-  passcode key, which strips whitespace: the code was filed under one string
-  and the connection made to another, so a saved passcode stopped being
-  found. Both now see the same string. It also means a port held off its
-  colon — `MYBOX.LAN: 7788` — keeps the value it plainly means instead of
-  reading as a port that was never given. An address that is only a port
-  (`:7788`) is refused rather than dialled at an empty host, which is the
-  answer an empty address already got.
 
 ## [0.8.0] - 2026-08-06
 

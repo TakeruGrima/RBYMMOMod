@@ -3,9 +3,15 @@
 -- This is the same relay `server/hub.js` implements, ported to Lua so a
 -- player can host from inside the game. It owns who is connected, where
 -- they last said they were, which two players are paired, and the player
--- cap the host chose. It does not simulate anything: trade and battle run
--- inside the two clients on the engine's own link code, and `mmo.relay`
--- payloads pass through unread.
+-- cap the host chose. Trade still runs inside the two clients on the
+-- engine's own link code, and its `mmo.relay` payloads pass through unread.
+--
+-- **Battle does not.** From PROTOCOL 10 a battle this hub brokers is
+-- resolved *here*, by src/BattleSim/Turn.lua, and the clients receive an
+-- ordered stream of events they draw rather than rolling their own. The
+-- mediated-battles section below is that plumbing, and server/lib/relay.js
+-- runs the same one over the same message types -- a client cannot tell
+-- which of the two hosting paths refereed its fight.
 --
 -- **No sockets appear anywhere below.** Everything talks to *peer handles*
 -- -- any table answering `:send(msg)` and `:close()`. `HostServer` supplies
@@ -37,6 +43,12 @@ local Config = need("Config")
 local Wire = need("Wire")
 local Sha256 = need("Sha256")
 local Rank = need("Rank")
+-- The turn machine, and the one thing in this file that is not pure routing.
+-- A battle this hub brokers is *resolved* here from PROTOCOL 10 onwards, so
+-- the header's "it does not simulate anything" now holds for trade alone --
+-- see the mediated-battles section below for what changed and why.
+local Turn = need("BattleSim/Turn")
+local Effects = need("BattleSim/Effects")
 
 local M = {}
 M.__index = M
@@ -269,6 +281,21 @@ function M.new(opts)
     -- reports rather than two, and folding them into one table would mean
     -- every settlement had to ask which shape it was looking at.
     coopMatches = {},
+    -- The fights this hub is *running*: id -> the record openMediatedBattle
+    -- builds. Keyed by the id the fight was already known under -- a session
+    -- id for a 1v1, a co-op group id for a 2v2 -- rather than by an id of its
+    -- own, because every message about a battle already carries one of those
+    -- and a second numbering would be a mapping to keep in step for no gain.
+    -- Those two numberings are minted by two counters that know nothing of each
+    -- other, which is why each stamps a letter of its own on what it mints -- one
+    -- table, two id spaces, and no way for the second "1" to land on the first's
+    -- record.
+    --
+    -- A record exists from the moment the fight is agreed and holds nothing
+    -- but a roster until a ruleset and every party arrive; `sim` is what says
+    -- the hub has taken it over, and it is the flag every hard cut in this
+    -- file is gated on.
+    battles = {},
     -- Friend traffic the hub is holding for somebody who is not here.
     --
     -- nameKey -> { { kind, name, accept, at }, ... }, oldest first.  Keyed by
@@ -293,17 +320,11 @@ function M.new(opts)
     -- wire to a log at all: a peer that sends nothing but junk costs one
     -- line, not a flooded terminal.
     onDrop = opts.onDrop,
-    -- Optional, and the same shape as onDrop above and for the same reason:
-    -- this file owns no logger, so a fact a host would want to see is handed
-    -- to a caller that can phrase it. Called as onClaim(what, name, clientId)
-    -- when a hello changes what a name means on this hub -- "taken" when a
-    -- claim nobody had proved moved to the player connecting now, "unscored"
-    -- when somebody was admitted without the ticket for a claimed name, and
-    -- "mid_battle" when a settled result was dropped because a claim moved
-    -- underneath it. server/lib/relay.js writes the same three lines to its
-    -- own log; without this the Lua host was the only one of the two that
-    -- saw a name change hands and said nothing.
-    onClaim = opts.onClaim,
+    -- Optional, same shape as onDrop: a handler that threw. Hub stays pure
+    -- logic with no logger of its own, so the seam hands the fact to HostServer
+    -- (or a suite) that can name a remediation. Mirror of relay.js handle()'s
+    -- try/catch -- a Turn throw must not take the LAN host down with it.
+    onHandlerError = opts.onHandlerError,
     clock = 0,
   }, M)
 end
@@ -329,35 +350,52 @@ function M:pendingCount()
   return self.count - self.players
 end
 
--- Is somebody else on this hub *ranked* under this name right now?
---
--- Board:claim will hand an unproved, unscored claim to whoever is connecting
--- -- which is the whole fix for a lost ticket -- and this is the one thing
--- the board cannot see: that the holder is sitting right here, still playing
--- under it. Without it, a second player typing the same name (two copies that
--- never changed the default one is enough) takes the claim, and the first
--- player's next settled win is recorded against the taker's ticket. Matched
--- on the board's own key, so it is the same "same name" the claim is about.
--- server/lib/relay.js computes this the same way over its own client table.
-function M:nameInUse(client)
-  local key = Rank.keyOf(client.name)
-  if not key then return false end
+-- Is this playerId already seated on a ready connection?
+function M:idInUse(playerId, except)
+  if not playerId then return false end
   for id, other in pairs(self.clients) do
-    if id ~= client.id and other.ready and other.ranked
-       and Rank.keyOf(other.name) == key then
+    if other ~= except and other.ready and other.id == playerId then
       return true
     end
   end
   return false
 end
 
--- Which claim a name is carrying, as one comparable value. nil for a name
--- with no claim on it at all, which is a legitimate state (a hub whose
--- entropy pool could not mint) and has to compare equal to itself rather
--- than being missing.
-function M:claimHash(name)
-  local entry = self.board:get(name)
-  return entry and entry.tokenHash or nil
+-- Rekey a pre-hello ephemeral id to the persistent playerId.
+function M:rekeyClient(client, playerId)
+  if not client or not playerId or client.id == playerId then return true end
+  if self.clients[playerId] and self.clients[playerId] ~= client then
+    return false
+  end
+  -- Keep the ephemeral accept-id as an alias index so callers that still hold
+  -- the pre-hello id (HostServer) can find this client after rekey. Not stored
+  -- in self.clients under both keys -- that would double-count.
+  local oldId = client.id
+  self.clients[oldId] = nil
+  client.ephemeralId = oldId
+  client.id = playerId
+  self.clients[playerId] = client
+  self.byEphemeral = self.byEphemeral or {}
+  self.byEphemeral[oldId] = client
+  return true
+end
+
+-- Resume a mediated fight paused in reconnect grace for this playerId.
+function M:reattachBattle(client)
+  if not client or not client.ready then return end
+  for _, record in pairs(self.battles) do
+    if record.sim and not record.settled then
+      local member = false
+      for _, mid in ipairs(record.memberIds or {}) do
+        if mid == client.id then member = true; break end
+      end
+      if member and record.sim:reconnect(client.id) then
+        client.battleId = record.id
+        self:flushBattle(record)
+        return
+      end
+    end
+  end
 end
 
 -- Is this hub asking for a join code?  Unchanged in meaning, and still
@@ -388,22 +426,6 @@ function M:newNonce()
   local digest = Sha256.hex(raw .. "|" .. self.nextNonce .. "|" .. self.clock)
   if type(digest) ~= "string" then return nil end
   return digest:sub(1, Config.NONCE_HEX)
-end
-
--- A fresh claim token: 16 bytes off the same pool the nonces come from,
--- lowercase hex, and the only copy that will ever exist outside the player's
--- save file -- the board keeps its digest and nothing else.
---
--- nil when the pool cannot answer, which is not fatal: a name claimed with
--- no token is simply left unclaimed, and the player scores under it the way
--- everybody did before tokens existed.
-function M:newToken()
-  self.nextToken = (self.nextToken or 0) + 1
-  local raw = self.entropy and self.entropy:bytes(Config.RANK_TOKEN_HEX / 2)
-  if type(raw) ~= "string" then return nil end
-  local digest = Sha256.hex(raw .. "|token|" .. self.nextToken .. "|" .. self.clock)
-  if type(digest) ~= "string" then return nil end
-  return digest:sub(1, Config.RANK_TOKEN_HEX)
 end
 
 -- ------- plumbing
@@ -546,6 +568,20 @@ function M:admit(client)
     return false
   end
   local hello = client.hello or {}
+  local playerId = hello.playerId
+  if not playerId then
+    self:refuseClient(client, "That player id can't be used here.")
+    return false
+  end
+  if self:idInUse(playerId, client) then
+    self:refuseClient(client, "You're already connected.")
+    return false
+  end
+  if not self:rekeyClient(client, playerId) then
+    self:refuseClient(client, "You're already connected.")
+    return false
+  end
+
   client.name = hello.name
   client.sprite = hello.sprite or Config.DEFAULT_SPRITE
   client.profile = hello.profile
@@ -553,53 +589,15 @@ function M:admit(client)
   client.facing = hello.facing or "down"
   client.hello, client.nonce = nil, nil
   client.ready = true
-  -- Who is behind the name.
-  --
-  -- A first visit claims it and is handed the ticket to come back with; a
-  -- returning player presents theirs and gets their rating; anybody else
-  -- typing that name plays as normal and scores nothing. `minted` is sent on
-  -- in the welcome and then forgotten -- the hub keeps only the digest, so
-  -- this is the one moment the token exists here.
-  --
-  -- A claim nobody has ever proved, on a name nothing has scored under and
-  -- nobody is ranked under right now, is transferred to whoever is connecting
-  -- now and answered "claimed" with a ticket of its own -- Board:claim is
-  -- where that rule lives and why, including why a connected holder blocks
-  -- it. This board is session-scoped, so it has no file to fall out of step
-  -- with; server/lib/relay.js runs the same verdicts against one that does,
-  -- and the two must answer a given hello alike.
-  --
-  -- The claim as it stood before is read first, because the verdict alone
-  -- does not say what changed: "claimed" is a first mint on a free name and a
-  -- transfer of a provisional one, and those read differently in a log.
-  local before = self.board:get(client.name)
-  local wasClaimed = before ~= nil and before.tokenHash ~= nil
-  local minted = self:newToken()
-  local verdict = self.board:claim(client.name, hello.token, minted,
-                                   self:nameInUse(client))
-  client.ranked = verdict ~= "impostor"
-  client.mintedToken = (verdict == "claimed") and minted or nil
-  if self.onClaim then
-    if verdict == "impostor" then
-      self.onClaim("unscored", client.name, client.id)
-    elseif verdict == "claimed" and wasClaimed then
-      self.onClaim("taken", client.name, client.id)
-    end
-  end
-
-  -- The rating this name already carries on this hub, and the character it
-  -- is wearing today -- so the leaderboard can draw a portrait for a player
-  -- who is not online, and a returning player is not silently reset to zero.
-  -- An unranked player is shown as zero rather than as the rating of the
-  -- name they typed: it is not theirs, and putting it on their card would be
-  -- the claim ticket buying nothing.
-  --
-  -- Gated on `ranked` for the same reason the rating is: a player who does not
-  -- own the name has no business writing to its row, portrait included.
-  if client.ranked then self.board:seen(client.name, client.sprite) end
-  client.points = client.ranked and self.board:points(client.name)
-    or Config.RANK_START
+  -- PROTOCOL 16: playerId is the account-shaped identity. Everyone with a
+  -- valid id scores; display name is cosmetic on the board.
+  client.ranked = true
+  client.mintedToken = nil
+  self.board:seen(client.id, client.name, client.sprite)
+  client.points = self.board:points(client.id)
   self.players = self.players + 1
+
+  self:reattachBattle(client)
 
   local players = {}
   for id, other in pairs(self.clients) do
@@ -607,25 +605,10 @@ function M:admit(client)
       players[#players + 1] = presenceOf(other)
     end
   end
-  -- `points` is this player's own rating, spelled out rather than left to be
-  -- fished out of the roster: the roster a client keeps deliberately has no
-  -- entry for itself (Roster:isSelf), so the welcome is the only place your
-  -- own score can arrive from.
   send(client, Wire.WELCOME, {
     id = client.id, players = players, points = client.points,
-    -- Sent on the visit that claimed the name, and only then -- including
-    -- the visit that took over a claim nobody had proved, which is a claim
-    -- like any other and needs its ticket. The client stores it against this
-    -- hub and presents it next time; a confirmed name never re-sends one,
-    -- because a hub that would hand the ticket to whoever asked would not be
-    -- checking anything.
-    rankToken = client.mintedToken,
-    -- Said out loud rather than left to be inferred from a zero: "your
-    -- battles will not score here" is a thing a player can act on (change
-    -- the name), and a silent zero is not.
-    ranked = client.ranked,
+    ranked = true,
   })
-  client.mintedToken = nil
   self:broadcast(Wire.JOIN, { player = presenceOf(client) }, client.id)
   -- Last, and after the welcome on purpose: a friend ask the hub has been
   -- holding is a box in front of this player, and a box needs a client that
@@ -645,15 +628,25 @@ function M:drop(client)
   -- the game.
   self:clearCoopOffer(client, "gone")
   self:clearCoopAsks(client, "gone")
-  -- A four-way that loses a player cannot be finished, and the group has to go
-  -- with them: the three left would otherwise keep relaying into an id that
-  -- includes somebody who is not there.
-  if client.coopBattleId then self:closeCoopBattle(client.coopBattleId) end
+  -- A fight the hub is *running* does not end because one of its players
+  -- vanished: it pauses on the reconnect grace and forfeits when that runs
+  -- out.  leaveBattle answers true only in that case, and only then is the
+  -- group left standing.  Everything else -- a fight still collecting parties,
+  -- a co-op group on the legacy client-simulated path -- closes exactly as it
+  -- always did, because the three left would otherwise keep relaying into an
+  -- id that includes somebody who is not there.
+  local fighting = self:leaveBattle(client)
+  if client.coopBattleId and not fighting then
+    self:closeCoopBattle(client.coopBattleId)
+  end
   -- A party outlives a trade but not a connection: the other member is told
   -- while this one is still in the table, so the presence that goes out with
   -- it is the one where they are no longer in a party.
   self:endParty(client, "peer_left")
   self.clients[client.id] = nil
+  if client.ephemeralId and self.byEphemeral then
+    self.byEphemeral[client.ephemeralId] = nil
+  end
   self.count = self.count - 1
   if client.ready then self.players = self.players - 1 end
   -- an outstanding request pointed at a player who just left would let the
@@ -680,6 +673,12 @@ end
 function M:endSession(client, reason)
   local id = client.sessionId
   if not id then return end
+  -- Leaving the session is leaving the field, not conceding it. A mediated
+  -- fight starts its reconnect grace here rather than ending on the spot, so
+  -- a player who backed out by accident gets the same window a dropped
+  -- socket does -- and a player who backed out on purpose still has to sit
+  -- out the grace rather than voiding a battle they were losing.
+  self:leaveBattle(client)
   local session = self.sessions[id]
   self.sessions[id] = nil
   client.sessionId = nil
@@ -709,7 +708,16 @@ function M:endSession(client, reason)
 end
 
 function M:startSession(a, b, kind)
-  local id = tostring(self.nextSession)
+  -- Prefixed, because two counters mint into one `battles` table.
+  --
+  -- A session and a co-op battle are numbered by two independent counters and
+  -- both open a mediated record under their own id, so the plain "1" the second
+  -- of them minted used to land on the first one's record -- a co-op fight
+  -- inheriting a 1v1's parties, or a battle_choice from one filed into the
+  -- other.  The letter is what keeps the two id spaces apart, and it is a letter
+  -- rather than a colon because these ids cross the wire and Wire.id refuses
+  -- anything outside [%w_-].
+  local id = "s" .. tostring(self.nextSession)
   self.nextSession = self.nextSession + 1
   self.sessions[id] = { a = a.id, b = b.id, kind = kind }
   a.sessionId, b.sessionId = id, id
@@ -725,12 +733,6 @@ function M:startSession(a, b, kind)
       -- touch the board is a fact about who they are, not about what they
       -- report afterwards
       aRanked = a.ranked ~= false, bRanked = b.ranked ~= false,
-      -- ...and *which* claim each name was, for the same reason. A claim can
-      -- move between the first turn and the last report -- that is exactly
-      -- what an unproved claim is allowed to do -- and paying a settled
-      -- result into a claim that has since changed hands would put one
-      -- player's win on another player's name.
-      aHash = self:claimHash(a.name), bHash = self:claimHash(b.name),
       reports = {}, startedAt = self.clock,
     }
   end
@@ -745,6 +747,19 @@ function M:startSession(a, b, kind)
 
   self:broadcast(Wire.MOVE, presenceOf(a), a.id)
   self:broadcast(Wire.MOVE, presenceOf(b), b.id)
+
+  -- A battle session is also a mediated fight from the moment it opens, and
+  -- the requester is its authority for the reason they were made host above.
+  -- Trade is untouched: there is no trade sim here and there is not going to
+  -- be one.
+  if kind == "battle" then
+    self:openMediatedBattle(id, {
+      mode = "1v1",
+      hostId = a.id,
+      memberIds = { a.id, b.id },
+      sides = { a = { a.id }, b = { b.id } },
+    })
+  end
 end
 
 -- ------- parties
@@ -901,7 +916,14 @@ end
 -- One id, however the battle was agreed: two partners against an NPC pair use
 -- it exactly as four players against each other do, so mmo.coop_relay has one
 -- routing rule rather than two that have to be kept in step.
-function M:openCoopBattle(id, memberIds)
+--
+-- `plan` is what the mediated record is built from -- the mode, who the
+-- authority is, and which side each member is on.  It is passed by the caller
+-- rather than worked out here because only the caller knows: the four-way
+-- knows its two parties from the ask it just settled, and the pair knows which
+-- of them walked up to the trainer.  When it is absent the shape is inferred,
+-- and openMediatedBattle says how.
+function M:openCoopBattle(id, memberIds, plan)
   local members = {}
   for _, memberId in ipairs(memberIds or {}) do
     local member = self.clients[memberId]
@@ -911,6 +933,13 @@ function M:openCoopBattle(id, memberIds)
     end
   end
   self.coopBattles[id] = { members = members, startedAt = self.clock }
+  -- ...and the hub's own record of the fight, on the same id.  Built even
+  -- though nothing may ever arrive for it: a client that never uploads a
+  -- ruleset simply leaves `sim` nil, which is exactly how the legacy
+  -- client-simulated path stays open underneath this one.
+  local shape = { memberIds = members }
+  for key, value in pairs(plan or {}) do shape[key] = value end
+  self:openMediatedBattle(id, shape)
   return id
 end
 
@@ -924,6 +953,12 @@ function M:closeCoopBattle(id)
     local member = self.clients[memberId]
     if member and member.coopBattleId == id then member.coopBattleId = nil end
   end
+  -- The group and the fight are the same event seen from two sides, so they
+  -- end together.  A sim still holding a field here is one whose players have
+  -- all gone (the max-age sweep, a member dropping mid-setup); the fight is
+  -- called off rather than left refereeing an empty room.
+  local record = self.battles[id]
+  if record then self:abortMediatedBattle(record, "gone") end
   return true
 end
 
@@ -955,8 +990,13 @@ function M:startCoopBattle(id)
 
   -- The membership outlives the ask, because the battle traffic is about to
   -- need it: mmo.coop_relay is fanned out to exactly these four and nobody
-  -- else, and the hub is the only party that knows who they are.
-  self:openCoopBattle(id, ask.everyone)
+  -- else, and the hub is the only party that knows who they are.  The two
+  -- sides go with it -- this is the moment they are known, and a mediated
+  -- field cannot be assembled from a flat list of four.
+  self:openCoopBattle(id, ask.everyone, {
+    mode = "coop_pvp", hostId = ask.asker,
+    sides = { a = ask.sideA, b = ask.sideB },
+  })
 
   -- The paperwork for a ranked 2-on-2.
   --
@@ -1052,23 +1092,12 @@ function M:settleMatch(id)
   -- it would move a rating that belongs to somebody who was not playing.
   if not (match.aRanked and match.bRanked) then return nil end
 
-  -- ...and only while both names are still the *same* claims they were when
-  -- the battle started. A claim that moved in between belongs to somebody
-  -- else now, and Board:record would confirm it into permanence on the way
-  -- past. Dropped rather than redirected: there is no honest name to pay.
-  if self:claimHash(match.aName) ~= match.aHash
-     or self:claimHash(match.bName) ~= match.bHash then
-    if self.onClaim then
-      self.onClaim("mid_battle", match.aName, match.a)
-    end
-    return nil
-  end
-
-  local settled = self.board:record(winner, loser, self.clock)
-  if not settled then return nil end
-
   local winnerId = (winner == match.aName) and match.a or match.b
   local loserId = (winnerId == match.a) and match.b or match.a
+  local settled = self.board:record(winnerId, loserId, self.clock)
+  if not settled then return nil end
+  self.board:seen(winnerId, winner)
+  self.board:seen(loserId, loser)
   self:publishPoints(winnerId, settled.winner.points)
   self:publishPoints(loserId, settled.loser.points)
   return settled
@@ -1139,26 +1168,680 @@ function M:settleCoopMatch(id)
     if client and client.ranked == false then return nil end
   end
 
-  local function names(members)
+  local function ids(members)
     local out = {}
-    for _, member in ipairs(members) do out[#out + 1] = member.name end
+    for _, member in ipairs(members) do out[#out + 1] = member.id end
     return out
   end
-  local settled = self.board:recordTeam(names(winners), names(losers), self.clock)
+  local settled = self.board:recordTeam(ids(winners), ids(losers), self.clock)
   if not settled then return nil end
 
   -- Everyone's new number goes out, winners and losers alike: four ratings
   -- moved, and a hub that announced two of them would leave two screens stale.
-  local byName = {}
-  for _, row in ipairs(settled.winners) do byName[row.name] = row.points end
-  for _, row in ipairs(settled.losers) do byName[row.name] = row.points end
+  local byKey = {}
+  for _, row in ipairs(settled.winners) do byKey[row.key] = row.points end
+  for _, row in ipairs(settled.losers) do byKey[row.key] = row.points end
   for _, member in ipairs(winners) do
-    if byName[member.name] then self:publishPoints(member.id, byName[member.name]) end
+    if byKey[member.id] then self:publishPoints(member.id, byKey[member.id]) end
   end
   for _, member in ipairs(losers) do
-    if byName[member.name] then self:publishPoints(member.id, byName[member.name]) end
+    if byKey[member.id] then self:publishPoints(member.id, byKey[member.id]) end
   end
   return settled
+end
+
+-- ------- mediated battles (BattleSim/Turn plumbing)
+--
+-- The hub referees.  A record exists for every battle it brokers from the
+-- moment the fight is agreed, holding nothing but a roster; a ruleset and one
+-- party per seat turn it into a running sim, and from that instant the hub is
+-- the only party that rolls anything.  `record.sim` is the flag: every hard
+-- cut below is gated on it and not on the record, because until the sim exists
+-- the two clients are still on the engine's own lockstep path and taking that
+-- away from a build that has not been rewritten yet would be a battle screen
+-- that never advances.
+--
+-- server/lib/relay.js runs this same plumbing over the same message types, so
+-- the two hosting paths referee a fight identically.  Keep them in step: a
+-- difference here is one client's copy of the game disagreeing with another's
+-- about a battle neither of them resolved.
+
+-- The sim counts in whole seconds; this hub's clock is fractional seconds of
+-- uptime.  One place to convert, so a deadline cannot be compared against a
+-- different unit than it was set in.
+local function battleSeconds(clock)
+  return math.floor(tonumber(clock) or 0)
+end
+
+-- The fight this connection is in, when the hub is the one running it.  nil
+-- for a player who is not fighting, and for a co-op group still on the legacy
+-- client-simulated path.
+--
+-- Every battle_* handler finds its record through `client.battleId` rather
+-- than through the id on the message.  The id is still checked where the
+-- sanitiser carries one, but it is checked *against* the connection's own
+-- fight: a client naming somebody else's battle is naming a fight it is not
+-- in, and trusting the field would let a spectator file choices into a match
+-- they were never at.
+local function mediatedOf(self, client)
+  if not client.ready or not client.battleId then return nil end
+  return self.battles[client.battleId]
+end
+
+-- A seed for a fight whose ruleset did not name one.
+--
+-- Off the session's entropy pool, which is honest about being weaker than a
+-- CSPRNG (see its header) and is far more than this needs: nobody is
+-- predicting a damage roll for profit, and the property that matters is that
+-- two fights in one session do not replay each other.  The clock is the
+-- fallback for a pool that cannot answer, because a fight with a predictable
+-- seed is still a fight and refusing to start one would be worse.
+function M:battleSeed()
+  local raw = self.entropy and self.entropy:bytes(4)
+  if type(raw) == "string" and #raw == 4 then
+    local n = 0
+    for i = 1, 4 do n = n * 256 + raw:byte(i) end
+    return (n % Wire.SEED_MAX) + 1
+  end
+  return (math.floor(self.clock * 1000) % Wire.SEED_MAX) + 1
+end
+
+-- Open the hub's record of a fight.  The sim is still nil: a ruleset and every
+-- required party have to arrive before tryStartSim takes it over.
+--
+-- `npcIds` is set for coop_npc (**two** synthetic seats) and wild (**one**
+-- seat). Coop_npc: two players meet two monsters. Wild: one player meets one
+-- wild mon on a hub NPC seat (protocol-only — no overworld divert). The host
+-- uploads the NPC team as side "b".
+--
+-- They are ids a client could in principle type, and that is safe rather than
+-- sloppy: client ids are minted as decimal counters, these carry a letter and
+-- the battle's own id, and nothing addresses a seat by name anyway -- a choice
+-- is attributed to the connection it arrived on.  It has to be spellable,
+-- because tryStartSim advertises them and Wire.id refuses a colon.
+function M:openMediatedBattle(id, plan)
+  plan = plan or {}
+  local memberIds, seen = {}, {}
+  for _, memberId in ipairs(plan.memberIds or {}) do
+    if type(memberId) == "string" and not seen[memberId] then
+      seen[memberId] = true
+      memberIds[#memberIds + 1] = memberId
+    end
+  end
+  if #memberIds == 0 then return nil end
+
+  local mode = Turn.MODES[plan.mode] and plan.mode
+    or ((#memberIds <= 2) and "1v1" or "coop_pvp")
+  local hostId = plan.hostId or memberIds[1]
+  local npcIds = nil
+  if mode == "coop_npc" then
+    npcIds = {}
+    for i = 1, Config.COOP_SIDE do
+      npcIds[i] = "n" .. tostring(id) .. string.char(96 + i)
+    end
+  elseif mode == "wild" then
+    -- One human, one synthetic wild seat. Protocol-only: nothing here diverts
+    -- an overworld encounter onto this path.
+    npcIds = { "n" .. tostring(id) .. "a" }
+  end
+
+  local sides = type(plan.sides) == "table" and plan.sides or nil
+  if not sides then
+    if mode == "1v1" then
+      sides = { a = { memberIds[1] }, b = { memberIds[2] or memberIds[1] } }
+    elseif mode == "coop_npc" or mode == "wild" then
+      sides = { a = memberIds, b = npcIds }
+    else
+      local mid = math.ceil(#memberIds / 2)
+      local a, b = {}, {}
+      for i, memberId in ipairs(memberIds) do
+        if i <= mid then a[#a + 1] = memberId else b[#b + 1] = memberId end
+      end
+      sides = { a = a, b = b }
+    end
+  end
+
+  -- Copied rather than referenced: `sides` here is usually the caller's own
+  -- ask, which endCoopAsk is about to forget, and a record holding somebody
+  -- else's table is a field that changes underneath the fight.
+  local function copy(list)
+    local out = {}
+    for _, value in ipairs(list or {}) do out[#out + 1] = value end
+    return out
+  end
+
+  local record = {
+    id = id,
+    mode = mode,
+    hostId = hostId,
+    memberIds = memberIds,
+    sides = { a = copy(sides.a), b = copy(sides.b) },
+    npcIds = npcIds,
+    ruleset = nil,
+    parties = {},      -- seat id -> the sanitised party that filled it
+    bags = {},         -- player id -> { [itemId] = count } from party.bag
+    bagHold = {},      -- player id -> itemId held until turn resolves
+    sim = nil,
+    settled = false,
+  }
+  self.battles[id] = record
+  for _, memberId in ipairs(memberIds) do
+    local member = self.clients[memberId]
+    if member then member.battleId = id end
+  end
+  return record
+end
+
+-- Is this seat one of the trainer's rather than a player's?
+function M:isNpcSeat(record, seat)
+  for _, npcId in ipairs((record and record.npcIds) or {}) do
+    if npcId == seat then return true end
+  end
+  return false
+end
+
+-- Which seat a party fills.  Normally the sender's own id.  For coop_npc the
+-- host may also upload the trainer's party under side "b", which is dealt across
+-- the synthetic npc seats rather than displacing their own team -- so this
+-- answers the *first* of them, and `fillBattleParty` below is what does the
+-- dealing.
+function M:battleSeat(record, client, party)
+  local member = false
+  for _, memberId in ipairs(record.memberIds) do
+    if memberId == client.id then member = true break end
+  end
+  if not member then return nil end
+  if record.mode == "coop_npc" and party.side == "b"
+     and client.id == record.hostId and record.npcIds then
+    return record.npcIds[1]
+  end
+  if record.mode == "wild" and party.side == "b"
+     and client.id == record.hostId and record.npcIds then
+    return record.npcIds[1]
+  end
+  return client.id
+end
+
+-- Store an uploaded party against the seat or seats it fills.
+--
+-- The trainer's team arrives as one list, because that is what it is on the
+-- host's screen -- src/CoopBattle.lua's `npcMons` re-interleaves the two
+-- ownerless slots back into the order the trainer would send them out.  Two
+-- seats fight it, so it is dealt back out here, alternately, which is the
+-- inverse of that interleave: the deal src/Coop.lua made when it built the field
+-- is the deal the field gets back.
+--
+-- A trainer with fewer monsters than seats leaves one empty, and an empty seat
+-- is a field Turn.create refuses -- so the spare seat is given up instead and
+-- the fight opens as the 2-on-1 the trainer actually brought.  Refusing would
+-- mean a lone-monster trainer could not be fought at all.
+function M:fillBattleParty(record, client, party)
+  local seat = self:battleSeat(record, client, party)
+  if not seat then return false end
+  if not self:isNpcSeat(record, seat) then
+    record.parties[seat] = party
+    -- Bag always keys off the connection: a host uploading side b for an NPC
+    -- never reaches this branch, so their own bag is not wiped by that upload.
+    record.bags = record.bags or {}
+    record.bags[client.id] = self:bagMap(party.bag)
+    return true
+  end
+
+  local dealt = {}
+  for index, mon in ipairs(party.mons) do
+    local at = ((index - 1) % #record.npcIds) + 1
+    dealt[at] = dealt[at] or {}
+    local hand = dealt[at]
+    hand[#hand + 1] = mon
+  end
+
+  local kept, dropped = {}, {}
+  for at, npcId in ipairs(record.npcIds) do
+    if dealt[at] and #dealt[at] > 0 then
+      kept[#kept + 1] = npcId
+      record.parties[npcId] = {
+        battle = party.battle, side = party.side,
+        badges = party.badges, mons = dealt[at],
+      }
+    else
+      dropped[npcId] = true
+      record.parties[npcId] = nil
+    end
+  end
+  record.npcIds = kept
+  -- Filtered rather than replaced: the side is the caller's description of the
+  -- field and may hold more than these seats one day, so only the seats actually
+  -- given up are taken out of it.
+  local sideB = {}
+  for _, seat in ipairs(record.sides.b) do
+    if not dropped[seat] then sideB[#sideB + 1] = seat end
+  end
+  record.sides.b = sideB
+  return true
+end
+
+-- List of `{id, count}` → lookup map. Empty / nil → empty map (no items).
+function M:bagMap(entries)
+  local map = {}
+  for _, entry in ipairs(entries or {}) do
+    if type(entry) == "table" and type(entry.id) == "string"
+       and type(entry.count) == "number" and entry.count > 0 then
+      map[entry.id] = entry.count
+    end
+  end
+  return map
+end
+
+-- Shallow copy of an id→count bag map (or nil when empty / absent).
+function M:cloneBagMap(src)
+  if type(src) ~= "table" then return nil end
+  local out, any = {}, false
+  for id, count in pairs(src) do
+    if type(id) == "string" and type(count) == "number" and count > 0 then
+      out[id] = count
+      any = true
+    end
+  end
+  if not any then return nil end
+  return out
+end
+
+-- Items proved present but never decremented (BattleSim noConsume, e.g. Poké Flute).
+function M:canSpendBag(record, clientId, itemId)
+  if type(itemId) ~= "string" then return false end
+  local bag = record and record.bags and record.bags[clientId]
+  if not bag then return false end
+  return (bag[itemId] or 0) >= 1
+end
+
+function M:spendBag(record, clientId, itemId)
+  if not self:canSpendBag(record, clientId, itemId) then return false end
+  local effect = Effects.itemEffect(itemId)
+  if effect and effect.noConsume then return true end
+  local bag = record.bags[clientId]
+  bag[itemId] = bag[itemId] - 1
+  if bag[itemId] <= 0 then bag[itemId] = nil end
+  return true
+end
+
+-- Item stacks are held on choice accept and spent only when the turn leaves
+-- the choice phase — so cancel/unchose drops the hold and never refunds.
+function M:commitBagHolds(record)
+  local holds = record.bagHold
+  if not holds then return end
+  record.bagHold = {}
+  for clientId, itemId in pairs(holds) do
+    self:spendBag(record, clientId, itemId)
+  end
+end
+
+-- After the sim leaves choice, fighter.bag is authoritative (auto-pick and
+-- human items both spend there). Mirror it onto the hub sheet and drop holds
+-- so we never double-spend with commitBagHolds.
+function M:syncBagsFromSim(record)
+  record.bagHold = {}
+  if not (record and record.sim and record.bags) then return end
+  for _, fighter in ipairs(record.sim.fighters or {}) do
+    record.bags[fighter.playerId] = self:cloneBagMap(fighter.bag) or {}
+  end
+end
+
+function M:clearBagHold(record, clientId)
+  if not (record and record.bagHold) then return end
+  record.bagHold[clientId] = nil
+end
+
+function M:holdBag(record, clientId, itemId)
+  record.bagHold = record.bagHold or {}
+  record.bagHold[clientId] = itemId
+end
+
+-- Every seat that owes a party before the fight can open.
+function M:seatsNeeded(record)
+  local seats = {}
+  for _, memberId in ipairs(record.memberIds) do seats[#seats + 1] = memberId end
+  for _, npcId in ipairs(record.npcIds or {}) do seats[#seats + 1] = npcId end
+  return seats
+end
+
+-- The ruleset and every party are in: build the field and start refereeing.
+--
+-- Answers false and changes nothing when anything is still missing, so it is
+-- safe to call from every message that could have been the last one needed.
+function M:tryStartSim(record)
+  if not record or record.sim or record.settled then return false end
+  if not record.ruleset then return false end
+  for _, seat in ipairs(self:seatsNeeded(record)) do
+    if not record.parties[seat] then return false end
+  end
+
+  local function fighterOf(seat)
+    local party = record.parties[seat]
+    if not party then return nil end
+    local client = self.clients[seat]
+    -- Seed NPC seats with a gym-style kit when the host uploaded no bag.
+    record.bags = record.bags or {}
+    if not record.bags[seat] and self:isNpcSeat(record, seat) then
+      record.bags[seat] = self:cloneBagMap(Turn.DEFAULT_NPC_BAG)
+    end
+    local bag = record.bags[seat]
+    return {
+      playerId = seat,
+      name = (client and client.name)
+        or (self:isNpcSeat(record, seat) and "TRAINER" or seat),
+      mons = party.mons,
+      badges = party.badges,
+      bag = bag and self:cloneBagMap(bag) or nil,
+    }
+  end
+
+  local function roster(seats)
+    local out = {}
+    for _, seat in ipairs(seats or {}) do
+      local fighter = fighterOf(seat)
+      if fighter then out[#out + 1] = fighter end
+    end
+    return out
+  end
+
+  -- The seed is the intermediator's and nobody else's.
+  --
+  -- A client may still *send* one -- the message has carried the field since the
+  -- lockstep days and refusing it now would drop the whole ruleset over a value
+  -- nothing reads -- but a fight whose seed came off the wire is a fight the
+  -- authority can replay offline until it finds a run it likes, and then ask for
+  -- that run.  Every roll in a mediated battle is drawn from this stream, so
+  -- choosing it is the whole of what the intermediator is for.
+  --
+  -- `forceBattleSeed` is the one way in, and it is a *hub* field rather than a
+  -- message: a suite that needs a reproducible fight sets it on the hub it
+  -- constructed, which is not something a connection can reach.
+  local seed = (type(self.forceBattleSeed) == "number")
+    and self.forceBattleSeed or self:battleSeed()
+  local battle, why = Turn.create({
+    id = record.id,
+    mode = record.mode,
+    seed = seed,
+    chart = record.ruleset.chart,
+    specialTypes = record.ruleset.specialTypes,
+    metronomePool = record.ruleset.metronomePool,
+    choiceTimeout = Config.BATTLE_CHOICE_TIMEOUT,
+    reconnectGrace = Config.BATTLE_RECONNECT_GRACE,
+    resolveTimeout = Config.BATTLE_RESOLVE_TIMEOUT,
+    now = battleSeconds(self.clock),
+    sides = { a = roster(record.sides.a), b = roster(record.sides.b) },
+  })
+  if not battle then
+    -- Turn.create answers a reason rather than raising, and this file owns no
+    -- logger, so the refusal goes out the seam that already exists for "a
+    -- message from this connection was not acted on" -- once per connection,
+    -- charged to the authority whose ruleset and parties made the field.
+    local host = self.clients[record.hostId]
+    if host then
+      noteDrop(self, host,
+        "this battle could not be assembled: " .. tostring(why))
+    end
+    return false
+  end
+  record.sim = battle
+
+  -- The npc seats are advertised under their own ids, not hidden behind the
+  -- host's.
+  --
+  -- They used to be filtered out and the emptied side announced as the host,
+  -- because the seat was not an id a client could address -- and src/CoopBattle's
+  -- `medMap` then had to guess that an advertised id owning no slot on that side
+  -- meant the ownerless ones.  Two seats is one guess too many: with both named,
+  -- the map is a lookup again and the trainer's second box has a field slot
+  -- rather than being drawn and never spoken about.  Nothing is opened up by
+  -- naming them, because a choice is attributed to the connection it arrived on
+  -- and no connection is either of these.
+  local function advertise(seats)
+    local out = {}
+    for _, seat in ipairs(seats) do out[#out + 1] = seat end
+    -- Wire.battleReady refuses an empty side, so a side that somehow lost every
+    -- seat is announced as the host rather than as a message no client reads.
+    if #out == 0 and record.hostId then out[1] = record.hostId end
+    return out
+  end
+  self:broadcastBattle(record, Wire.BATTLE_READY, {
+    battle = record.id,
+    mode = record.mode,
+    sides = { a = advertise(record.sides.a), b = advertise(record.sides.b) },
+  })
+  self:flushBattle(record)
+  return true
+end
+
+-- Answer for the trainer, for as long as it owes an answer.
+--
+-- The npc seats have no connection to send mmo.battle_choice, so without this
+-- every turn of a coop_npc would sit out BATTLE_CHOICE_TIMEOUT and then be
+-- auto-picked anyway -- a minute a turn, which is not a battle.  The pick is the
+-- turn machine's own (first move with PP, at the first living foe), so what
+-- happens here is exactly what used to happen a minute later.
+--
+-- The loop is what carries the fight forward rather than a retry: filing the
+-- last outstanding choice resolves the turn and opens the next one, where the
+-- trainer owes again.  It is bounded because a machine that opened a turn it
+-- cannot close is a hub that stops answering anything, and that is a worse
+-- failure than a fight that pauses.
+function M:fillNpcChoices(record)
+  if not record or not record.sim or record.settled then return false end
+  local seats = record.npcIds
+  if not seats or #seats == 0 then return false end
+
+  local filed = false
+  for _ = 1, Config.BATTLE_MON_MAX * Config.COOP_FIGHTERS do
+    local any = false
+    for _, seat in ipairs(seats) do
+      if record.sim:autoPick(seat) then any, filed = true, true end
+    end
+    if not any then break end
+  end
+  return filed
+end
+
+-- Everyone in the fight, and nobody else.  A member who has dropped is skipped
+-- rather than removed: the sim is still holding their grace open.
+function M:broadcastBattle(record, msgType, payload)
+  for _, memberId in ipairs(record.memberIds) do
+    local member = self.clients[memberId]
+    if member and member.ready then send(member, msgType, payload) end
+  end
+end
+
+-- Everything the sim has produced since the last look, then the verdict if it
+-- has one.  Called after every message that can move the fight, because the
+-- sim buffers and nothing else drains it.
+function M:flushBattle(record)
+  if not record or not record.sim or record.settled then return end
+  -- Before the drain rather than after it: the trainer's answer can be the one
+  -- that closes the turn, and the events that turn produced have to go out in
+  -- this same pass or nothing else would send them until somebody else spoke.
+  -- Nothing here calls back into this function, so the two cannot chase each
+  -- other.
+  self:fillNpcChoices(record)
+  -- Fighter bags are authoritative after resolve (Turn spends on item use,
+  -- including NPC auto-pick). Sync the hub sheet and drop holds so we never
+  -- double-spend with commitBagHolds.
+  if record.sim.phase ~= "choice" then
+    self:syncBagsFromSim(record)
+  end
+  for _, event in ipairs(record.sim:drainEvents()) do
+    self:broadcastBattle(record, Wire.BATTLE_EVENT, event)
+  end
+  local outcome = record.sim:outcome()
+  if outcome then self:settleMediated(record, outcome) end
+end
+
+-- The clock, for every fight at once.
+--
+-- Called from update() below, so a host that already pumps the hub pumps the
+-- battles too and there is nothing new for src/Client.lua to remember. This is
+-- the only thing that fires a choice timeout or expires a reconnect grace: a
+-- fight whose players have all gone quiet has no other source of time.
+function M:tickBattles(now)
+  local seconds = battleSeconds(now or self.clock)
+  for _, record in pairs(self.battles) do
+    if record.sim and not record.settled then
+      record.sim:tick(seconds)
+      self:flushBattle(record)
+    end
+  end
+end
+
+-- A connection left the field.  Answers true when a live sim started its
+-- reconnect grace (the fight continues), false when the record was called off
+-- or there was nothing to leave.
+function M:leaveBattle(client)
+  if not client or not client.battleId then return false end
+  local record = self.battles[client.battleId]
+  if not record then
+    client.battleId = nil
+    return false
+  end
+  if record.sim and not record.settled then
+    if record.sim:disconnect(client.id) then self:flushBattle(record) end
+    return true
+  end
+  -- Still collecting parties or a ruleset: there is no fight to pause, so the
+  -- one that was being assembled is called off.
+  self:abortMediatedBattle(record, "gone")
+  return false
+end
+
+-- Call the fight off.  Everybody still owed a grace is disconnected and the
+-- clock pushed past it, so the sim reaches its own verdict where it can --
+-- a forfeit by the side that is still there beats a draw invented here.
+function M:abortMediatedBattle(record, reason)
+  if not record or record.settled then return end
+  if record.sim then
+    for _, memberId in ipairs(record.memberIds) do
+      record.sim:disconnect(memberId)
+    end
+    record.sim:tick(battleSeconds(self.clock) + Config.BATTLE_RECONNECT_GRACE + 1)
+    self:flushBattle(record)
+    if record.settled then return end
+  end
+  record.settled = true
+  -- No winners and no losers, spelled as their absence: Wire.battleOutcome
+  -- refuses an empty id list, so two empty lists would be an outcome no client
+  -- would read -- a battle screen with no way out.
+  self:broadcastBattle(record, Wire.BATTLE_OUTCOME, {
+    battle = record.id,
+    outcome = "draw",
+    reason = Wire.battleReason(reason) or "agree",
+  })
+  self:clearBattle(record)
+end
+
+-- The verdict, and the only account of the fight anybody gets.
+--
+-- **This replaces the two-client vote.** mmo.result exists because neither
+-- peer in a relayed battle could be believed about its own win, so two
+-- agreeing claims stood in for a witness.  Here there *is* a witness -- it did
+-- every roll -- so the rating moves on its word alone and a client's report
+-- about a mediated fight is ignored rather than weighed.
+function M:settleMediated(record, outcome)
+  if not record or record.settled then return nil end
+  record.settled = true
+
+  local payload = { battle = record.id, outcome = outcome.outcome }
+  -- Present only when there is somebody in them, for the reason
+  -- abortMediatedBattle gives: an empty list refuses the whole message.
+  if outcome.winners and #outcome.winners > 0 then
+    payload.winners = outcome.winners
+  end
+  if outcome.losers and #outcome.losers > 0 then
+    payload.losers = outcome.losers
+  end
+  if outcome.reason then payload.reason = outcome.reason end
+  if outcome.caught then payload.caught = outcome.caught end
+  self:broadcastBattle(record, Wire.BATTLE_OUTCOME, payload)
+
+  local match = self.matches[record.id]
+  if match and record.mode == "1v1" then
+    -- One battle, one settlement, whatever the verdict: the paperwork goes
+    -- either way so nothing can be paid out twice.
+    self.matches[record.id] = nil
+    self:payMediated(match, payload)
+  elseif record.mode == "coop_pvp" and self.coopMatches[record.id] then
+    self:payMediatedCoop(self.coopMatches[record.id], record.id, payload)
+  end
+
+  self:clearBattle(record)
+  return payload
+end
+
+-- Pay a 1v1 out of the intermediator's verdict.
+--
+-- The winners list is player ids and the board deals in names, so the two are
+-- joined through the paperwork startSession copied at the first turn -- which
+-- is also what makes a rating land on whoever actually fought even if one of
+-- them has since left. Every guard settleMatch applies still applies: an
+-- impostor anywhere voids the payout, and so does a claim that changed hands
+-- between the first turn and this line.
+function M:payMediated(match, payload)
+  if payload.outcome ~= "win" and payload.outcome ~= "loss"
+     and payload.outcome ~= "forfeit" then
+    return nil
+  end
+  local winners, losers = payload.winners or {}, payload.losers or {}
+  local winnerId, loserId
+  if winners[1] == match.a then
+    winnerId, loserId = match.a, match.b
+  elseif winners[1] == match.b then
+    winnerId, loserId = match.b, match.a
+  elseif losers[1] == match.a then
+    winnerId, loserId = match.b, match.a
+  elseif losers[1] == match.b then
+    winnerId, loserId = match.a, match.b
+  end
+  if not (winnerId and loserId) then return nil end
+  if not (match.aRanked and match.bRanked) then return nil end
+
+  local settled = self.board:record(winnerId, loserId, self.clock)
+  if not settled then return nil end
+  if winnerId == match.a then
+    self.board:seen(winnerId, match.aName)
+    self.board:seen(loserId, match.bName)
+  else
+    self.board:seen(winnerId, match.bName)
+    self.board:seen(loserId, match.aName)
+  end
+  self:publishPoints(winnerId, settled.winner.points)
+  self:publishPoints(loserId, settled.loser.points)
+  return settled
+end
+
+-- ...and a 2-on-2, the same way.  The four reports the client-simulated path
+-- collected are synthesised from the verdict instead, so settleCoopMatch --
+-- which already knows how to rate two sides as teams -- is reached with the
+-- unanimity it expects rather than being taught a second entry point.
+function M:payMediatedCoop(coop, id, payload)
+  if payload.outcome == "draw" then
+    self.coopMatches[id] = nil
+    return nil
+  end
+  local won = {}
+  for _, memberId in ipairs(payload.winners or {}) do won[memberId] = true end
+  for _, memberId in ipairs(coop.everyone or {}) do
+    coop.reports[memberId] = won[memberId] and "win" or "loss"
+  end
+  return self:settleCoopMatch(id)
+end
+
+-- Forget the fight and let its players out of it.  A record that outlived its
+-- battle would keep every member's battleId pointed at something settled, and
+-- the next fight they were offered would find a seat already taken.
+function M:clearBattle(record)
+  if not record then return end
+  for _, memberId in ipairs(record.memberIds) do
+    local member = self.clients[memberId]
+    if member and member.battleId == record.id then member.battleId = nil end
+  end
+  self.battles[record.id] = nil
 end
 
 -- ------- friends
@@ -1171,8 +1854,8 @@ end
 --
 -- Everything is keyed by trainer name rather than connection id, because a
 -- friendship outlives the connection that made it and a held ask has, by
--- definition, no connection left to hang on.  Rank.keyOf is the fold, the same
--- one the board uses, so "the same name" means one thing on this hub.
+-- definition, no connection left to hang on.  Wire.nameKey is the fold -- trainer names, upper-cased -- not
+-- Rank.keyOf (playerId), because friendships are keyed by the name you play as, so "the same name" means one thing on this hub.
 --
 -- Kept in step with server/lib/relay.js, which does all of this over its own
 -- client table: the same client dials a dedicated hub and a game hosted from
@@ -1190,7 +1873,7 @@ end
 function M:byName(nameKey)
   if not nameKey then return nil end
   for _, client in pairs(self.clients) do
-    if client.ready and Rank.keyOf(client.name) == nameKey then return client end
+    if client.ready and Wire.nameKey(client.name) == nameKey then return client end
   end
   return nil
 end
@@ -1238,9 +1921,9 @@ function M:holdFriend(nameKey, hold)
     self.friendHolds[nameKey] = holds
   end
 
-  local fromKey = Rank.keyOf(hold.name)
+  local fromKey = Wire.nameKey(hold.name)
   for index, held in ipairs(holds) do
-    if held.kind == hold.kind and Rank.keyOf(held.name) == fromKey then
+    if held.kind == hold.kind and Wire.nameKey(held.name) == fromKey then
       table.remove(holds, index)
       self.friendHeld = self.friendHeld - 1
       break
@@ -1270,7 +1953,7 @@ function M:takeFriendHold(nameKey, kind, fromKey)
   local holds = nameKey and self.friendHolds[nameKey]
   if not holds then return nil end
   for index, held in ipairs(holds) do
-    if held.kind == kind and Rank.keyOf(held.name) == fromKey then
+    if held.kind == kind and Wire.nameKey(held.name) == fromKey then
       table.remove(holds, index)
       self.friendHeld = self.friendHeld - 1
       if #holds == 0 then self.friendHolds[nameKey] = nil end
@@ -1306,7 +1989,7 @@ end
 -- player who logs out mid-prompt is asked again next time, whereas an answer
 -- is news that has now been delivered.
 function M:flushFriendHolds(client)
-  local key = Rank.keyOf(client.name)
+  local key = Wire.nameKey(client.name)
   local holds = key and self.friendHolds[key]
   if not holds then return 0 end
   self:sweepFriendHolds()
@@ -1319,7 +2002,7 @@ function M:flushFriendHolds(client)
       -- No `from` id: the asker may not be here, and inventing one would give
       -- the receiving client an id to answer to that means somebody else's
       -- connection.  The name is what the answer travels by anyway.
-      local asker = self:byName(Rank.keyOf(hold.name))
+      local asker = self:byName(Wire.nameKey(hold.name))
       send(client, Wire.FRIEND_ASK,
         { from = asker and asker.id or nil, name = hold.name })
       kept[#kept + 1] = hold
@@ -1351,6 +2034,10 @@ handlers[Wire.HELLO] = function(self, client, msg)
   if not name then
     return self:refuseClient(client, "That trainer name can't be used here.")
   end
+  local playerId = Wire.playerId(msg.playerId)
+  if not playerId then
+    return self:refuseClient(client, "That player id can't be used here.")
+  end
   -- A courtesy, not the gate: admit() re-checks, because on a coded hub the
   -- seat is not charged until the challenge is answered and everything that
   -- greeted in between would otherwise sail past this.
@@ -1362,9 +2049,7 @@ handlers[Wire.HELLO] = function(self, client, msg)
   -- player yet, and half-applied fields would be a player nobody admitted.
   client.hello = {
     name = name,
-    -- the ticket that says this name is theirs, if they have been here
-    -- before; absent on a first visit and on a copy that lost its save
-    token = Wire.token(msg.rankToken),
+    playerId = playerId,
     sprite = Wire.spriteId(msg.sprite) or Config.DEFAULT_SPRITE,
     profile = Wire.profile(msg.profile),
     map = Wire.mapId(msg.map),
@@ -1484,7 +2169,7 @@ handlers[Wire.SPRITE] = function(self, client, msg)
   -- who does not own the name has no business writing to its row.  Last,
   -- because it is the one call here that reaches state this handler does not
   -- own, and a leaderboard portrait is not worth anyone's announcement.
-  if client.ranked then self.board:seen(client.name, client.sprite) end
+  if client.ranked then self.board:seen(client.id, client.name, client.sprite) end
 end
 
 handlers[Wire.CHAT] = function(self, client, msg)
@@ -1700,8 +2385,8 @@ handlers[Wire.FRIEND_ASK] = function(self, client, msg)
   local target = self.clients[Wire.id(msg.to) or ""]
   if not (target and target.ready) or target.id == client.id then return end
 
-  local mine = Rank.keyOf(client.name)
-  local theirs = Rank.keyOf(target.name)
+  local mine = Wire.nameKey(client.name)
+  local theirs = Wire.nameKey(target.name)
   -- Two connections wearing one name on a hub that never claimed it.  There is
   -- no friendship to form between a name and itself, and the hold table is
   -- keyed by name, so an ask filed here would be one this player could answer
@@ -1724,7 +2409,7 @@ end
 
 handlers[Wire.FRIEND_ANSWER] = function(self, client, msg)
   if not client.ready then return end
-  local mine = Rank.keyOf(client.name)
+  local mine = Wire.nameKey(client.name)
   local asker = Wire.nameKey(msg.toName)
   if not (mine and asker) then return end
 
@@ -1740,7 +2425,7 @@ end
 
 handlers[Wire.FRIEND_REMOVE] = function(self, client, msg)
   if not client.ready then return end
-  local mine = Rank.keyOf(client.name)
+  local mine = Wire.nameKey(client.name)
   local theirs = Wire.nameKey(msg.toName)
   if not (mine and theirs) or mine == theirs then return end
 
@@ -1787,7 +2472,21 @@ end
 
 handlers[Wire.COOP_CANCEL] = function(self, client, msg)
   if not client.ready then return end
-  self:clearCoopOffer(client, Wire.coopReason(msg and msg.reason) or "left")
+  local reason = Wire.coopReason(msg and msg.reason) or "left"
+  -- Own standing offer withdrawn (STOP / ALONE / timeout).
+  if client.coopOffer then
+    return self:clearCoopOffer(client, reason)
+  end
+  -- Partner declined our invite: clear the waiter's offer and tell them so
+  -- they can go in alone. Only `no` takes this path -- other reasons without
+  -- an own offer are noise from a client that is not waiting.
+  if reason == "no" then
+    local partner = self:partnerOf(client)
+    if partner and partner.coopOffer then
+      partner.coopOffer = nil
+      send(partner, Wire.COOP_DECLINE, { name = client.name, reason = "no" })
+    end
+  end
 end
 
 -- "Yes, I'll join you."  The one message that ends a wait.
@@ -1804,7 +2503,13 @@ handlers[Wire.COOP_JOIN] = function(self, client, msg)
 
   local offer = host.coopOffer
   local battle = Wire.battleKey(msg.battle)
-  if not (offer and battle and offer.battle == battle) then return end
+  if not (offer and battle and offer.battle == battle) then
+    -- Too late: the waiter already went in alone (or walked off). Tell the
+    -- joiner so a yes that raced a withdraw is not silence -- same sentence
+    -- their confirm would have gotten from onOfferEnd.
+    send(client, Wire.COOP_OFFER_END, { reason = "alone" })
+    return
+  end
 
   -- Taken off the table before either side is told, so a second join racing
   -- this one finds nothing to accept rather than starting the fight twice.
@@ -1823,11 +2528,26 @@ handlers[Wire.COOP_JOIN] = function(self, client, msg)
   -- The pair get a fan-out group of their own, on the same footing as a
   -- four-player one: from here on the battle traffic does not care which of
   -- the two ways it was agreed.
-  local id = tostring(self.nextCoopAsk)
+  --
+  -- `coop_npc`, and it is the flow that decides it rather than a head count:
+  -- this pair agreed by one of them standing in front of a trainer, so the
+  -- other side of the field is that trainer -- an opponent with a party and no
+  -- connection.  The four-way path is the only one that makes a `coop_pvp`,
+  -- because it is the only one where both sides are players.
+  -- "c", for startSession's reason: sessions and co-op battles share the
+  -- `battles` table and are numbered by two counters that know nothing of each
+  -- other.
+  local id = "c" .. tostring(self.nextCoopAsk)
   self.nextCoopAsk = self.nextCoopAsk + 1
-  self:openCoopBattle(id, { host.id, client.id })
+  self:openCoopBattle(id, { host.id, client.id },
+    { mode = "coop_npc", hostId = host.id })
 
-  send(host, Wire.COOP_JOINED, { id = client.id, name = client.name })
+  -- `plan` is the hub's mediated battle id (`c*`). Without it the waiting
+  -- host's CoopBattle has no battleId, uploadMediated is a no-op, and the
+  -- fight silently stays on host CoopSim while the joiner alone holds `c*`.
+  -- `id` remains the joiner (who joined), matching what clients already read.
+  send(host, Wire.COOP_JOINED,
+    { id = client.id, name = client.name, plan = id })
   -- `host` names the client that simulates. It is the player who was already
   -- standing at the fight, because they are the one *guaranteed* to have
   -- walked into the trainer -- the joiner usually has too, but a join taken
@@ -1843,6 +2563,26 @@ end
 -- the only thing that can be judged, and Wire.payloadOk is what judges it.
 handlers[Wire.COOP_RELAY] = function(self, client, msg)
   if not client.ready or not client.coopBattleId then return end
+
+  -- ...unless the hub is running this one, in which case the same cut
+  -- mmo.relay gets applies and for the same reason.
+  --
+  -- **The cut engages when the sim does, not when the group opens**, and that
+  -- is the one place the co-op path deliberately differs from the 1v1.  A
+  -- group exists from the moment two players agree; the fight only becomes
+  -- mediated when a ruleset and every party have arrived.  Cutting at the
+  -- group would take the client-simulated path away from a client that has
+  -- not been rewritten to upload one yet, and would take it away *silently*
+  -- -- a partner watching a battle screen that never advances.  So the two
+  -- coexist for exactly as long as it takes one fight to become mediated, and
+  -- no longer: the moment an intermediator owns the rolls, a second set of
+  -- them fanned out from a client is the desync it looks like.
+  local mediated = self.battles[client.coopBattleId]
+  if mediated and mediated.sim then
+    return noteDrop(self, client,
+      "this co-op battle is mediated -- the battle_* types are the way in")
+  end
+
   if not Wire.payloadOk(msg.payload) then
     return noteDrop(self, client, "the co-op payload is not a shape we forward")
   end
@@ -1865,6 +2605,16 @@ end
 -- of its players would be a group with nothing left to carry.
 handlers[Wire.COOP_LEAVE] = function(self, client)
   if not client.ready or not client.coopBattleId then return end
+  -- ...except while the hub is refereeing it, where one player walking out is
+  -- a disconnection and not a verdict.  The others keep fighting, and the
+  -- leaver's grace decides whether they come back or forfeit -- ending the
+  -- whole thing on their say-so would hand any of the four a way to void a
+  -- battle they were losing.
+  local record = self.battles[client.coopBattleId]
+  if record and record.sim then
+    if record.sim:disconnect(client.id) then self:flushBattle(record) end
+    return
+  end
   self:closeCoopBattle(client.coopBattleId)
 end
 
@@ -1883,7 +2633,7 @@ handlers[Wire.COOP_CHALLENGE] = function(self, client, msg)
   local theirs = self:partyMembers(target.partyId)
   if #mine ~= Config.PARTY_MAX or #theirs ~= Config.PARTY_MAX then return end
 
-  local id = tostring(self.nextCoopAsk)
+  local id = "c" .. tostring(self.nextCoopAsk)
   self.nextCoopAsk = self.nextCoopAsk + 1
 
   local sideA, sideB, everyone = {}, {}, {}
@@ -1941,9 +2691,115 @@ handlers[Wire.COOP_ANSWER] = function(self, client, msg)
   if yes > ask.needed then self:startCoopBattle(id) end
 end
 
+-- ------- the four things a client says during a fight the hub is running
+--
+-- What comes back -- mmo.battle_ready, mmo.battle_event, mmo.battle_outcome --
+-- is sent from the methods above rather than from here, because it is the
+-- sim's word rather than an answer to any one message.
+
+-- The ephemeral ruleset: the type chart this one match runs under.
+--
+-- A `seed` still parses, because the field has ridden this message since the
+-- lockstep days, but tryStartSim does not read it -- see the note there for why
+-- the RNG is the intermediator's alone.
+--
+-- The authority's to upload and nobody else's -- the asker in a 1v1, the
+-- player who was already standing at the trainer in a co-op fight.  Not
+-- because a guest's chart would be worse, but because two charts is a fight
+-- with no answer to "which", and taking the second to arrive would let either
+-- side re-roll the matchups by sending one late.
+handlers[Wire.BATTLE_RULESET] = function(self, client, msg)
+  local record = mediatedOf(self, client)
+  if not record or record.sim then return end
+  if client.id ~= record.hostId then return end
+
+  local ruleset = Wire.battleRuleset(msg)
+  if not ruleset then
+    return noteDrop(self, client,
+      "the ruleset is not a shape we can fight under")
+  end
+  record.ruleset = ruleset
+  self:tryStartSim(record)
+end
+
+-- One combatant's team.  Stored under the seat it belongs to -- normally the
+-- sender's own -- and the fight opens on the message that completes the set.
+handlers[Wire.BATTLE_PARTY] = function(self, client, msg)
+  local record = mediatedOf(self, client)
+  if not record or record.sim then return end
+
+  local party = Wire.battleParty(msg)
+  if not party then
+    return noteDrop(self, client, "the party is not a shape we can fight with")
+  end
+  -- The battle it names has to be the one this connection is in.  A party for
+  -- another fight is not a party that was mis-addressed, it is a sheet whose
+  -- sender believes it is being used somewhere else.
+  if party.battle ~= record.id then return end
+
+  if not self:fillBattleParty(record, client, party) then return end
+  self:tryStartSim(record)
+end
+
+-- One turn's intent.  Who it is from is the connection it arrived on and never
+-- a field, so there is nothing here for a modified client to spend somebody
+-- else's turn with.
+handlers[Wire.BATTLE_CHOICE] = function(self, client, msg)
+  local record = mediatedOf(self, client)
+  if not record or not record.sim then return end
+
+  local choice = Wire.battleChoice(msg)
+  if not choice or choice.battle ~= record.id then return end
+  -- Item choices are proved against the bag uploaded with the party
+  -- (PROTOCOL 15). A missing stack costs the message and nothing else —
+  -- same silence as a refused choice — so the turn clock keeps running.
+  -- The stack is *held* until the turn resolves; cancel clears the hold.
+  if choice.action == "item"
+     and not self:canSpendBag(record, client.id, choice.item) then
+    return
+  end
+  if not record.sim:submitChoice(client.id, choice) then return end
+  if choice.action == "item" then
+    self:holdBag(record, client.id, choice.item)
+  elseif choice.action == "cancel" then
+    self:clearBagHold(record, client.id)
+  end
+  self:flushBattle(record)
+end
+
+-- Back inside the grace.
+--
+-- What this covers is a client that left the *field* -- backed out to the
+-- overworld, dropped its session, lost the battle screen to a crash it
+-- recovered from -- and still holds the connection it was fighting on.  A peer
+-- whose socket actually died cannot come back through here at all: identity on
+-- this hub is the connection, so the returning process is a new client with a
+-- new id and its fight forfeits when the grace runs out.
+handlers[Wire.BATTLE_RECONNECT] = function(self, client, msg)
+  local record = mediatedOf(self, client)
+  if not record or not record.sim then return end
+  local rejoin = Wire.battleReconnect(msg)
+  if not rejoin or rejoin.battle ~= record.id then return end
+  record.sim:reconnect(client.id)
+  self:flushBattle(record)
+end
+
 handlers[Wire.RELAY] = function(self, client, msg)
   if not client.ready or not client.sessionId then
     return noteDrop(self, client, "sender is not in a session")
+  end
+  -- PROTOCOL 10's hard cut, and it is a cut rather than a preference.
+  --
+  -- A mediated battle exists for every battle session this hub brokers, so
+  -- from here on the engine's lockstep vocabulary has nowhere to go: the two
+  -- clients would agree a seed between themselves and fight a second,
+  -- invisible battle beside the one the hub is resolving, and the first
+  -- disagreement would be a player watching their own screen contradict the
+  -- outcome they are about to be sent.  Trade sessions are untouched -- there
+  -- is no trade sim here and there is not going to be one.
+  if self.battles[client.sessionId] then
+    return noteDrop(self, client,
+      "this battle is mediated -- the battle_* types are the way in")
   end
   local peer = self:peerOf(client)
   if not peer then
@@ -1970,6 +2826,17 @@ handlers[Wire.RESULT] = function(self, client, msg)
   local id = Wire.id(msg.session)
   local outcome = Wire.outcome(msg.outcome)
   if not (id and outcome) then return end
+
+  -- A fight the hub itself resolved has no use for a vote.  settleMediated
+  -- paid out from the witness's verdict already; an honest report here is
+  -- redundant and a dishonest one is the whole thing that path removes.
+  --
+  -- Gated on the sim rather than on the record, because a record exists for
+  -- every battle session from the moment it opens.  Until a ruleset and both
+  -- parties arrive the two clients are still on the lockstep path and their
+  -- vote is still the only account of the fight there is.
+  local mediated = self.battles[id]
+  if mediated and mediated.sim then return end
 
   -- A co-op battle files under its own paperwork, because four players report
   -- one battle rather than two.
@@ -2009,14 +2876,33 @@ end
 -- ------- entry points
 
 function M:receive(client, msg)
-  if not (client and self.clients[client.id]) then return end
+  if not client then return end
+  if not self.clients[client.id]
+     and not (client.ephemeralId and self.byEphemeral
+              and self.byEphemeral[client.ephemeralId] == client) then
+    return
+  end
   if type(msg) ~= "table" or type(msg.type) ~= "string" then return end
   local handler = handlers[msg.type]
-  if handler then handler(self, client, msg) end
+  if not handler then return end
+  -- Contained, matching server/lib/relay.js handle(): a Turn/Damage throw must
+  -- not take the LAN host down. The next message still lands; the fight's own
+  -- resolveDeadline is what finishes a wedge left mid-resolve.
+  local ok, err = pcall(handler, self, client, msg)
+  if not ok and self.onHandlerError then
+    self.onHandlerError(msg.type, client.id, err)
+  end
 end
 
 function M:update(dt)
   self.clock = self.clock + (dt or 0)
+
+  -- Before the sweeps, deliberately: a fight that ends on this tick should be
+  -- told to its players from the clock that ended it, not from whatever the
+  -- next message to arrive happens to be. src/HostServer.lua already calls
+  -- this every frame, so a host that pumps the hub pumps its battles too and
+  -- there is nothing new for src/Client.lua to remember.
+  self:tickBattles(self.clock)
 
   -- Reap connections that never finished introducing themselves. Without
   -- this a peer can hold a slot indefinitely simply by saying nothing.
@@ -2111,8 +2997,10 @@ function M:shutdown(message)
   self.clients, self.count, self.players = {}, 0, 0
   self.sessions, self.parties = {}, {}
   -- The asks and the battles go with the connections they were between; there
-  -- is nobody left to answer one or to fight the other.
+  -- is nobody left to answer one or to fight the other.  A fight in progress
+  -- does not survive the process that was refereeing it.
   self.coopAsks, self.coopBattles, self.coopMatches = {}, {}, {}
+  self.battles = {}
   -- The board survives: it is the hub's record, not the connection's, and a
   -- host who stops and starts a game has not un-won anybody's battles. The
   -- half-reported matches do not -- their sessions are gone.
