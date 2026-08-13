@@ -8,6 +8,314 @@ here must match `manifest.version`.
 
 ### Added
 
+- **Modern battle band.** The stretched GB message box and menus at the bottom
+  of the arena are replaced by native widescreen panels (message, command
+  grid, scrolling lists with PP/HP columns) in the plate visual language,
+  shared by CoopBattle and MediatedBattle; the classic 160×144 and Gen2
+  screens keep their GB chrome. The command grid lays out 4-across and the
+  cursor walks it that way.
+- **Pokéball throws animate on the arena.** An original vector pokéball arcs
+  to the target, the mon recalls into it at the engine's HIDEPIC beat, each
+  referee shake reads as one wobble, and the break-free or catch resolves in
+  wire order — the fanfare waits for the last wobble. A caught mon stays in
+  its ball; an interrupted chain cleans up instead of hiding the seat.
+- **EXP bar on your own battle plate (co-op).** A thin blue strip under the
+  HP bar shows progress to the next level, driven by a display clock like
+  the HP bar. After a foe faints and the "gained N EXP" line shows, the
+  strip crawls; on a level-up it fills, resets, and the level pill ticks —
+  then the "grew to level" text follows, then the HP climb (which also
+  fixes the bar's value-vs-denominator desync on multi-award turns and
+  under EXP.ALL). Partner and foe plates carry no strip; mediated wild,
+  co-op wild and co-op NPC fights now award exp too (see PROTOCOL 21
+  below) — PvP (1v1 and coop_pvp) still awards none.
+- **PROTOCOL 21 — exp in mediated battles.** `Config.PROTOCOL` / `relay.js`
+  bump **20 → 21**. The hub holds no ROM species table (locked legal
+  floor), so the referee can never compute an exp amount — after a faint
+  it emits a facts-only `exp` event per **participant** (`slot`, `mon` —
+  the party index of the paid monster — `species`, `level`,
+  `participants`; not an amount, not `winners`), and each client runs
+  its own `Experience` formula over its own `save.party` mon and applies
+  the result locally. Sharing is vanilla: every mon that was fielded
+  against the fallen foe and still stands splits the award, benched
+  included; fainted participants neither pay out nor dilute; the
+  participation set resets when the foe's monster changes — mirrored
+  from the engine's own solo award logic and pinned byte-identical
+  across the Lua and Node referees. The on-field EXP bar animates only
+  for the active mon; a benched share arrives as text (level-ups and
+  move learning included). Paying modes are
+  `wild`, `coop_wild` and `coop_npc` — the modes vanilla itself awards
+  exp for; 1v1 and `coop_pvp` never emit, so there is no PvP farming
+  loop. Gen1 twins only (`src/BattleSim/Turn.lua` +
+  `server/lib/battle/Turn.js`); Gen2 (`BattleSim2` / `lib/battle2`)
+  stays exp-free. `exp` joins `Wire.BATTLE_EVENTS` and
+  `server/lib/sanitize.js`'s event whitelist in lockstep.
+- **Your partner sees the `!` too.** When one party member gets pulled
+  into a fight, the other's screen now shows the classic `!` bubble
+  bobbing over that player's avatar — drawn by the mod (original vector
+  art) and anchored to the avatar rather than any NPC, so it works even
+  when the two players run different ROMs. It stands from the moment the
+  offer lands until the join completes.
+- **Co-op prompts render over classic battles.** A day-one bug in the
+  UI paper machinery flattened the whole frame whenever a mod prompt
+  opened over a classic engine battle (which publishes no color zones by
+  design) — the WAIT/ALONE choice showed as a cut-off empty box. Mod
+  screens now decline to claim zones when the state beneath authored
+  none, matching the engine's own rule.
+- **The waiting screen is gone.** Triggering a co-op fight leaves the
+  engine's own encounter on screen while the partner is pulled in
+  (sub-second) — no cover, no flash. If the join hasn't landed in six
+  seconds, the fight proceeds solo with one line: "X couldn't join!" —
+  same message at a trainer or in the grass. A partner on a different
+  map doesn't wait at all: "X was too far to join!" and the solo fight
+  starts immediately (no offer even posted). And the joiner now gets a
+  proper battle-entry fade instead of a cold cut to the arena — drawn
+  through the engine's own screen-veil channel, both sides consistent.
+- **A stolen KO redirects your partner's attack.** When a faster ally
+  knocks out the mon a slower attack was aimed at, the attack no longer
+  fizzles ("has no target") — it retargets whoever now stands in that
+  field position, else the nearest living opponent, and only skips when
+  the whole side is down. Applied once per action (multi-hit included);
+  charging moves and Bide track the seat they actually swung at. Both
+  the hub referee and the LAN host-sim pay the same rule (the host-sim
+  already retargeted but attacked corpses when every foe seat was
+  empty — also fixed).
+- **The attack callout shouts once.** A co-op attack raised its
+  "PIKACHU! / THUNDERBOLT!" bubble up to three times (the beat's
+  re-queued row lacked the guard its 1v1 twin had, and the original
+  text-line raise sat a whole move animation later) — one shout per
+  attack now, with multi-hit moves refreshing the same bubble.
+- **The party IS the consent — no more WAIT/ALONE.** A partied player who
+  triggers a trainer fight goes straight into the co-op flow; the waiting
+  cover keeps a single ALONE row as the escape, and cancelling the party
+  remains the opt-out for co-op battles entirely.
+- **Replacements resolve before the next turn.** The referee gains a
+  replace phase: after a KO nobody picks a move until every seat owing a
+  replacement has fielded one — NPC replacements land in the same batch
+  (faint, switch, send, turn), and a human's partner sees "X is choosing
+  who to send out..." instead of an empty field behind an open menu.
+- **You can actually see your partner enter a fight.** The `!` bubble is
+  raised the moment the offer arrives (it previously never was — the
+  offer was consumed in the same call that set it), lives for the whole
+  pre-battle window with a 2.5s floor, and the "Joining X's battle!"
+  line is now a toast that survives the battle covering the screen.
+- **Your partner joins co-op fights automatically.** Choosing WAIT at a
+  trainer or wild encounter now pulls your partied partner straight into
+  the 2v2 — no walking to the NPC, no confirm box (the party itself is
+  the consent; a "Joining X's battle!" line lands in their chat). A busy
+  partner (mid-battle, mid-trade) is retried every half-second and joins
+  the moment they're free; if they never free up, the waiter is released
+  to fight alone after the standard ask timeout, and a partner whose
+  offer expires now tells the waiter instead of leaving a stale box.
+  Mutual waits resolve deterministically. The four-way PARTY BATTLE
+  challenge keeps its explicit yes/no — a different consent surface.
+- **Send-outs are thrown.** The owner-designed sequence: the "sent out"
+  line prints, the trainer's pokeball arcs from their field position to
+  the empty seat, and the mon materializes out of the burst — for every
+  send: battle intros (staggered per seat), switches, and post-faint
+  replacements. Wild appearances keep a plain materialize (nobody throws
+  a wild mon). Along the way: the referee's switch+send pair no longer
+  plays twice on the 1v1 screen, and mediated co-op intros play once
+  (the referee's own send-outs are the intro) instead of twice with
+  different wording. Same-side mons also gained real vertical air (the
+  pair rows moved from touching to a 24px gap; under plate pressure the
+  trainers drift instead of the mons compressing).
+- **A fainted mon stays fainted, even through packet loss.** The co-op
+  screen's faint rows are now HP-authoritative (a lost lethal-damage
+  packet can no longer leave a locally "living" corpse), the fainted
+  display flag is a one-way latch, and every seat's bar drains to zero
+  ahead of the sink — closing the last way a KO'd monster could stand
+  back up with its pre-KO HP.
+- **Send-outs materialize during their spawn beat.** A sent-out mon no
+  longer stands on the field before its animation: the arrival is parked
+  until its queued spawn row plays (empty seats stay hidden until the
+  pop), which also restores the departing mon's drain, sink and release
+  in refereed replacements — the parse-time relabel had been silently
+  cancelling all three. Referee send/switch events now carry the party
+  index of the fielded mon, so duplicate-species NPC teams can no longer
+  resurrect a fainted mon on the arena (the client also prefers living
+  namesakes, and both sims refuse to field a monster at 0 HP). The
+  vector pokeball got volume shading, a fixed specular over the spinning
+  shell, and a crisper band and button — still 100% programmatic art.
+- **Canonical attack chronology.** Every attack now plays its beats in
+  strict order on the arena: the trainer's callout stands alone, then the
+  attacker lunges, then the hit flashes with the bar frozen, then the HP
+  drains — followed by the already-ordered sink, fainted line, switch
+  choice and send-out. Multi-hit moves call out once and land one hit beat
+  per strike; heals skip both beats; classic and Gen2 screens are
+  untouched. The order is pinned by per-twin regression tests.
+- **Trainer speech bubbles v2.** Rounded callouts with the move name
+  emphasized on its own line, sized from real font metrics.
+- **Battlefield HUD plates.** The Gen1 arena now shows a persistent plate per
+  fielded mon — name, level, thresholded HP bar, status; exact `hp/maxHp`
+  numbers on your own side — stacked per side (co-op 2v2 gets all four), fed
+  by the display clock so bars drain instead of snapping. The floating target
+  card only appears when a pick is between multiple targets.
+- **Battle fx on the arena.** Attackers lunge, defenders flash, damaging
+  hits nudge the field (clamped), fainting mons sink and fade before their
+  line prints, and sent-out mons pop in — all queue-sequenced so nothing on
+  screen jumps ahead of the text that explains it. MediatedBattle gains the
+  engine-rate two-clock HP drain (`max(1, maxHp/96)` per frame); victory
+  music keeps waiting for drains and faints to finish.
+
+### Fixed
+
+- **NIRE faced the wrong way everywhere.** The custom walk sheets were
+  authored mirrored against the engine convention (the stand-left frame held
+  a right-facing pose); the left-facing frames are flipped, fixing the arena
+  and the overworld in one stroke.
+- **Trainer placement.** Humans now stand at the vertical center of the
+  field and stack inside it — a two-player side used to render its second
+  trainer above the arena into the letterbox. Two-mon sides pull in off the
+  arena edges (no more half-clipped seat 1), with everything clamped inside
+  the field.
+- **NPC co-op fights show their trainer.** Classes without a literal walk
+  sprite (BUG CATCHER, LASS, …) resolve through the class→sprite pairing the
+  engine's own map objects establish, with a generic fallback — the foe edge
+  is never empty. Battle callouts now shout "PIKACHU!" / "THUNDERBOLT!"
+  instead of a flat "used" line.
+- **Custom characters render legibly on the arena.** The mod's own walk
+  sheets carried export residue outside the 4 DMG shades, collapsing most
+  pixels into the darkest palette bin — NIRE read as a black blob. Sheets are
+  requantized to the canonical shades; battle-canvas trainer color also keys
+  its bake cache by color mode.
+- **Co-op arena polish.** Letterbox no longer leaks the overworld around the
+  arena (the white-paper vote is withdrawn on the battlefield path and the
+  canvas is filled); plates read real max HP instead of always drawing full;
+  host-sim fights lunge their attacker; multi-shake throws no longer double-
+  drive the engine's shake audio.
+- **Ally mons on the arena face their opponent.** Left-seat battle fronts
+  are mirrored (right-edge-anchored flip) instead of staring at the camera;
+  foe seats keep the vanilla front pose.
+- **Trainer figures on the arena render in color.** Walk sheets are baked
+  through the engine's per-sprite OBJ palettes (`PaletteFX.spriteObp`) at
+  resolve time — the battle canvas opts out of the zone shader that would
+  otherwise colorize them, which left both trainers DMG-gray. Bake cache is
+  keyed by color mode and cleared on fight entry.
+- **A replacement batched behind a KO no longer inherits the faint.** Drain,
+  sink and pic-release rows are stamped with the mon they were filed for and
+  refused when the seat changes hands mid-queue.
+
+- **Gen 2 co-op / mediated battle theatre.** Quarkst battle music, victory
+  jingles, map restore, and hit/catch SFX now resolve through Gen 2
+  `BattleMusic` song labels and Gold SFX names (`Sfx_SuperEffective`,
+  `Sfx_BallWobble`, …) instead of Gen 1 `Music.playBattle(kind)` /
+  `data.audio.battle[kind]` (absent on Gold). Gen 2 trainer faces use
+  `enemyTrainerImage` as `trainerPic` for the theatrical intro. Gen 1 path
+  unchanged.
+- **Code-review must-fixes (gen2-compatibility).** Trade2 keeps `theirMail`
+  aligned with `theirParty` when a non-strict unpack skips a mon; Hub↔relay
+  `battleParty`/`cleanBattleParty` take hub generation (Effects twin, refuse
+  explicit generation mismatch, stamp party.generation); `Gen.freeRoam`
+  empty-stack only on Gen 2; `money.get` no longer creates `save.player`;
+  Gen2 vitamin writeback uses BattleSim2/Effects only.
+
+### Added
+
+- **Gen1 top-down battlefield theatre (CoopBattle + MediatedBattle 1v1).**
+  Hard-cut Gen1 presentation onto a 640×360 fill-scale arena
+  (`assets/battle/outdoor_grass_arena.png` — original authored field art,
+  not ROM-derived) via `src/Battlefield.lua`: humans on the sides (OW walk
+  sheets, facing inward), active mons as **battle front sprites** (aspect-
+  preserved; bag-icon sheets were stretching/smashing), field-cursor
+  targeting with arrow + floating status card (name / Lxx / HP / status /
+  front sprite), Pokémon bob + ground shadow, and trainer-head callout
+  bubbles when a human’s mon acts (not wild). Gen2 keeps the classic
+  guild-focus / 160×144 path until a later pass.
+- **PROTOCOL 20 — gen lock + co-op invite joiner finish.** `Config.PROTOCOL` /
+  `relay.js` bump **18 → 20** (both parallel branches had claimed 19). Client
+  `mmo.hello` carries `generation` (1|2); Hub.lua and the Node relay refuse a
+  mismatch after the protocol check (`This hub is for generation N; yours is
+  generation M.`). Optional `npcId` / `event` on `mmo.coop_wait` → offer →
+  battle carry the waiter's overworld trainer so a menu/invite joiner (no
+  buried `BattleState`) can mark that NPC beaten, take prize money, and run
+  `afterBattle` after a co-op win — without a solo rematch. Missing
+  `generation` defaults to 1; hub `opts.generation` defaults to 1 (Gen2 hubs
+  must set `generation: 2`). Gen1 behaviour unchanged when the hub stays on
+  generation 1.
+- **Co-op gym battle music via oppClass#partyIndex.** `CoopBattle.musicKind`
+  probes `computeMusicKind` with `oppClass` + `partyIndex` (from the buried
+  engine or PROTOCOL 20 npcId), so badge gym leaders (Brock, Misty, Giovanni
+  #3, …) get gym music — not only Lance / Rival3 via `trainer.id`.
+- **MediatedBattle battle / victory / map music.** 1v1 link fights and
+  protocol-only wild now call `Music.playBattle` on enter, `playVictory` once
+  on a win (including catch), and `restoreMap` on exit — same theatre
+  contract as CoopBattle (was silent on overworld music for the whole fight).
+- **Co-op / mediated attack SFX.** CoopBattle and MediatedBattle poll
+  `AnimPlayer` effects like solo `BattleState` (move whoosh / cry /
+  `SFX_TINK`) and play effectiveness hit thuds after the flash.
+- **Trainer foe theatrical intro on co-op NPC battles.** Appear line,
+  trainer face, foe ball row, and sequential foe send-outs before ally
+  `Go!` (wild / PvP unchanged).
+
+- **Wave 4 polish + dual-gen headless load.** `Places.name` resolves Gen 2
+  landmarks via `data.gen2Landmarks` (no `data.field` crash); Overlay soft-
+  skips Gen 2 POKeGEAR MAP (`pokegear-skip`) instead of treating it as TownMap;
+  `Chars.list` / `resolve` fall back through `Gen.defaultSprite`. Suite loads
+  with `{ generation = 1 }` and `{ generation = 2 }` (both `loaded`, no
+  errors); `tests/drivers/run-mmo-e2e-gen2.sh` documents Gen 2 hub
+  (`--generation 2`) + Gold boot and exits 0 when the Gold cache is absent.
+
+- **Gen2 co-op strategy split (Wave 3 T3a).** Hub-mediated co-op
+  (`coop_pvp` / `coop_npc` / `coop_wild`) opens on Gen 2 without hard-failing
+  on missing Gen1 `BattleState`/`Damage`: `CoopBattle.loadEngine` soft-loads,
+  `CoopField` / Gen1 host-sim `CoopSim` resolve are refused with a remediation
+  pointing at a Gen 2 hub (BattleSim2), and the screen replays mediated events
+  with slot fallback battlers. Party pack/unpack uses `packMon2`/`unpackMon2`.
+  `Coop.badgesOf` delegates to the MK403-safe MediatedBattle path; MoveLearnMenu
+  is capability-tested / skipped on Gen 2 (no Gen2MoveLearnMenu). Gen1 host-sim
+  CoopField path unchanged. Deferred: full Gen2 CoopField rewrite, Gen2
+  MoveLearnMenu, host-sim Damage on Gold.
+
+- **Gen2 trade over SessionNet (Wave 3 T3b).** When `Gen.generation(game)==2`,
+  `Sessions` opens `Trade2.TradeSession` (packMon2/unpackMon2, parallel party
+  `mail` array, apply into party + `pokedex.caught` + held item). Gen1 still
+  uses engine `Protocol.TradeSession`. Soft-fails with remediation if the
+  engine lacks packMon2 or Mail.
+
+- **Gen2 battle sheets on the wire + MediatedBattle upload (Wave 2 T2c).**
+  `Wire.battleMon` / `server/lib/sanitize.js` accept Gen 1 `atk/def/spd/spc`
+  and Gen 2 `atk/def/spe/spa/spd` (+ optional `heldItem`), preferring an
+  explicit `generation` then shape-sniff. MediatedBattle uploads the Gen 2
+  dialect when `Gen.generation(game)==2`, fixes MK403 `badgesOf` (no Gen 1
+  `src.battle.Damage` on Gold), and writes Gen 2 vitamin Stat Exp via the
+  engine's `special` word + `specialAttack`/`specialDefense` live stats.
+
+- **Hub/LAN host selects Gen1 vs Gen2 battle sim by generation (Wave 2 T2d).**
+  `Hub.new` / `Relay` constructor load `BattleSim`+`Effects` when
+  `generation` is 1 (default) and `BattleSim2` / `lib/battle2` when it is 2;
+  every mediated open/turn path uses the instance twin. Node bag sanitise
+  picks Effects by the same generation. Gen1 hubs behave as before; Gen2
+  hubs never instantiate Gen1 Turn.
+
+- **Gen2 BattleSim2 formulas + Turn scaffold (Wave 2 T2a).** New pure
+  `src/BattleSim2/` sibling (SpA/SpD damage, crit ladder, 85–100% variance,
+  damage cap 999, freeze 1/5 thaw, burn/poison /8) with
+  `tests/fixtures/battle_sim2_vectors.json` and
+  `tests/battle_sim2_vectors.lua`. Gen1 `src/BattleSim/` untouched.
+
+- **Node Gen2 battle twin (Wave 2 T2b).** `server/lib/battle2/` mirrors
+  `src/BattleSim2/` (Damage / Crit / Accuracy / Status / Rng / Effects / Turn /
+  events). `server/battle2_vectors.test.js` pins
+  `tests/fixtures/battle_sim2_vectors.json` integer-identical to Lua. Hub
+  generation selection is T2d.
+
+- **Hub `--generation` / config `generation` (Wave 1 T1b).** CLI and config
+  lock a hub to Gen 1 or Gen 2 (`--generation 1|2`, `generation:` in
+  `config.json`, `RBY_MMO_GENERATION`). Compat default is 1 when omitted, with
+  a startup warning that Gen 2 hubs must pass `--generation 2`. In-game HOST
+  binds the boot's generation via `Gen.generation()`. Equal-peer Gen 1 / Gen 2
+  run recipes are in `server/README.md`. (Server-list gen chip deferred —
+  no row field carries generation yet.)
+
+- **Gen 1 + Gen 2 dual claim (Wave 0).** `manifest.games` is
+  `["gen1","gen2"]`. New `src/Gen.lua` helpers cover money (`save.money` vs
+  `save.player.money`), dex (`owned` vs `caught`), badges, free-roam
+  (overworld-on-top vs empty Gen 2 stack), StartMenu / Gen2StartMenu cancel,
+  and avatar spawn (STAY+range vs numeric STANDING_* + name lookup). Presence,
+  chat, party UI, and save-side money/heal paths are generation-aware.
+  Hub-locked Gen 2 BattleSim / trade / co-op land in later waves — see
+  `docs/plans/gen2-compatibility.md`.
+
 - **PROTOCOL 18 — Party vs Wild (`coop_wild`).** `Config.PROTOCOL` / `relay.js`
   bump **17 → 18**. New mediated mode: two partied humans vs one wild NPC
   seat. When partners share a map, a grass encounter auto-opens the fight
@@ -49,7 +357,17 @@ here must match `manifest.version`.
 - **Plan docs indexed.** `docs/plans/README.md` marks living vs historical;
   stale plans carry a historical banner (old PROTOCOL citations are archive).
 
-## [1.0.0] - 2026-08-09
+### Fixed
+
+- **Co-op win music before HP drains.** Victory fanfare is queued as a message
+  `act` after that batch's drains and faint sinks, so a multi-attacker final
+  KO no longer plays the jingle while Gust still animates a living bar.
+- **Heal-shaped HP revive illusion.** Drains that would climb `shownHP` after
+  a faint is queued / display-fainted are skipped; strip icons follow display
+  faint rather than premature sim `isDown`.
+- **Joiner immediate rematch after co-op NPC win.** Walk-in harden via
+  `claimBuriedEngine`; invite joiners finish via PROTOCOL 20 synthetic
+  defeat (see Added).
 
 First stable release line. Hub-mediated battles (0.11.x) are the supported
 path for MMO 1v1 / co-op; BattleSim locked decisions and the UX/fidelity

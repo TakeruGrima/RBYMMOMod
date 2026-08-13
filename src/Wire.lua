@@ -19,9 +19,21 @@
 
 local need = ...
 local Config = need("Config")
-local Effects = need("BattleSim/Effects")
 
 local M = {}
+
+-- Effects for bag proofs: Gen1 default, Gen2 when hub generation is 2.
+-- Lazy so a Gen1-only load never pulls BattleSim2.
+local effectsByGen = {}
+local function effectsFor(generation)
+  local key = (generation == 2) and 2 or 1
+  local cached = effectsByGen[key]
+  if cached then return cached end
+  local path = key == 2 and "BattleSim2/Effects" or "BattleSim/Effects"
+  local Effects = need(path)
+  effectsByGen[key] = Effects
+  return Effects
+end
 
 -- client -> hub
 M.HELLO         = "mmo.hello"
@@ -75,13 +87,16 @@ M.RANKS         = "mmo.ranks"
 -- same one PARTY_INVITE has: the hub is what turns "I am waiting" into "your
 -- friend is waiting", because only the hub knows who is in the party.
 --
--- COOP_WAIT carries { battle, label, map [, mode] } -- the fight this player is
--- standing in front of.  Optional `mode` is only `"coop_wild"` (Party vs Wild
--- auto-join); absent means the trainer WAIT/JOIN invite path.  COOP_CANCEL
--- withdraws it with an optional reason (`alone` / `left` / `timeout` from the
--- waiter; `no` from the partner who declined the invite). Naming which offer
--- is unnecessary: there is only ever one per player.  COOP_JOIN answers
--- somebody else's offer with { to, battle }.
+-- COOP_WAIT carries { battle, label, map [, mode] [, npcId] [, event] } -- the
+-- fight this player is standing in front of.  Optional `mode` is only
+-- `"coop_wild"` (Party vs Wild auto-join); absent means the trainer WAIT/JOIN
+-- invite path.  Optional `npcId` / `event` (PROTOCOL 20) are the waiter's
+-- overworld NPC id and event-flag id from engine `checkpointOrigin`, so an
+-- invite joiner with no local BattleState can still mark the trainer beaten.
+-- COOP_CANCEL withdraws it with an optional reason (`alone` / `left` /
+-- `timeout` from the waiter; `no` from the partner who declined the invite).
+-- Naming which offer is unnecessary: there is only ever one per player.
+-- COOP_JOIN answers somebody else's offer with { to, battle }.
 --
 -- A partner decline (`COOP_CANCEL` reason `no`) is forwarded to the waiter as
 -- `COOP_DECLINE`, so they can leave the wait and fight the trainer alone.
@@ -457,6 +472,13 @@ function M.int(value, min, max)
   return n
 end
 
+-- Boot generation claimed on mmo.hello (PROTOCOL 20). Exactly 1 or 2; missing
+-- or out of range defaults to 1 so a PROTOCOL-20 client that omits the field
+-- still joins a Gen1 hub (legacy-shaped hello after the bump).
+function M.generation(value)
+  return M.int(value, 1, 2) or 1
+end
+
 function M.facing(value)
   if M.FACINGS[value] then return value end
   return nil
@@ -509,6 +531,20 @@ function M.mapId(value)
   if type(value) ~= "string" then return nil end
   if not value:match("^[%w_%.%-]+$") then return nil end
   return value:sub(1, 64)
+end
+
+-- Overworld NPC id (`ROUTE_3_obj_2`) or an event-flag id from a trainer
+-- header. Same shape as M.id (opaque engine key), and the same 40-cap: map
+-- object ids and EVENT_* names fit, and borrowing mapId's 64 would let a
+-- peer send a key longer than defeatedTrainers ever uses.
+function M.npcId(value)
+  return M.id(value)
+end
+
+-- Event-flag id off a trainer header / checkpointOrigin.event. Same sanitiser
+-- as npcId on purpose -- both are save.flags / defeatedTrainers keys.
+function M.eventFlag(value)
+  return M.id(value)
 end
 
 -- Is this relay payload a shape we are willing to pass on?
@@ -825,7 +861,9 @@ end
 -- trainer -- so it degrades to nil and the screen says "a battle" instead of
 -- refusing the whole offer over a cosmetic field.  Optional `mode` is only
 -- `coop_wild` (auto-join Party vs Wild); unknown values are dropped, not a
--- refuse of the whole offer.
+-- refuse of the whole offer.  Optional `npcId` / `event` (PROTOCOL 20) name the
+-- waiter's overworld trainer so a menu joiner can finish the fight off without
+-- a local BattleState; absent on older hubs and on coop_wild.
 function M.coopOffer(raw)
   if type(raw) ~= "table" then return nil end
   local from = M.id(raw.from)
@@ -839,13 +877,16 @@ function M.coopOffer(raw)
     label = M.label(raw.label),
     map = M.mapId(raw.map),
     mode = M.coopOfferMode(raw.mode),
+    npcId = M.npcId(raw.npcId),
+    event = M.eventFlag(raw.event),
   }
 end
 
 -- Presence as it appears in a welcome roster, a join, or a move.  Position
 -- is optional so a player sitting in a menu or a battle can still be listed
 -- without claiming a cell in the world.
-function M.presence(raw)
+-- Optional `generation` (1|2) picks the missing-sprite fallback (Red vs Chris).
+function M.presence(raw, generation)
   if type(raw) ~= "table" then return nil end
   local id = M.id(raw.id)
   local name = M.name(raw.name)
@@ -853,7 +894,7 @@ function M.presence(raw)
   local out = {
     id = id,
     name = name,
-    sprite = M.spriteId(raw.sprite) or Config.DEFAULT_SPRITE,
+    sprite = M.spriteId(raw.sprite) or Config.defaultSpriteFor(generation),
     map = M.mapId(raw.map),
     x = M.int(raw.x, 0, 4096),
     y = M.int(raw.y, 0, 4096),
@@ -907,7 +948,7 @@ function M.ranking(raw)
       if name then
         local entry = {
           name = name,
-          sprite = M.spriteId(row.sprite) or Config.DEFAULT_SPRITE,
+          sprite = M.spriteId(row.sprite) or Config.defaultSpriteFor(nil),
           points = M.points(row.points),
         }
         -- Optional: older hubs omit id; PROTOCOL 16 boards always send it.
@@ -988,6 +1029,18 @@ M.SEED_MAX = 1073741824
 -- change.  Unsigned, because which direction a stat moved is the event's kind
 -- and its sentence rather than the sign of this field.
 M.AMOUNT_MAX = 9999
+
+-- How many shares an `exp` event may say a faint was split between.
+--
+-- A ceiling on a *divisor* a stranger sent, which is why it has a floor of one
+-- as well: zero shares is not a smaller award, it is a division by zero inside
+-- the client's own Experience formula.  Twelve rather than BATTLE_MON_MAX
+-- because vanilla pays every mon that was ever in against the fallen foe and is
+-- still alive, benched included -- so a co-op faint can be split across two
+-- full parties: BATTLE_MON_MAX (6) * COOP_SIDE (2) = 12.  One number that
+-- covers both shapes beats two that have to be kept in step; it bounds a
+-- foreign value before it enters a formula, it does not restate a game rule.
+M.PARTICIPANTS_MAX = 12
 
 -- How long a reason token this build has never heard of may be.  Refused past it
 -- rather than trimmed -- a cut token matches nothing and is a value nobody sent.
@@ -1193,18 +1246,37 @@ function M.battleMove(raw)
   return out
 end
 
--- Gen 1's four battle stats.  SPC is one stat and not two: Special did not
--- split until Gen 2, so a snapshot carrying spa/spd would be describing a
--- different game's battler.
-local STAT_KEYS = { "atk", "def", "spd", "spc" }
+-- Battle-stat keys on the sheet.  Gen 1 keeps one Special (`spc`) with Speed
+-- as `spd`.  Gen 2 splits Special into Sp.Atk / Sp.Def (`spa` / `spd`) and
+-- renames Speed to `spe` — so `spd` means different things in each dialect.
+-- Both shapes are first-class; a classic four-key Gen 1 table must still
+-- sanitise, and a Gen 2 spa/spd sheet must not be refused as "wrong game".
+local STAT_KEYS_GEN1 = { "atk", "def", "spd", "spc" }
+local STAT_KEYS_GEN2 = { "atk", "def", "spe", "spa", "spd" }
 
--- A full set of the four, or nothing.  Partial is refused rather than filled
--- in: every one of them is a multiplicand in the damage formula, and a
+-- Which dialect a stats / ivs / evs block is in.
+--
+-- Prefer an explicit `generation` (1|2) on the mon (or stamped from the party
+-- message).  Else sniff: `spa` or `spe` marks Gen 2; everything else — including
+-- a classic atk/def/spd/spc table — is Gen 1.  Gen 1's `spd` (Speed) alone is
+-- never enough to claim Gen 2, because that key is the Gen 1 name for Speed.
+local function statsGeneration(raw, hint)
+  local gen = M.int(hint, 1, 2)
+  if gen then return gen end
+  if type(raw) ~= "table" then return 1 end
+  if raw.spa ~= nil or raw.spe ~= nil then return 2 end
+  return 1
+end
+
+-- A full set for the dialect, or nothing.  Partial is refused rather than
+-- filled in: every key is a multiplicand in the damage formula, and a
 -- defaulted Defence is a made-up number that reads as a real one.
-local function statsOf(raw, min, max)
+local function statsOf(raw, min, max, generation)
   if type(raw) ~= "table" then return nil end
+  local keys = statsGeneration(raw, generation) == 2 and STAT_KEYS_GEN2
+    or STAT_KEYS_GEN1
   local out = {}
-  for _, key in ipairs(STAT_KEYS) do
+  for _, key in ipairs(keys) do
     local n = M.int(raw[key], min, max)
     if not n then return nil end
     out[key] = n
@@ -1242,13 +1314,22 @@ end
 -- `slot`, `ivs` and `evs` are optional wholesale but not piecemeal, and an
 -- unreadable one refuses the battler rather than being dropped: a snapshot from a
 -- client that does not track EVs is fine and common, while a snapshot with two of
--- the four is a bug on the sending side that accepting would silently zero the
--- rest of.
+-- the four (or five) is a bug on the sending side that accepting would silently
+-- zero the rest of.
+--
+-- Optional `generation` (1|2) selects the stats dialect; absent falls back to
+-- shape sniff on `stats` (see statsGeneration). Optional `heldItem` is a Gen 2
+-- item id string — cleaned like any other id, dropped when absent.
 function M.battleMon(raw)
   if type(raw) ~= "table" then return nil end
 
-  local stats = statsOf(raw.stats, 1, M.STAT_MAX)
+  local generation = M.int(raw.generation, 1, 2)
+  local stats = statsOf(raw.stats, 1, M.STAT_MAX, generation)
   if not stats then return nil end
+  -- Dialect actually used (explicit or sniffed) — stamp so downstream sees it.
+  if not generation then
+    generation = stats.spa ~= nil and 2 or 1
+  end
 
   local status = M.battleStatus(raw.status)
   if status == false then return nil end
@@ -1260,6 +1341,7 @@ function M.battleMon(raw)
     maxHp = M.int(raw.maxHp, 1, M.HP_MAX),
     stats = stats,
     status = status,
+    generation = generation,
   }
   -- hp may be 0 (fainted); only nil means the field failed to sanitise.  In Lua
   -- 0 is truthy, but spell the check with `== nil` anyway so a reader coming
@@ -1274,13 +1356,13 @@ function M.battleMon(raw)
     if out.slot == nil then return nil end
   end
   if raw.ivs ~= nil then
-    out.ivs = statsOf(raw.ivs, 0, 15)
+    out.ivs = statsOf(raw.ivs, 0, 15, generation)
     if not out.ivs then return nil end
   end
   if raw.evs ~= nil then
-    out.evs = statsOf(raw.evs, 0, 65535)
+    out.evs = statsOf(raw.evs, 0, 65535, generation)
     if not out.evs then return nil end
-    -- Optional HP Stat Exp for HP_UP (fourOf-style battle stats stay required).
+    -- Optional HP Stat Exp for HP_UP (battle-stat keys stay required).
     if raw.evs.hp ~= nil then
       out.evs.hp = M.int(raw.evs.hp, 0, 65535)
       if out.evs.hp == nil then return nil end
@@ -1320,6 +1402,13 @@ function M.battleMon(raw)
     if out.catchRate == nil then return nil end
   end
 
+  -- Optional Gen 2 held item id. Absent is fine; present-but-unreadable
+  -- refuses, same posture as a mangled types list.
+  if raw.heldItem ~= nil then
+    out.heldItem = M.id(raw.heldItem)
+    if not out.heldItem then return nil end
+  end
+
   return out
 end
 
@@ -1340,10 +1429,14 @@ end
 -- `bag` is optional: absent means an empty sheet (PROTOCOL 15). Present-but
 -- unreadable refuses the party — a half-parsed bag would let the hub prove the
 -- wrong inventory.
-function M.battleBag(raw)
+--
+-- Optional `generation` (1|2) selects BattleSim vs BattleSim2 Effects for
+-- itemEffect; omitted → Gen 1 (compat).
+function M.battleBag(raw, generation)
   if raw == nil then return {} end
   if type(raw) ~= "table" then return nil end
 
+  local Effects = effectsFor(generation)
   local out, seen = {}, {}
   -- Array form: [{id, count}, ...]. Map form (id -> count) is also accepted so
   -- a client that already holds inventory as a dict does not have to rebuild.
@@ -1379,12 +1472,34 @@ function M.battleBag(raw)
   return out
 end
 
-function M.battleParty(raw)
+function M.battleParty(raw, generation)
   if type(raw) ~= "table" then return nil end
   local battle = M.id(raw.battle)
   if not battle then return nil end
 
   local out = { battle = battle, badges = M.badges(raw.badges) }
+
+  -- Hub generation (second arg) is authoritative when provided: stamp
+  -- party.generation from it, and refuse a mon/party whose explicit
+  -- generation disagrees.
+  local hubGen = nil
+  if generation ~= nil then
+    hubGen = M.int(generation, 1, 2)
+    if not hubGen then return nil end
+  end
+
+  local partyGen = nil
+  if raw.generation ~= nil then
+    partyGen = M.int(raw.generation, 1, 2)
+    if not partyGen then return nil end
+    if hubGen and partyGen ~= hubGen then return nil end
+  end
+  if hubGen then
+    out.generation = hubGen
+    partyGen = hubGen
+  elseif partyGen then
+    out.generation = partyGen
+  end
 
   if raw.side ~= nil then
     out.side = M.side(raw.side)
@@ -1395,14 +1510,26 @@ function M.battleParty(raw)
   local mons = {}
   for _, entry in ipairs(raw.mons) do
     if #mons >= Config.BATTLE_MON_MAX then return nil end
-    local mon = M.battleMon(entry)
+    local hadExplicit = type(entry) == "table" and entry.generation ~= nil
+    if hubGen and hadExplicit then
+      local monGen = M.int(entry.generation, 1, 2)
+      if not monGen or monGen ~= hubGen then return nil end
+    end
+    local sheet = entry
+    if partyGen and type(entry) == "table" and entry.generation == nil then
+      sheet = {}
+      for k, v in pairs(entry) do sheet[k] = v end
+      sheet.generation = partyGen
+    end
+    local mon = M.battleMon(sheet)
     if not mon then return nil end
+    if hubGen and hadExplicit and mon.generation ~= hubGen then return nil end
     mons[#mons + 1] = mon
   end
   if #mons == 0 then return nil end
   out.mons = mons
 
-  local bag = M.battleBag(raw.bag)
+  local bag = M.battleBag(raw.bag, partyGen or hubGen)
   if not bag then return nil end
   out.bag = bag
 
@@ -1496,11 +1623,17 @@ end
 --   chose      -- a seat filed this turn's answer (wait-line peer accuracy)
 --   unchose    -- cancel cleared a filed answer
 --   moves      -- mid-fight move-list sync after Transform/Mimic
+--   exp        -- a faint's spoils, as facts: who fell (species, level), how
+--                 many shares split it, and which of the paid side's six is
+--                 banking this share (`mon`, optional).  Not an amount: the hub
+--                 holds no species table and can never compute one, so the
+--                 referee states the facts and each client runs its own
+--                 Experience formula over its own party.
 M.BATTLE_EVENTS = {
   msg = true, anim = true, damage = true, drain = true, faint = true,
   send = true, status = true, stat = true, switch = true, item = true,
   run = true, turn = true, over = true, wait = true, reconnect = true,
-  chose = true, unchose = true, moves = true,
+  chose = true, unchose = true, moves = true, exp = true,
 }
 
 -- One thing to draw.
@@ -1548,6 +1681,29 @@ function M.battleEvent(raw)
   -- name: an event is about somebody who is out, not about a bench position.
   if raw.slot ~= nil then out.slot = M.int(raw.slot, 0, M.FIELD_MAX) end
   if raw.hp ~= nil then out.hp = M.int(raw.hp, 0, M.HP_MAX) end
+  -- `exp` carries the facts a client needs to run its own award: which monster
+  -- fell and how many shares split it.  Same sanitisers a battler's own fields
+  -- get (M.name / M.int over LEVEL_MAX), because they are the same quantities
+  -- read off the same monster -- an event is not a second dialect for them.
+  if raw.species ~= nil then out.species = M.name(raw.species) end
+  if raw.level ~= nil then out.level = M.int(raw.level, 1, M.LEVEL_MAX) end
+  if raw.participants ~= nil then
+    -- Deliberately not `winners`: an OUTCOME's winners is a list of player ids,
+    -- and one name over two shapes is the sanitiser bug that reads a count as a
+    -- roster.  This one is a count, and it divides.
+    out.participants = M.int(raw.participants, 1, M.PARTICIPANTS_MAX)
+  end
+  -- Which of the winner's six the award is *for* -- a **party** index, bounded
+  -- by SLOT_MAX, and so the one field on an event that is not about the field.
+  -- It has to be: vanilla pays every mon that fought the fallen foe and lived,
+  -- and a benched one has no field slot to name.  `slot` above still carries
+  -- the owning fighter's seat, which is what gates the award to a player;
+  -- `mon` says which of that player's monsters banks it.
+  --
+  -- Optional, and its absence is meaningful rather than a defect: a PROTOCOL 21
+  -- referee that predates this field pays the mon that was standing at the
+  -- faint, so a client that gets no `mon` falls back to the active one.
+  if raw.mon ~= nil then out.mon = M.int(raw.mon, 0, M.SLOT_MAX) end
   if raw.side ~= nil then out.side = M.side(raw.side) end
   if raw.status ~= nil then
     -- battleStatus answers `false` for present-but-unknown, which is not a

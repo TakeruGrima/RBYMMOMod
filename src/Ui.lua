@@ -16,6 +16,7 @@ local Config = need("Config")
 local Wire = need("Wire")
 local Chat = need("Chat")
 local World = need("World")
+local Gen = need("Gen")
 local Chars = need("Chars")
 local Cast = need("Cast")
 local Places = need("Places")
@@ -23,14 +24,43 @@ local Places = need("Places")
 local M = {}
 M.__index = M
 
+-- Re-open the boot's START menu after leaving an MMO screen.
+--
+-- Gen 1's StartMenu is a Menu that pops itself on B. Gen 2's Gen2StartMenu
+-- only leaves the stack when opts.onClose pops it (Game2:openStartMenu). A
+-- bare `push(Gen2StartMenu)` made B/START call close() with a nil onClose --
+-- the menu stayed on the stack forever. Mirror the engine's openStartMenu
+-- opts whenever we reopen Gold's menu.
+function M.reopenStartMenu(game)
+  local id = Gen.startMenuId(game)
+  if id == "Gen2StartMenu" then
+    mod.ui.push(game, id, {
+      save = game and game.save,
+      onClose = function()
+        if game and game.stack and type(game.stack.pop) == "function" then
+          game.stack:pop()
+        end
+      end,
+      onChoose = function(itemId)
+        if game and type(game.openStartMenuItem) == "function" then
+          game:openStartMenuItem(itemId)
+        end
+      end,
+    })
+  else
+    mod.ui.push(game, id)
+  end
+end
+
 -- True-white paper over the bottom message / menu strip (tiles y=12..17).
 --
 -- Game.lua lets the topmost `sgbPalettes` owner color the frame; TextBox and
 -- Menu have none, so a prompt stacked on BattleState inherits the battle
 -- message-box zone. That zone's color 0 is SGB off-white pink (255,239,255),
 -- so Font.drawBox's (1,1,1) fill becomes pink while a menu drawn the same
--- way can read as a white island -- the WAIT/ALONE screen. Claiming this
--- strip as `colors = false` keeps the fill true white; the battle field
+-- way can read as a white island -- a prompt raised over a live battle, such
+-- as Sessions' trade-wait box. Claiming this strip as `colors = false` keeps
+-- the fill true white; the battle field
 -- above still uses the engine's palettes from beneath.
 local UI_PAPER = { colors = false, x = 0, y = 96, w = 160, h = 48 }
 M.UI_PAPER = UI_PAPER
@@ -48,6 +78,16 @@ local function withUiPaper(screen)
             if s and s.sgbPalettes then
               local ok, z = pcall(s.sgbPalettes, s, game)
               if ok then zones = z end
+              -- Stop at the first state that OWNS an sgbPalettes, even when it
+              -- answers nil.  This mirrors Game:draw exactly ("the topmost
+              -- state that knows its palette owns the screen" -- engine
+              -- src/core/Game.lua:527-537), which also breaks on the field
+              -- being present and keeps whatever came back.  A nil from an
+              -- owner is an authored answer -- "this frame is raw DMG" -- not
+              -- an absence, so walking past it would inherit zones the engine
+              -- itself would never have consulted: the overworld's per-area
+              -- map zones from BENEATH a battle, painted over the battle
+              -- frame.  Publishing nothing is the honest inheritance here.
               break
             end
           end
@@ -55,10 +95,18 @@ local function withUiPaper(screen)
         end
       end
     end
+    -- A classic BattleState publishes no zones on purpose (it colorises itself
+    -- in drawZonePass and hands the frame a raw DMG canvas -- engine
+    -- src/battle/BattleState.lua:126-134).  Claiming the strip alone there
+    -- makes this screen the frame's zone owner with a one-zone list, so
+    -- PaletteFX.ensureZones short-circuits and every pixel outside y=96..144
+    -- is left unzoned and flattened to paper: the battle field is erased, and
+    -- any menu drawn outside the strip (MENU_CHOOSE sits at y 56..104) with
+    -- it.  Publish nothing instead and give up only the cosmetic true-white
+    -- fill, in the one case where claiming it destroys the frame.
+    if not (type(zones) == "table" and zones[1]) then return nil end
     local out = {}
-    if type(zones) == "table" then
-      for i = 1, #zones do out[i] = zones[i] end
-    end
+    for i = 1, #zones do out[i] = zones[i] end
     out[#out + 1] = UI_PAPER
     return out
   end
@@ -948,12 +996,15 @@ end
 -- A question with named answers, where **B is an answer and not an escape**.
 --
 -- CONFIRM is the yes/no box, and its B is a no that returns the player to
--- whatever they came from.  That is exactly wrong for a fight that has already
--- been triggered: the engine has committed to the encounter by the time the
--- mod is asked, so a prompt that could be backed out of would be a prompt that
--- skipped a trainer.  Here B selects the **last row** instead -- which the
--- callers order so that the last row is the one that costs the player nothing
--- they had not already accepted (BATTLE ALONE, or reopening the choice).
+-- whatever they came from -- right for an ordinary question, wrong for a
+-- prompt standing in front of something already sent: Sessions' trade-wait
+-- box (the live caller of this today) has already put the request on the
+-- other player's screen, so B has to reopen the choice rather than silently
+-- drop it.  Here B selects the **last row** instead -- which the callers
+-- order so that the last row is the one that costs the player nothing they
+-- had not already accepted.  Co-op's own trainer/wild wait leaned on this
+-- same widget once (BATTLE ALONE); round 13 deleted that cover outright
+-- rather than give it a row to select.
 --
 -- The rows are a Menu, not a TextBox choice, because there can be more than
 -- two of them and because they are commands rather than an answer to a
@@ -1098,12 +1149,12 @@ function M:install()
     return store
   end
 
-  local function serverMenuList()
+  local function serverMenuList(game)
     local store = serverStore()
     local list
     if store then
       if store.menuList then
-        list = store:menuList()
+        list = store:menuList(game)
       elseif store.list then
         list = store:list()
       end
@@ -1111,10 +1162,10 @@ function M:install()
     return type(list) == "table" and list or {}
   end
 
-  local function serverMenuGet(key)
+  local function serverMenuGet(key, game)
     local store = serverStore()
     if not store then return nil end
-    if store.menuGet then return store:menuGet(key) end
+    if store.menuGet then return store:menuGet(key, game) end
     if store.get then return store:get(key) end
     return nil
   end
@@ -1345,8 +1396,9 @@ function M:install()
       tx = 9, ty = 0, tw = 11,
       -- the same ceiling the START menu uses: (18 rows - 2 border) / 2
       maxVisible = 8,
-      -- B goes back where it came from, like every vanilla submenu
-      onCancel = function() mod.ui.push(game, "StartMenu") end,
+      -- B goes back where it came from, like every vanilla submenu.
+      -- Gen 2 must reopen StartMenu with onClose (see M.reopenStartMenu).
+      onCancel = function() M.reopenStartMenu(game) end,
     })
     -- the cursor survives closing the menu, as the original's does
     menu.index = math.min(cursor.main or 1, math.max(1, #items))
@@ -1877,7 +1929,7 @@ function M:install()
   -- store prepends its synthetic official row before that saved ordering.
   screens:register(SCREEN.SERVERS, { new = function(game)
     local items = {}
-    for _, entry in ipairs(serverMenuList()) do
+    for _, entry in ipairs(serverMenuList(game)) do
       items[#items + 1] = {
         label = entry.name,
         right = entry.fav and FAV_MARK or nil,
@@ -1899,7 +1951,7 @@ function M:install()
   screens:register(SCREEN.SERVERACT, { new = function(game, opts)
     opts = opts or {}
     local store = serverStore()
-    local entry = serverMenuGet(opts.key)
+    local entry = serverMenuGet(opts.key, game)
     if not entry then
       -- The key is derived from the address rather than chosen, so EDIT HOST
       -- moves an entry to a different one -- and a menu still holding the old

@@ -727,8 +727,10 @@ local PHASE = {
   guest_ready_for_party  = 180,  -- menus + closeToOverworld
   host_party_asked       = 180,  -- menus
   guest_party_joined     = 180,  -- the invite box + the flag
-  host_coop_waiting      = 180,  -- staging a trainer + the wait/alone prompt
-  guest_coop_joined      = 240,  -- staging + walking the join prompt
+  host_ready_for_sight   = 180,  -- party formed; about to warp to Route 3
+  guest_on_sight_map     = 240,  -- warp settle on the sight map
+  host_coop_waiting      = 240,  -- sight bang + WAIT prompt
+  guest_coop_joined      = 300,  -- sight bang + walk-in join
   host_coop_done         = 420,  -- a whole 2-on-2 driven by two tappers
   guest_coop_done        = 420,  -- the same
   host_coop_left         = 180,  -- leaving the party afterwards  -- 120 watching + menus + LEAVE
@@ -835,13 +837,95 @@ function M.await(game, name, seconds, sample)
   return ok
 end
 
+-- Live overworld controller: Gen 1 keeps it on the stack (and as
+-- game.overworld); Gen 2 free-roam is an empty stack with game.world only.
+function M.overworld(game)
+  if not game then return nil end
+  local stack = game.stack and game.stack.states
+  if type(stack) == "table" then
+    for i = #stack, 1, -1 do
+      if stack[i] and stack[i].isOverworld then return stack[i] end
+    end
+  end
+  return game.overworld or game.world
+end
+
+-- True when the player can open START / walk: Gen 1 overworld-on-top, or
+-- Gen 2 empty stack with a loaded map (POKEPORT_DRIVER skips Gold cinema).
+function M.inPlay(game)
+  if not game then return false end
+  local ow = M.overworld(game)
+  if not (ow and ow.map and ow.player) then return false end
+  local top = M.top(game)
+  if top == nil then return true end
+  if top == ow or top.isOverworld then return true end
+  return false
+end
+
+function M.generation(game)
+  local ok, Handshake = pcall(require, "src.link.Handshake")
+  if ok and Handshake and type(Handshake.generation) == "function" then
+    return tonumber(Handshake.generation(game)) or 1
+  end
+  local data = game and game.data
+  if data and data.gen2Statuses then return 2 end
+  if data and data.type_chart and tonumber(data.type_chart.generation) == 2 then
+    return 2
+  end
+  return 1
+end
+
+-- Reach a playable overworld without thrashing an open Start menu.
+--
+-- Gen 2 + POKEPORT_DRIVER already lands in free-roam (empty stack). Gen 1
+-- still needs U.newGame. Never mash A while StartMenu.list is up -- that is
+-- how PACK flash-loops happen in a LOVE window.
+function M.bootToPlay(game)
+  U.wait(20)
+  if M.inPlay(game) then return true end
+  if M.generation(game) == 2 then
+    for _ = 1, 600 do
+      if M.inPlay(game) then
+        U.wait(10)
+        return true
+      end
+      local top = M.top(game)
+      if top and top.list ~= nil and type(top.onClose) == "function" then
+        U.tap(game, "b")
+        U.wait(4)
+      else
+        U.tap(game, "a")
+        U.wait(2)
+      end
+    end
+    return M.inPlay(game)
+  end
+  U.newGame(game)
+  return M.inPlay(game)
+end
+
+-- Seed a one-mon party the e2e can trade / fight with. Gen 2 uses Mon.new
+-- (spa/spd sheets); Gen 1 keeps Pokemon.new.
+function M.seedParty(game, species, level)
+  if not (game and game.save and game.data) then return nil end
+  level = level or 50
+  if M.generation(game) == 2 then
+    local ok, Mon = pcall(require, "src.battle.gen2.Mon")
+    if not (ok and Mon and type(Mon.new) == "function") then return nil end
+    local mon = Mon.new(game.data, species, level)
+    if not mon then return nil end
+    game.save.party = { mon }
+    return mon
+  end
+  local Pokemon = require("src.pokemon.Pokemon")
+  local mon = Pokemon.new(game.data, species, level)
+  game.save.party = { mon }
+  return mon
+end
+
 -- this game's own player cell
 function M.playerCell(game)
-  local ow
-  for i = #game.stack.states, 1, -1 do
-    if game.stack.states[i].isOverworld then ow = game.stack.states[i] break end
-  end
-  ow = ow or game.overworld
+  local ow = M.overworld(game)
   if not (ow and ow.map and ow.player) then return nil end
   return { mapId = ow.map.id, x = ow.player.cellX, y = ow.player.cellY }
 end
@@ -855,11 +939,7 @@ end
 -- connecting is how "leaving gives you your own trainer back" is checkable
 -- at all.
 function M.playerSheet(game)
-  local ow
-  for i = #game.stack.states, 1, -1 do
-    if game.stack.states[i].isOverworld then ow = game.stack.states[i] break end
-  end
-  ow = ow or game.overworld
+  local ow = M.overworld(game)
   return ow and ow.player and ow.player.sprite or nil
 end
 
@@ -1121,7 +1201,33 @@ end
 -- are a valid product path (three-seat field) and are covered in the Lua
 -- suite; e2e keeps the full 2v2 so SWITCH/ITEM and four-slot asserts stay
 -- meaningful.
+--
+-- Gen 2 trainers live under data.trainers.classes[*].trainers[*].party (see
+-- engine src/world/gen2/Trainers.lua). Return the class id string so
+-- stageTrainer can look the class up and pick its weakest 2+ party member.
 function M.coopTrainer(data)
+  local classes = data and data.trainers and data.trainers.classes
+  if type(classes) == "table" then
+    local best
+    for classId, class in pairs(classes) do
+      if type(class) == "table" and type(class.trainers) == "table" then
+        for _, row in ipairs(class.trainers) do
+          local party = row and row.party
+          if party and #party >= 2 then
+            local total = 0
+            for _, spec in ipairs(party) do
+              total = total + (spec.level or 0)
+            end
+            if best == nil or total < best.total
+               or (total == best.total and tostring(classId) < best.id) then
+              best = { id = tostring(classId), total = total }
+            end
+          end
+        end
+      end
+    end
+    return best and best.id, best and best.total
+  end
   local best
   for id, record in pairs(data.trainers or {}) do
     local party = record.parties and record.parties[1]
@@ -1137,6 +1243,42 @@ function M.coopTrainer(data)
   return best and best.id, best and best.total
 end
 
+local function softenPartyHp(party)
+  for _, mon in ipairs(party or {}) do
+    local max = (mon.stats and mon.stats.hp) or mon.maxHp or 4
+    mon.hp = math.max(1, math.floor(max / 4))
+  end
+end
+
+local function isGen2Staging(game)
+  if M.generation(game) == 2 then return true end
+  local data = game and game.data
+  if data and data.type_chart and tonumber(data.type_chart.generation) == 2 then
+    return true
+  end
+  local ok = pcall(require, "src.ui.gen2.BattleState")
+  if ok and data and data.trainers and data.trainers.classes then
+    return true
+  end
+  return false
+end
+
+-- Pick the weakest Gen 2 class member with #party >= 2 (fallback: member 1).
+local function gen2TrainerMember(classRec)
+  local bestIdx, bestTotal
+  for i, row in ipairs((classRec and classRec.trainers) or {}) do
+    local party = row and row.party
+    if party and #party >= 2 then
+      local total = 0
+      for _, spec in ipairs(party) do total = total + (spec.level or 0) end
+      if bestIdx == nil or total < bestTotal then
+        bestIdx, bestTotal = i, total
+      end
+    end
+  end
+  return bestIdx or 1
+end
+
 -- Put a real trainer battle on the stack, the way the overworld does.
 --
 -- Softened, not gutted: the engine's trainers are built for a full playthrough
@@ -1150,16 +1292,315 @@ end
 -- normally attach it -- the overworld hangs the defeated flag and the rewards
 -- on it -- and it is what lets a co-op leg assert the battle it displaced was
 -- told how it went.
+--
+-- Gen 2: build via battle.gen2.Battle + Screens.push Gen2BattleState (onDone),
+-- then stamp Gen1-shaped kind/oppClass/enemyParty/onFinish so Client/Coop
+-- divert predicates see the same surface they do on Red.
 function M.stageTrainer(game, class, onFinish)
+  if isGen2Staging(game) then
+    local okB, Battle = pcall(require, "src.battle.gen2.Battle")
+    local okT, Trainers = pcall(require, "src.world.gen2.Trainers")
+    local okS, Screens = pcall(require, "src.ui.Screens")
+    if not (okB and Battle and okT and Trainers and okS and Screens) then
+      return nil
+    end
+    local data = game.data or {}
+    local classes = data.trainers and data.trainers.classes
+    local classRec = classes and classes[class]
+    if not classRec and type(class) == "number" then
+      classRec = Trainers.classIndex(data.trainers)[class]
+    end
+    if not classRec then return nil end
+    local member = gen2TrainerMember(classRec)
+    local entry = Trainers.lookup(data.trainers, classRec.index, member)
+    if not entry then return nil end
+    local party = Trainers.party(data, entry)
+    if not (party and #party > 0) then return nil end
+    softenPartyHp(party)
+    local trainer = {
+      class = entry.class,
+      classId = entry.classId,
+      memberId = entry.id,
+      name = entry.name,
+      className = entry.className,
+      party = party,
+      baseMoney = entry.baseMoney,
+      attributes = entry.attributes,
+      items = entry.items,
+    }
+    local battle = Battle.new({
+      data = data,
+      party = (game.save and game.save.party) or {},
+      trainer = trainer,
+      save = game.save,
+    })
+    local onDone = onFinish and function(outcome)
+      onFinish(outcome)
+    end or nil
+    local state = Screens.push(game, "Gen2BattleState", {
+      battle = battle,
+      save = game.save,
+      onDone = onDone,
+    })
+    state = state or (game.stack and game.stack:top())
+    if not state then return nil end
+    state.kind = "trainer"
+    state.oppClass = trainer.classId or trainer.class
+    state.enemyParty = battle.enemyParty or party
+    state.trainer = trainer
+    state.onDone = state.onDone or onDone
+    state.onFinish = state.onFinish or onFinish or state.onDone
+    return state
+  end
   local BattleState = require("src.battle.BattleState")
   local ok, battle = pcall(BattleState.newTrainer, game, class, 1)
   if not (ok and battle) then return nil end
-  for _, mon in ipairs(battle.enemyParty or {}) do
-    mon.hp = math.max(1, math.floor((mon.stats and mon.stats.hp or 4) / 4))
-  end
+  softenPartyHp(battle.enemyParty)
   battle.onFinish = onFinish
   game.stack:push(battle)
   return battle
+end
+
+-- ------- sight-trainer co-op (Route 3 walk-in)
+--
+-- LAN e2e used to stageTrainer + invite-join. That never showed a "!" and the
+-- joiner rematch asserts were vacuous. These helpers warp onto a real sight
+-- line, wait for the emotion bubble, soften the engine party, and prove the
+-- overworld stays on top after co-op (no buried FIGHT UI).
+
+local SIGHT_FACING = {
+  DOWN = "down", UP = "up", LEFT = "left", RIGHT = "right",
+}
+local SIGHT_OPPOSITE = {
+  up = "down", down = "up", left = "right", right = "left",
+}
+local SIGHT_DIR = {
+  up = { 0, -1 }, down = { 0, 1 }, left = { -1, 0 }, right = { 1, 0 },
+}
+
+-- First STAY trainer on the map with a facing range and a party of 2+.
+-- Route 3's first hit is ROUTE3_YOUNGSTER1 (Bug Catcher, range RIGHT).
+function M.sightTrainerOn(data, mapId)
+  local map = data and data.maps and data.maps[mapId]
+  if not map then return nil end
+  for _, obj in ipairs(map.objects or {}) do
+    if obj.movement == "STAY" and obj.trainerClass
+        and obj.range and obj.range ~= "NONE"
+        and type(obj.x) == "number" and type(obj.y) == "number" then
+      local rec = data.trainers and data.trainers[obj.trainerClass]
+      local party = rec and rec.parties and rec.parties[obj.trainerParty or 1]
+      if party and #party >= 2 then
+        return obj
+      end
+    end
+  end
+  return nil
+end
+
+function M.sightNpcId(mapId, obj)
+  if not (mapId and obj and obj.index) then return nil end
+  return string.format("%s_obj_%d", mapId, obj.index)
+end
+
+function M.findNpcByName(game, name)
+  local ow = game and game.overworld
+  if not (ow and name) then return nil end
+  for _, npc in ipairs(ow.npcs or {}) do
+    if npc.def and npc.def.name == name then return npc end
+  end
+  for _, npc in pairs(ow.npcPool or {}) do
+    if type(npc) == "table" and npc.def and npc.def.name == name then
+      return npc
+    end
+  end
+  return nil
+end
+
+-- The live Coop instance, via an export closure upvalue. Drivers need it only
+-- to dismiss a same-map invite box *without* COOP_CANCEL so a walk-in can
+-- still adopt the buried engine (considerOffer otherwise steals the confirm
+-- before checkTrainerSight can fire).
+function M.coopInstance(game)
+  local exports = M.exports(game)
+  local fn = exports and exports.coopOffer
+  if type(fn) ~= "function" or not debug or not debug.getupvalue then
+    return nil
+  end
+  local i = 1
+  while true do
+    local name, val = debug.getupvalue(fn, i)
+    if not name then break end
+    if name == "coop" then return val end
+    i = i + 1
+  end
+  return nil
+end
+
+-- Drop the invite-path confirm without telling the waiter the partner said no.
+--
+-- Round 9 deleted the confirm this used to dismiss -- `coop.joinAsk` and
+-- `coop:closeJoinBox` are both gone from src/Coop.lua (offers are taken
+-- automatically now, with no box left for a walk-in to race). Left as an
+-- explicit no-op rather than removed outright: callers already treat `false`
+-- as "nothing to dismiss," which is now unconditionally the truth.
+function M.dismissInviteForWalkIn(game) -- luacheck: ignore game
+  return false
+end
+
+-- Warp onto (or beside) the trainer's facing line. `behind` steps further
+-- along the line; `side` offsets perpendicular so the landing cell is not
+-- already inside another STAY trainer's cone (Route 3's (14,6) is both
+-- Bug Catcher RIGHT@2 *and* Youngster2 DOWN).
+function M.warpToSightLine(game, mapId, obj, opts)
+  opts = opts or {}
+  if not (game and game.overworld and mapId and obj) then return nil end
+  local facing = SIGHT_FACING[obj.range] or "down"
+  local vec = SIGHT_DIR[facing]
+  if not vec then return nil end
+  local dist = opts.dist or 2
+  local behind = opts.behind or 0
+  local side = opts.side or 0
+  -- Perpendicular: RIGHT/LEFT → north/south; UP/DOWN → east/west.
+  local perp = { -vec[2], vec[1] }
+  local x = obj.x + vec[1] * (dist + behind) + perp[1] * side
+  local y = obj.y + vec[2] * (dist + behind) + perp[2] * side
+  local look = SIGHT_OPPOSITE[facing] or "down"
+  game.overworld:startWarpTo(mapId, x, y, look)
+  return {
+    x = x, y = y, facing = look, lineFacing = facing,
+    dist = dist, lineX = obj.x + vec[1] * dist, lineY = obj.y + vec[2] * dist,
+  }
+end
+
+function M.awaitOnMap(game, mapId, seconds)
+  return M.waitSeconds(game, function()
+    local ow = game.overworld
+    if not (ow and ow.map and ow.map.id == mapId) then return false end
+    if ow.transitioning then return false end
+    -- Map id is enough: a same-frame TextBox / remote overlay must not fail
+    -- the arrival barrier (guest previously timed out while already on ROUTE_3).
+    return true
+  end, seconds or 90, "arrive on " .. tostring(mapId))
+end
+
+function M.awaitTrainerBang(game, seconds)
+  return M.waitSeconds(game, function()
+    local ow = game.overworld
+    if ow and ow.emote and ow.emote.npc then return true end
+    -- Bubble already spent: walk-up, battle text, or BattleState.
+    if ow and ow.engaging then return true end
+    local top = M.top(game)
+    if top and top.kind == "trainer" then return true end
+    return false
+  end, seconds or 30, "trainer ! emote")
+end
+
+-- Step onto the named trainer's sight cell, then force that NPC's approach
+-- so a neighbouring cone cannot steal the engage.
+function M.walkIntoTrainerSight(game, obj, opts)
+  opts = opts or {}
+  local ow = game.overworld
+  if not (ow and obj) then return false end
+  local facing = SIGHT_FACING[obj.range] or "down"
+  local vec = SIGHT_DIR[facing]
+  local dist = opts.dist or 2
+  local lineX = obj.x + (vec and vec[1] or 0) * dist
+  local lineY = obj.y + (vec and vec[2] or 0) * dist
+
+  for _ = 1, 12 do
+    if ow.emote and ow.emote.npc then return true end
+    if ow.engaging then return true end
+    local top = M.top(game)
+    if top and top.kind == "trainer" then return true end
+    local p = ow.player
+    if p and p.cellX == lineX and p.cellY == lineY then
+      break
+    end
+    local dir = nil
+    if p then
+      if p.cellX < lineX then dir = "right"
+      elseif p.cellX > lineX then dir = "left"
+      elseif p.cellY < lineY then dir = "down"
+      elseif p.cellY > lineY then dir = "up"
+      end
+    end
+    if dir then U.hold(game, dir, 18) end
+    U.wait(8)
+  end
+
+  local npc = M.findNpcByName(game, obj.name)
+  if npc and ow.startTrainerApproach and not ow.engaging
+      and not (ow.emote and ow.emote.npc) then
+    local p = ow.player
+    local along = 1
+    if p then
+      along = math.max(1, math.abs(p.cellX - npc.cellX) + math.abs(p.cellY - npc.cellY))
+    end
+    ow:startTrainerApproach(npc, math.min(along, dist))
+  end
+  return M.awaitTrainerBang(game, opts.bangSeconds or 20)
+end
+
+function M.softenTopTrainer(game)
+  local function soften(battle)
+    if not (battle and battle.enemyParty) then return false end
+    for _, mon in ipairs(battle.enemyParty) do
+      mon.hp = math.max(1, math.floor((mon.stats and mon.stats.hp or 4) / 4))
+    end
+    return true
+  end
+  local top = M.top(game)
+  if soften(top) then return true end
+  for _, state in ipairs((game.stack and game.stack.states) or {}) do
+    if state and state.kind == "trainer" and soften(state) then
+      return true
+    end
+  end
+  return false
+end
+
+function M.captureStagedTrainer(game)
+  for _, state in ipairs((game.stack and game.stack.states) or {}) do
+    if state and state.kind == "trainer" then return state end
+  end
+  return nil
+end
+
+function M.wrapBattleFinish(battle, sink)
+  if not battle then return end
+  local prev = battle.onFinish
+  battle.onFinish = function(result)
+    if type(sink) == "function" then sink(result) end
+    if type(prev) == "function" then return prev(result) end
+  end
+end
+
+-- After co-op: overworld on top, no buried trainer BattleState, defeated flag.
+function M.assertNoRematch(game, npcId, frames, check)
+  frames = frames or 120
+  local buried = false
+  local leftOverworld = false
+  for _ = 1, frames do
+    local top = M.top(game)
+    if not (top == game.overworld or (top and top.isOverworld) == true) then
+      leftOverworld = true
+    end
+    for _, state in ipairs((game.stack and game.stack.states) or {}) do
+      if state and state.kind == "trainer" then
+        buried = true
+      end
+    end
+    U.wait(1)
+  end
+  local defeated = game.save and game.save.defeatedTrainers
+      and npcId and game.save.defeatedTrainers[npcId] == true
+  check(not leftOverworld,
+        "overworld stayed on top after co-op (no immediate rematch UI)")
+  check(not buried,
+        "no trainer BattleState left buried under the overworld")
+  check(defeated == true,
+        "defeatedTrainers marks the sighted npc beaten")
+  return not leftOverworld and not buried and defeated == true
 end
 
 -- Put a real wild battle on the stack, the way grass does.
@@ -1169,9 +1610,42 @@ end
 -- no headless force-grass seam in the engine, so e2e stages the encounter
 -- directly rather than walking Route 1 until RNG cooperates.
 function M.stageWild(game, species, level, onFinish)
-  local BattleState = require("src.battle.BattleState")
   species = species or "PIDGEY"
   level = level or 5
+  if isGen2Staging(game) then
+    local okB, Battle = pcall(require, "src.battle.gen2.Battle")
+    local okM, Mon = pcall(require, "src.battle.gen2.Mon")
+    local okS, Screens = pcall(require, "src.ui.Screens")
+    if not (okB and Battle and okM and Mon and okS and Screens) then
+      return nil
+    end
+    local data = game.data or {}
+    local wild = Mon.new(data, species, level)
+    if not wild then return nil end
+    softenPartyHp({ wild })
+    local battle = Battle.new({
+      data = data,
+      party = (game.save and game.save.party) or {},
+      wild = wild,
+      save = game.save,
+    })
+    local onDone = onFinish and function(outcome)
+      onFinish(outcome)
+    end or nil
+    local state = Screens.push(game, "Gen2BattleState", {
+      battle = battle,
+      save = game.save,
+      onDone = onDone,
+    })
+    state = state or (game.stack and game.stack:top())
+    if not state then return nil end
+    state.kind = "wild"
+    state.enemyParty = battle.enemyParty or { wild }
+    state.onDone = state.onDone or onDone
+    state.onFinish = state.onFinish or onFinish or state.onDone
+    return state
+  end
+  local BattleState = require("src.battle.BattleState")
   local ok, battle = pcall(BattleState.newWild, game, species, level)
   if not (ok and battle and not battle.dead) then return nil end
   local mon = battle.enemy and battle.enemy.mon
@@ -1181,6 +1655,43 @@ function M.stageWild(game, species, level, onFinish)
   battle.onFinish = onFinish
   game.stack:push(battle)
   return battle
+end
+
+-- Drop the player onto a map. Gen 1 still uses U.teleport (pushes
+-- OverworldController). Gen 2 must not -- Gold's World hangs off game.world
+-- and is not a stack state; pushing the Gen 1 controller breaks free-roam.
+function M.teleport(game, mapId, x, y, facing)
+  facing = facing or "down"
+  if M.generation(game) ~= 2 then
+    U.teleport(game, mapId, x, y, facing)
+    return true
+  end
+  local okApi, WorldAPI = pcall(require, "src.world.gen2.WorldAPI")
+  if okApi and WorldAPI and WorldAPI.new then
+    local api = WorldAPI.new(game, "rby_mmo")
+    local ok = api:warpTo(mapId, x, y, facing)
+    if ok then
+      U.wait(5)
+      return true
+    end
+  end
+  local ow = M.overworld(game)
+  if ow and type(ow.setMap) == "function" then
+    local ok = pcall(ow.setMap, ow, mapId, x, y, facing)
+    if ok then
+      U.wait(5)
+      return true
+    end
+  end
+  if ow and ow.player then
+    if ow.map and ow.map.id == mapId then
+      ow.player.cellX, ow.player.cellY = x, y
+      ow.player.facing = facing
+      U.wait(5)
+      return true
+    end
+  end
+  return false
 end
 
 -- Put a battle-usable item in the live bag (and clear the battle item cache).
@@ -1206,14 +1717,30 @@ function M.partySpeciesCount(game, species)
   return n
 end
 
--- Classic command grid: FIGHT SWITCH / ITEM RUN. From FIGHT, DOWN then A opens
--- the bag; another A commits the highlighted row. Balls need no party pick.
+-- Command grid: FIGHT SWITCH / ITEM RUN. The battlefield band lays the four
+-- commands in ONE row (Battlefield.bandGridCols == 4), so ITEM is two RIGHTs
+-- from FIGHT there; the classic 2x2 keeps ITEM one DOWN. Ask the screen for
+-- its live column count rather than assuming a shape -- the D-wave made draw
+-- and navigation share it, and this helper walking the wrong grid is exactly
+-- how the round-2 band silently broke the catch flow.
+-- Another A commits the highlighted row. Balls need no party pick.
 -- Prefer an empty-ish bag so the first row is the item under test.
 function M.throwBattleItem(game, itemId)
   local top = M.top(game)
   if not (top and top.sim and top.phase == "choose") then return false end
   local U = M.U
-  U.tap(game, "down"); U.wait(6)
+  local cols = 2
+  if top.commandCols then
+    local ok, c = pcall(top.commandCols, top)
+    if ok and tonumber(c) then cols = tonumber(c) end
+  end
+  if cols >= 4 then
+    -- One row of four: FIGHT -> SWITCH -> ITEM.
+    U.tap(game, "right"); U.wait(6)
+    U.tap(game, "right"); U.wait(6)
+  else
+    U.tap(game, "down"); U.wait(6)
+  end
   U.tap(game, "a");    U.wait(10)
   if top.phase ~= "item" then
     top = M.top(game)

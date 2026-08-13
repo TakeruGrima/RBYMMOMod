@@ -22,9 +22,9 @@ const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
 const {
-  PROTOCOL, DEFAULT_SPRITE, SPRITE_GATE_MS,
+  PROTOCOL, DEFAULT_SPRITE, DEFAULT_SPRITE_GEN2, defaultSpriteFor, SPRITE_GATE_MS,
 } = require('./lib/relay.js');
-const { PLAYER_ID_HEX } = require('./lib/sanitize.js');
+const { PLAYER_ID_HEX, BATTLE_EVENT_TYPES } = require('./lib/sanitize.js');
 
 function read(rel) {
   return fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -76,6 +76,16 @@ test('DEFAULT_SPRITE matches', () => {
   );
 });
 
+test('DEFAULT_SPRITE_GEN2 matches', () => {
+  const config = read('src/Config.lua');
+  assert.strictEqual(
+    luaAssignString(config, 'DEFAULT_SPRITE_GEN2'), DEFAULT_SPRITE_GEN2,
+    'DEFAULT_SPRITE_GEN2 must match on both hubs',
+  );
+  assert.strictEqual(defaultSpriteFor(2), DEFAULT_SPRITE_GEN2);
+  assert.strictEqual(defaultSpriteFor(1), DEFAULT_SPRITE);
+});
+
 test('battle reconnect grace and choice timeout match', () => {
   const config = read('src/Config.lua');
   const relay = read('server/lib/relay.js');
@@ -109,11 +119,34 @@ test('shared hello refuse strings stay twin-worded', () => {
     "That player id can't be used here.",
     "That trainer name can't be used here.",
     'This game speaks protocol',
+    // PROTOCOL 20 generation lock — same template on both hubs.
+    'This hub is for generation',
   ];
   for (const needle of needles) {
     assert.ok(hub.includes(needle), `Hub.lua must contain: ${needle}`);
     assert.ok(relay.includes(needle), `relay.js must contain: ${needle}`);
   }
+});
+
+test('Wire.BATTLE_EVENTS matches sanitize.js BATTLE_EVENT_TYPES', () => {
+  // A one-sided add here is silent both ways: Wire.lua would sanitise a kind
+  // the JS hub refuses (mediated_battle_client.test.js catches that from the
+  // Lua side only), and sanitize.js would accept a kind Wire.lua's own
+  // battleEvent() never lets a Lua-side sender produce. Neither direction has
+  // a suite that reads both vocabularies side by side except this one.
+  const wire = read('src/Wire.lua');
+  const tableMatch = wire.match(/M\.BATTLE_EVENTS\s*=\s*\{([\s\S]*?)\}/);
+  assert.ok(tableMatch, 'Wire.lua must assign M.BATTLE_EVENTS as a table');
+  const luaKinds = [...tableMatch[1].matchAll(/(\w+)\s*=\s*true/g)].map((m) => m[1]).sort();
+  assert.ok(luaKinds.length > 0, 'Wire.BATTLE_EVENTS parsed at least one kind');
+
+  const jsKinds = [...BATTLE_EVENT_TYPES].sort();
+
+  assert.deepStrictEqual(
+    jsKinds, luaKinds,
+    'Wire.BATTLE_EVENTS and sanitize.js BATTLE_EVENT_TYPES must name the same '
+    + 'closed vocabulary -- add a new battle event kind to both in the same change',
+  );
 });
 
 test('inbound client→hub message types match on both hubs', () => {
