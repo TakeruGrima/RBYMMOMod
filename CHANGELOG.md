@@ -6,6 +6,8 @@ here must match `manifest.version`.
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-08-17
+
 ### Added
 
 - **The battle theatre is not a Gen 1 feature any more.** Gold gets the
@@ -288,6 +290,38 @@ here must match `manifest.version`.
 
 ### Fixed
 
+- **A POKéMON traded over the MMO now evolves.** KADABRA stayed KADABRA,
+  MACHOKE stayed MACHOKE, and Gold's held-item trades stayed put — on both
+  transports and in both games. Neither TradeSession was at fault: both
+  answer *whether* the received mon evolves and hand it back as a second
+  return, and turning that answer into a screen has always been the caller's
+  job. On the cable club the caller is the engine's `LinkState`; nothing in
+  this mod was its opposite number, so the answer was dropped on the floor
+  with nothing logged on either side. `src/Sessions.lua` is now that caller:
+  the movie follows the "was traded over!" line rather than opening under it,
+  Gen 1 goes through `Evolution.evolve` with `via="TRADE"` so B cannot cancel
+  it, and Gold pushes the engine's own `Gen2EvolutionAnim` (row, party slot
+  and pop included) the way `Game2:afterRareCandy` does. `src/Trade2.lua`
+  stopped scanning for a TRADE row by hand and asks the engine's Gen 2
+  evolution module instead, so an Everstone refuses and a KING'S ROCK row
+  demands — and gets eaten by — its held item. A screen that cannot open
+  degrades to applying the evolution outright with a line saying so: the
+  trade is committed on both sides by then, and there is no second chance
+  at a trade evolution.
+- **A finished trade is now written to disk, twice, the way the cable club
+  writes it.** pokered's `cable_club.asm` calls `SaveSAVtoSRAM` straight
+  after every trade so the swap is on the cartridge before the animation
+  runs, and the engine's `LinkState` does the same and then writes again
+  once the evolution movie ends (gen1recomp #222). A hub trade did neither:
+  the received POKéMON lived only in memory until the player happened to
+  open START > SAVE, so a force-quit lost it *and* handed back the one that
+  was traded away — two of the same POKéMON in the world, which is exactly
+  the duplication this session's teardown exists to prevent, arriving by the
+  back door. Worse here than on a cable, because finishing locally
+  deliberately does not end the session: this side sits in `settling` while
+  the peer acknowledges. Both writes are guarded and never raise — a build
+  with no `writeSave` is not a failure, and a refused or throwing write
+  leaves the swap in memory and names START > SAVE as the way out.
 - **A hub that accepts and never answers is given up on.** The transport's
   idle timeout measures silence *since the last message*, so it never covered
   a connection that had never had one: a listener that took the socket and

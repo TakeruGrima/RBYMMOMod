@@ -4950,7 +4950,14 @@ local function tradeSide(hub, name, species)
     isReady = function() return true end,
   }
   side.ui = {
-    say = function(_, text) side.said[#side.said + 1] = text end,
+    -- A real say pushes a box the player has to dismiss and hands it back,
+    -- which is what the trade evolution waits on: the movie follows the
+    -- "traded over!" line rather than opening underneath it.
+    say = function(_, text, onDone)
+      side.said[#side.said + 1] = text
+      side.sayDone = onDone
+      return { kind = "text" }
+    end,
     confirm = function(_, _, text, cb)
       side.confirmText = text
       side.confirmBox = cb
@@ -4966,6 +4973,7 @@ local function tradeSide(hub, name, species)
     ctx = {},
   }
   side.sessions = Sessions.new(side.transport, side.ui)
+  side.saves = 0
   side.game = {
     data = Data,
     save = {
@@ -4973,6 +4981,17 @@ local function tradeSide(hub, name, species)
       player = { name = name },
       pokedex = { seen = {}, owned = {} },
     },
+    -- The cable club commits a trade to the cartridge the instant it lands
+    -- (gen1recomp #222); this counts the same writes on the hub path, and
+    -- snapshots the party at each one so a test can say *what* was saved
+    -- rather than only that something was.
+    writeSave = function(self)
+      side.saves = side.saves + 1
+      local names = {}
+      for _, mon in ipairs(self.save.party) do names[#names + 1] = mon.species end
+      side.savedParty = table.concat(names, ",")
+      return true
+    end,
   }
   hub:receive(side.client, { type = Wire.HELLO, proto = Config.PROTOCOL,
       playerId = testPlayerId("anon14_" .. name),
@@ -5015,6 +5034,13 @@ local function answerConfirm(side, yes)
   local box = side.confirmBox
   side.confirmBox = nil
   box(yes)
+end
+
+-- A on the last line this side was shown.
+local function dismissSay(side)
+  local box = side.sayDone
+  side.sayDone = nil
+  if box then box() end
 end
 
 -- Two players, paired through the hub, driven as far as both confirm boxes
@@ -5071,6 +5097,22 @@ eq(#ann.game.save.party, 1, "ANN's party did not grow")
 eq(#bob.game.save.party, 1, "nor did BOB's")
 eq(ann.sessions.active, nil, "and the session is closed on ANN's side")
 eq(bob.sessions.active, nil, "and on BOB's")
+
+-- ------- and it is on disk, not just in memory
+--
+-- The cable club writes the save the instant the swap commits (pokered's
+-- cable_club.asm calls SaveSAVtoSRAM after every trade; gen1recomp #222).
+-- Nothing here did, so a force-quit between the trade and the player's next
+-- visit to START > SAVE lost the mon they received and gave back the one
+-- they sent -- two of the same POKéMON in the world, which is precisely the
+-- duplication the rest of this section exists to prevent, arriving by the
+-- back door.  A hub trade holds that window open longer than a cable trade
+-- does: this side sits in "settling" while the peer acknowledges.
+
+check(ann.saves >= 1, "the trade is committed to disk rather than left in memory")
+eq(ann.savedParty, "FIXMON_C", "with the swap already in the party that was written")
+check(bob.saves >= 1, "and the same on the other side of it")
+eq(bob.savedParty, "FIXMON_B", "carrying his half of the swap")
 
 -- ------- the other ordering, which used to decide who lost a POKéMON
 
@@ -5212,6 +5254,103 @@ orphan:onRelay({ from = "1", payload = {} })
 eq(#warns, 1, "a relay with no session open is logged exactly once")
 
 stubMod.log.warn = function() end
+
+-- ------- the trade evolution
+--
+-- TradeSession answers what a received mon becomes and stops there; turning
+-- that answer into a screen has always been the caller's job, and on the
+-- cable club the caller is src/link/LinkState.lua.  Nothing here was that
+-- caller, so `apply`'s second return went on the floor and an MMO-traded
+-- KADABRA stayed a KADABRA -- silently, on both sides.
+--
+-- Driven against the engine's own Evolution.evolve, recorded rather than
+-- run: what is worth pinning is that the seam is reached at all, for the mon
+-- that just landed, with the `via` that stops B working.  The movie itself
+-- is the engine's and has the engine's tests.
+--
+-- In a `do` block of its own: the chunk this sits in is already close to
+-- LuaJIT's 200-active-local ceiling, and a scoped block hands its slots back.
+
+do
+
+local Evolution = require("src.pokemon.Evolution")
+local realEvolve = Evolution.evolve
+local fixtureEvos = Data.pokemon.FIXMON_C.evolutions
+Data.pokemon.FIXMON_C.evolutions = { { method = "TRADE", species = "FIXMON_A" } }
+
+local evolveCall
+Evolution.evolve = function(_, mon, species, onDone, via)
+  evolveCall = { mon = mon, species = species, via = via, done = onDone }
+end
+
+local _, ann9, bob9 = pairAtConfirm()
+answerConfirm(ann9, true)
+pump(ann9); pump(ann9)
+pump(bob9)
+answerConfirm(bob9, true)
+pump(bob9); pump(ann9); pump(bob9); pump(ann9)
+
+eq(partyOf(ann9), "FIXMON_C", "ANN receives the POKéMON with a trade row on it")
+eq(evolveCall, nil, "and nothing evolves while the trade box is still up")
+
+dismissSay(ann9)
+check(evolveCall ~= nil, "dismissing that box is what starts the evolution")
+eq(evolveCall.mon, ann9.game.save.party[1],
+   "for the record that just landed in the party, not the sheet off the wire")
+eq(evolveCall.species, "FIXMON_A", "into what the engine said it becomes")
+eq(evolveCall.via, "TRADE", "as a trade evolution, which B cannot cancel")
+
+-- The second write of the pair: what the swap committed was the pre-evo, so
+-- the movie ending has to put the species the player is now looking at on
+-- disk instead.  The engine applies before it calls back, so the stub does.
+local savedBefore = ann9.saves
+check(type(evolveCall.done) == "function",
+      "and the engine is handed something to call when the movie ends")
+evolveCall.mon.species = "FIXMON_A"
+evolveCall.done()
+eq(ann9.saves, savedBefore + 1, "which writes the save a second time")
+eq(ann9.savedParty, "FIXMON_A", "with the evolved species on it, not the pre-evo")
+
+evolveCall = nil
+dismissSay(bob9)
+eq(evolveCall, nil, "while the side holding a POKéMON with no trade row evolves nothing")
+
+-- ------- ...and a screen that will not open does not cost the evolution
+--
+-- The trade is committed on both sides by the time this runs, and there is
+-- no second chance at a trade evolution: a mon left as the wrong species is
+-- left that way forever.  So the movie failing degrades to applying it
+-- outright, with a line saying so, rather than to nothing at all.
+
+local evoWarns = {}
+stubMod.log.warn = function(_, fmt, ...)
+  local okFmt, line = pcall(string.format, fmt, ...)
+  evoWarns[#evoWarns + 1] = okFmt and line or tostring(fmt)
+end
+Evolution.evolve = function() error("no evolution screen in this build", 0) end
+
+local _, ann10, bob10 = pairAtConfirm()
+answerConfirm(ann10, true)
+pump(ann10); pump(ann10)
+pump(bob10)
+answerConfirm(bob10, true)
+pump(bob10); pump(ann10); pump(bob10); pump(ann10)
+dismissSay(ann10)
+
+eq(partyOf(ann10), "FIXMON_A", "the POKéMON evolved even with no screen to do it in")
+eq(#ann10.game.save.party, 1, "and the party did not grow while doing it")
+eq(ann10.game.save.pokedex.owned.FIXMON_A, true, "with the dex told about it")
+eq(ann10.savedParty, "FIXMON_A",
+   "and the evolved species reached the disk too -- the movie is what was "
+   .. "lost, not the evolution and not the save")
+check(#evoWarns > 0 and evoWarns[1]:find("evolution screen"),
+      "and a line naming what the player missed rather than what broke")
+
+Evolution.evolve = realEvolve
+Data.pokemon.FIXMON_C.evolutions = fixtureEvos
+stubMod.log.warn = function() end
+
+end
 
 -- ------- a ranked battle's paperwork survives the session it belonged to
 --
