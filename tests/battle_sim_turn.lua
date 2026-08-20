@@ -2156,6 +2156,13 @@ do
   eq(#battle:snapshot().field, 3, "coop_wild create accepts 2v1 seating")
 end
 
+-- One wild monster per player: the same mode, a longer side b.
+--
+-- coop_wild capped side b at one until PROTOCOL 23, and the pair of tests here
+-- used to assert that refusal.  An ordinary grass encounter now seats one wild
+-- monster per human, and a *scripted* one (a legendary, the ghost) still seats
+-- exactly one -- which is the case above, unchanged, and the reason there is no
+-- second mode: the count is what the host uploaded, not what the token says.
 do
   local battle, err = Turn.create({
     mode = "coop_wild",
@@ -2171,7 +2178,31 @@ do
       },
     },
   })
-  ok(battle == nil, "coop_wild refuses two fighters on side b")
+  ok(battle ~= nil, "coop_wild accepts a wild monster per player: " .. tostring(err))
+  if battle then
+    eq(#battle:snapshot().field, 4, "2-on-2 seating opens four slots")
+  end
+end
+
+do
+  -- ...and the ceiling is still a ceiling.  Three on a side is refused in every
+  -- mode, and the refusal still names which side it was.
+  local battle, err = Turn.create({
+    mode = "coop_wild",
+    seed = 88003,
+    sides = {
+      a = {
+        { playerId = "a1", name = "Ann", mons = { mon() } },
+        { playerId = "a2", name = "Abe", mons = { mon({ species = "Gamma" }) } },
+      },
+      b = {
+        { playerId = "b1", name = "Bob", mons = { mon({ species = "Beta" }) } },
+        { playerId = "b2", name = "Bea", mons = { mon({ species = "Delta" }) } },
+        { playerId = "b3", name = "Baz", mons = { mon({ species = "Epsilon" }) } },
+      },
+    },
+  })
+  ok(battle == nil, "coop_wild refuses three fighters on side b")
   ok(type(err) == "string" and err:find("side b", 1, true) ~= nil,
      "refusal names side b: " .. tostring(err))
 end

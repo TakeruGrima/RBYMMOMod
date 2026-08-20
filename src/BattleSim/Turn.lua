@@ -132,22 +132,34 @@ M.MODES = {
 }
 M.SIDES = { "a", "b" }
 
--- Roster cap per side. coop_wild is 2v1 (humans on a, wild on b); other modes
--- keep a single per-side ceiling (1 for 1v1/wild, FIGHTERS_PER_SIDE otherwise).
+-- Roster cap per side.  A ceiling, never a requirement: every mode here opens
+-- with whatever the roster actually holds, and this only says what it may not
+-- exceed.  Solo `wild` is one human against one monster; everything else --
+-- coop_wild included, on both sides -- tops out at FIGHTERS_PER_SIDE.
+--
+-- **coop_wild used to cap side b at one, and lifting that is the whole of this
+-- mode's second version.** An ordinary grass encounter seats one wild monster
+-- per player, so two humans meet two of them; a *scripted* encounter -- a
+-- legendary, Snorlax, the Marowak ghost -- seats one, and needs no branch
+-- anywhere to do it, because the host uploads one monster and the hub's
+-- spare-seat drop (Hub:fillBattleParty) already lets a side open short.  The
+-- count is a property of the roster, not of the mode token, which is why there
+-- is no `coop_wild2` here to keep in step with this.
 local function maxFighters(mode, side)
-  if mode == "coop_wild" then
-    return (side == "a") and M.FIGHTERS_PER_SIDE or 1
-  end
   if mode == "1v1" or mode == "wild" then return 1 end
   return M.FIGHTERS_PER_SIDE
 end
 
--- The wild monster's seat.  Wildlife is always the synthetic side-b seat of a
--- mode whose name says "wild" (the seat `maxFighters` caps at one above and
--- `_awardExp` pays the other side for), and wildlife carries no bag: a wild
--- monster never uses an item, no matter who asks on its behalf.  Both askers
--- are gated -- `_normaliseChoice` refuses a submitted one, `_autoItemChoice`
--- never picks one -- because the seat can be driven from either end.
+-- The wild monster's seat.  Wildlife is always **a** synthetic side-b seat of a
+-- mode whose name says "wild" (the seats `_awardExp` pays the other side for),
+-- and wildlife carries no bag: a wild monster never uses an item, no matter who
+-- asks on its behalf.  Both askers are gated -- `_normaliseChoice` refuses a
+-- submitted one, `_autoItemChoice` never picks one -- because the seat can be
+-- driven from either end.
+--
+-- Deliberately about the *side* and not about a slot number: a coop_wild can
+-- seat two of them now, and a rule that named the first would have handed the
+-- second one a gym kit.
 local WILD_SIDE = "b"
 
 local function isWildSeat(mode, fighter)
@@ -461,6 +473,35 @@ local function activeMon(fighter)
   return nil
 end
 
+-- Everything a monster stops carrying the moment it leaves the field.
+--
+-- Two callers, and they are the two ways off it: `_faint` and `_catch`.  Shared
+-- rather than written twice because the list is long, the entries are
+-- individually forgettable, and a monster that left with `trapping` still set
+-- holds its victim's turn from outside the fight.  `_clearTrapsFrom` is the
+-- other half of that -- the pointers the rest of the field holds *to* this one
+-- -- and stays at the call sites, since it needs the seat and not the monster.
+local function clearVolatiles(mon)
+  mon.charging = nil
+  mon.invulnerable = false
+  mon.mustRecharge = false
+  mon.thrashing = nil
+  mon.raging = false
+  mon.rageMove = 0
+  mon.trapped = nil
+  mon.trapping = nil
+  mon.bide = nil
+  mon.substitute = 0
+  mon.lightScreen = false
+  mon.reflect = false
+  mon.mist = false
+  mon.focusEnergy = false
+  mon.transformed = false
+  mon.xAccuracy = false
+  mon.leechSeed = nil
+  mon.disable = nil
+end
+
 -- Which of this party a zero-based wire slot means.
 --
 -- Matched against the position each monster claims rather than counted off the
@@ -509,6 +550,12 @@ function M.create(opts)
     -- `_drainExp`.  A list, so the order faints happened in is the order their
     -- spoils are announced in.
     pendingExp     = {},
+    -- Every ball that has landed this fight, oldest first, each naming its own
+    -- thrower.  Read once, by `_finish`, onto the outcome -- a monster reaches
+    -- a save at the end of the fight and not before, which is where the grant
+    -- already was, and is why one player catching does not have to interrupt
+    -- the other player's turn to hand somebody a nickname box.
+    catches        = {},
     result         = nil,
     resolveDeadline = nil,
   }, Battle)
@@ -763,9 +810,15 @@ function Battle:_retarget(fighter, slot)
   return best
 end
 
+-- Is there anything left on this side to fight?
+--
+-- A caught seat is not, whatever its party says.  It holds a monster with HP on
+-- it -- caught, not beaten -- and it is never coming back out, so a reading
+-- that only asked about HP would leave a fight nobody could end: no active
+-- monster to hit, no replacement owed, and a side that answers "alive" forever.
 function Battle:_sideAlive(side)
   for _, fighter in ipairs(self.bySide[side]) do
-    if firstLiving(fighter.mons) then return true end
+    if not fighter.caught and firstLiving(fighter.mons) then return true end
   end
   return false
 end
@@ -975,6 +1028,29 @@ function Battle:_normaliseChoice(fighter, choice)
       out.move = move + 1
     elseif effect and effect.needsMove then
       return nil
+    end
+    -- A ball may name which monster it is thrown at, and only a ball.
+    --
+    -- Two wild monsters on the field is the whole reason: "the ball" and "the
+    -- foe" stopped being the same thing the moment a coop_wild could seat one
+    -- per player, and a throw that always took the lower seat would mean the
+    -- second player could never aim at the one they wanted.
+    --
+    -- Validated exactly as a fight's aim is -- a living opposing seat, or one
+    -- mid-replace, since switches resolve before items -- and refused rather
+    -- than redirected for the same reason: a ball is spent whatever happens, so
+    -- spending it on a monster nobody picked is worse than asking again.
+    --
+    -- Every other item ignores the field entirely (a potion names a party slot
+    -- in `slot`, which is a different number in the same-named field), so an
+    -- aim that rode along with one is dropped rather than checked: refusing a
+    -- heal because a stale target came with it would cost a turn over a field
+    -- nothing was going to read.
+    if effect and effect.ball and choice.target ~= nil then
+      local aimed = self:_fighterAtSlot(int(choice.target, -1))
+      if not aimed or aimed.side == fighter.side then return nil end
+      if not activeMon(aimed) and not aimed.mustReplace then return nil end
+      out.target = aimed.slot
     end
     return out
   end
@@ -1787,9 +1863,16 @@ function Battle:_resolveOneItem(fighter)
     if not Effects.isWildMode(self.mode) then
       self:_say("But it failed")
     else
-      -- Wild modes seat exactly one monster on side b, so "the first living
-      -- foe" and "the only foe" are the same seat -- no aim to spread.
-      local foe = self:_firstLivingFoe(fighter)
+      -- Which monster the ball is thrown at.
+      --
+      -- The aim the thrower named, if they named one and it is still there;
+      -- otherwise the lowest living foe, which is the same predictable default
+      -- a fight with no aim takes -- and, in a fight seating one wild monster,
+      -- is the only answer there has ever been.  `_retarget` also covers the
+      -- one way a named aim goes stale: the other player's ball landed on that
+      -- seat earlier in the same turn.
+      local foe = choice.target and self:_retarget(fighter, choice.target)
+        or self:_firstLivingFoe(fighter)
       local target = foe and activeMon(foe)
       if not target then
         self:_say("But it failed")
@@ -1802,11 +1885,7 @@ function Battle:_resolveOneItem(fighter)
         end
         if caught then
           self:_say("Gotcha")
-          local finish = self:_finish("win", self:_sidePlayers(fighter.side),
-            self:_sidePlayers(fighter.side == "a" and "b" or "a"), "catch")
-          local sheet = Effects.caughtSheet(target)
-          if finish and sheet then finish.caught = sheet end
-          if finish then finish.catcher = fighter.playerId end
+          self:_catch(fighter, foe, target)
         else
           self:_say("It broke free")
         end
@@ -2830,24 +2909,7 @@ function Battle:_faint(fighter, mon)
   for index = 1, #fighter.mons do
     if fighter.mons[index] == mon then self:_unfield(fighter, index); break end
   end
-  mon.charging = nil
-  mon.invulnerable = false
-  mon.mustRecharge = false
-  mon.thrashing = nil
-  mon.raging = false
-  mon.rageMove = 0
-  mon.trapped = nil
-  mon.trapping = nil
-  mon.bide = nil
-  mon.substitute = 0
-  mon.lightScreen = false
-  mon.reflect = false
-  mon.mist = false
-  mon.focusEnergy = false
-  mon.transformed = false
-  mon.xAccuracy = false
-  mon.leechSeed = nil
-  mon.disable = nil
+  clearVolatiles(mon)
   self:_clearTrapsFrom(fighter.slot)
 
   -- Living bench? Computed before clearing active; fainted mon already has hp 0.
@@ -2901,6 +2963,90 @@ function Battle:_faint(fighter, mon)
     self:_drainExp()
     self:_checkOver()
   end
+end
+
+-- A ball closed on that seat, and the seat leaves the fight.
+--
+-- **The other way off the field, and the reason it cannot be `_faint` with a
+-- different sentence.** A faint says a monster is down: it prints "fainted", it
+-- asks the seat for its next one, and on a wild seat it means the encounter is
+-- over. A catch says a monster changed hands: nothing is sent out after it, and
+-- with a second wild monster still standing the fight simply carries on with
+-- one fewer opponent. One kind for both would put a client in the position of
+-- guessing which of those it just watched.
+--
+-- What it shares with `_faint` is every piece of bookkeeping that is about
+-- *leaving*, and it shares it deliberately rather than by resemblance:
+--
+--   * out of the participation sets first (`_unfield`), so a monster nobody
+--     can fight any more is not sitting in a later payout's divisor;
+--   * volatiles cleared, and the pointers the rest of the field holds to this
+--     seat cut (`_clearTrapsFrom`) -- a caught WRAP user would otherwise hold
+--     its victim's turn from inside somebody's party;
+--   * the spoils owed to `pendingExp` and paid at the action boundary. Vanilla
+--     pays experience for a caught monster exactly as it pays for a fainted
+--     one, and the queue is what makes the two orders identical.
+--
+-- What it does not share: no replacement is ever asked for. A wild seat holds
+-- one monster in every fight this mode opens, but the rule is not "there is no
+-- bench" -- it is that a caught seat is *done*, which is why `caught` is set on
+-- the fighter and `_sideAlive` reads it. Zeroing a bench to say the same thing
+-- would be a lie told in HP, and it would show up in a snapshot as a party that
+-- fainted off-screen.
+--
+-- The sheet is taken **before** anything is cleared: a caught monster keeps the
+-- HP it had when the ball closed, which is what the player watched happen, and
+-- it is the sheet the grant rebuilds from. A monster too thin to describe
+-- (`caughtSheet` answers nil when it has no moves at all) still leaves the
+-- field: the ball is spent and "Gotcha" is already on screen, so refusing here
+-- would be a fight that says a monster was caught and then keeps hitting it.
+-- It simply has no entry to grant, which no wild monster the engine builds can
+-- reach.
+function Battle:_catch(thrower, fighter, mon)
+  local sheet = Effects.caughtSheet(mon)
+
+  for index = 1, #fighter.mons do
+    if fighter.mons[index] == mon then self:_unfield(fighter, index); break end
+  end
+  clearVolatiles(mon)
+  self:_clearTrapsFrom(fighter.slot)
+
+  self:_emit("caught", {
+    slot = fighter.slot, side = fighter.side, text = mon.species,
+    speciesId = mon.speciesId,
+  })
+
+  if sheet then
+    self.catches[#self.catches + 1] = {
+      caught = sheet, catcher = thrower.playerId,
+    }
+  end
+
+  self.pendingExp[#self.pendingExp + 1] = { fallen = fighter, mon = mon }
+
+  fighter.active = nil
+  fighter.caught = true
+  fighter.mustReplace = nil
+  fighter.pendingFought = nil
+
+  -- Paid and checked **here**, unconditionally, where `_faint` defers both to
+  -- its caller while resolving. The two differ because the reasons `_faint`
+  -- defers do not exist for a ball:
+  --
+  --   * A faint defers so the same action can still fell the user -- recoil,
+  --     EXPLOSION -- and land a draw. A ball fells nobody, and nothing else
+  --     happens inside the throw that could change who won.
+  --   * A ball **is** its action, so this is the action boundary; there is no
+  --     later one to wait for. Deferring would put the `over` event before the
+  --     `exp` it owes, since the turn drains after the fight phase.
+  --
+  -- And checking now is what stops the slower thrower's ball on a fight the
+  -- catch just ended: `_resolveItems` tests `self.result` before it resolves
+  -- the next throw, so a single-monster encounter still costs exactly one ball
+  -- -- the rule Party vs Wild opened with -- while an encounter with a second
+  -- monster still standing carries straight on to the second throw.
+  self:_drainExp()
+  self:_checkOver()
 end
 
 function Battle:_resolveResiduals()
@@ -2970,6 +3116,27 @@ end
 -- endings
 -- ------------------------------------------------------------------
 
+-- How a side that has nothing left came to have nothing left.
+--
+-- "ko" unless **every** seat on it left inside a ball, which is the only way a
+-- fight can honestly be described as ending in a catch. A single wild monster
+-- taken by a ball is that case and always was -- so a `wild` fight reads
+-- exactly as it read before any of this -- and so is a coop_wild whose two
+-- monsters were both caught.
+--
+-- One caught and one knocked out is "ko", deliberately. Something did faint,
+-- the losing side did lose, and the catch is not lost by saying so: it is on
+-- the outcome's `catches` either way, which is the whole point of that list
+-- being attached on every ending rather than on this one.
+function Battle:_beatenReason(side)
+  local seats = self.bySide[side]
+  if #seats == 0 then return "ko" end
+  for _, fighter in ipairs(seats) do
+    if not fighter.caught then return "ko" end
+  end
+  return "catch"
+end
+
 function Battle:_checkOver()
   if self.result then return true end
   local aliveA, aliveB = self:_sideAlive("a"), self:_sideAlive("b")
@@ -2978,9 +3145,11 @@ function Battle:_checkOver()
   if not aliveA and not aliveB then
     self:_finish("draw", nil, nil, "ko")
   elseif aliveA then
-    self:_finish("win", self:_sidePlayers("a"), self:_sidePlayers("b"), "ko")
+    self:_finish("win", self:_sidePlayers("a"), self:_sidePlayers("b"),
+      self:_beatenReason("b"))
   else
-    self:_finish("win", self:_sidePlayers("b"), self:_sidePlayers("a"), "ko")
+    self:_finish("win", self:_sidePlayers("b"), self:_sidePlayers("a"),
+      self:_beatenReason("a"))
   end
   return true
 end
@@ -3002,6 +3171,44 @@ function Battle:_finish(outcome, winners, losers, reason)
     losers = losers,
     reason = reason,
   }
+
+  -- Every ball that landed, on **every** ending and not merely on `catch`.
+  --
+  -- This is the whole reason the list exists rather than a pair of fields set
+  -- by the ball that ends the fight. Two wild monsters means a catch is no
+  -- longer the last thing that happens: the player who caught one watches their
+  -- partner knock the other one out, or run from it, or time out on it -- and
+  -- until this attached unconditionally, every one of those endings dropped a
+  -- monster somebody had already seen themselves catch.
+  --
+  -- Copied rather than referenced: `self.catches` keeps accumulating in a
+  -- battle object a hub may still be draining events out of, and a result table
+  -- that changed underneath its reader would be the same bug in a subtler place.
+  if #self.catches > 0 then
+    local catches = {}
+    for i = 1, #self.catches do
+      catches[i] = {
+        caught = self.catches[i].caught,
+        catcher = self.catches[i].catcher,
+      }
+    end
+    self.result.catches = catches
+
+    -- ...and the singular pair the wire has carried since PROTOCOL 18, when a
+    -- ball is what ended the fight.
+    --
+    -- Not deprecation theatre: `wild` seats one monster, ends on the ball that
+    -- takes it, and is read by a client (MediatedBattle) that has never heard
+    -- of a list. Mirroring the last entry means that fight's outcome is
+    -- byte-identical to the one it produced before this existed, and it costs
+    -- one line. The plural is what a coop_wild client reads; the two never
+    -- disagree, because this is copied from the list rather than set beside it.
+    if reason == "catch" then
+      local last = catches[#catches]
+      self.result.caught = last.caught
+      self.result.catcher = last.catcher
+    end
+  end
   self.phase = "over"
   self.deadline = nil
   self.resolveDeadline = nil
