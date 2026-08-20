@@ -108,10 +108,13 @@ more in one:
 
 `Config.PROTOCOL` **22 → 23**. Two optional fields on presence:
 
-- **`mon`** — species **id** (string), sanitised against the `pokemon` registry the way
-  `sprite` is sanitised against `sprites`. Absent means no follower. An id rather than a
-  dex number because the rest of the mod speaks ids (`spriteId`, `mapId`) and an id
-  validates against a registry.
+- **`mon`** — species **id** (string), validated by **shape, not against a registry**:
+  `^[%w_]+$` and a 40-character cap, exactly as `Wire.spriteId` does (`src/Wire.lua:390`).
+  Wire runs on the hub as well as in the client — `src/Hub.lua` and `server/lib/relay.js`
+  both re-derive presence from these bytes — and a hub has no content registry to consult.
+  The registry question belongs to the client, at the moment it asks Wilds for a sheet: an
+  id nobody has art for simply draws no follower. Absent means no follower. An id rather
+  than a dex number because the rest of the mod speaks ids (`spriteId`, `mapId`).
 - **`shiny`** — boolean, **strict** (`raw.shiny == true`). Same reason already written
   above `fast` in `Wire.lua`: both hubs re-derive presence from the same bytes, and a `0`
   or `""` would be true in Lua and false in JS.
@@ -171,9 +174,16 @@ never synced for a player who has no avatar: the avatar is the thing it trails.
 passed through **with its True Size geometry** (`frameWidth/Height`, `anchorX/Y`) — that
 is what keeps an ONIX from drawing at RATTATA's size.
 
-`require("src.render.SpriteRenderer")` in a memoised `pcall`. On failure: one
-`mod.log:warn` naming the remediation and the feature stays dark. Never `error()` — the
-loader's rule for mod callbacks.
+The renderer is reached through **one named seam, `Followers.newSprite(def, npcId)`**, not
+a bare `require` at the top of the file. Its default body is a memoised
+`pcall(require, "src.render.SpriteRenderer")`; on failure it answers `nil`, the caller
+emits one `mod.log:warn` naming the remediation, and the feature stays dark. Never
+`error()` — the loader's rule for mod callbacks.
+
+That seam is not decoration: `tests/followers.lua` pins `package.path = ""` for the reason
+`tests/solo_battle.lua` does, so the real `SpriteRenderer` is unreachable from the suite by
+construction. A bare top-level require would make the module untestable outside an engine
+checkout; the seam is what lets the whole spawn/swap/trail contract be driven headlessly.
 
 ## 7. Manifest & posture
 
