@@ -133,7 +133,16 @@ function defaultSpriteFor(generation) {
 // protocol-21 hub strips the field from the upload and states none on the
 // events, which is exactly that failure -- and it is one no player can
 // diagnose from inside the fight, since every other part of it works.
-const PROTOCOL = 22;
+// 23: one wild monster per player on a party encounter. `coop_wild` may seat
+// up to COOP_SIDE monsters on side b instead of exactly one; the referee
+// emits a `caught` event when a ball lands (that seat leaves the field and
+// the fight carries on while another wild stands); and mmo.battle_outcome
+// grows a `catches` list so a fight that paid out twice can say so. Each of
+// those degrades badly rather than visibly against a 22-era peer: a 22 hub
+// deals the host's second monster nowhere, a 22 client keeps drawing a
+// monster that has left the field, and a 22 outcome cleaner strips the list
+// a caught monster travels home on.
+const PROTOCOL = 23;
 
 // How long a four-way PARTY BATTLE ask waits for its three answers. Mirrors
 // Config.COOP_ASK_TIMEOUT: every one of the four is looking at a box right

@@ -143,7 +143,24 @@ M.MOD_ID = "rby_mmo"
 -- the picture and the number under it are wrong. Refusal naming both versions
 -- is the only sentence either player can act on.
 -- This number lives here and in server/lib/relay.js -- bump them together.
-M.PROTOCOL = 22
+--
+-- 23 is one wild monster per player on a party encounter: `coop_wild` may seat
+-- up to COOP_SIDE monsters on side b instead of exactly one, the referee emits
+-- a `caught` event when a ball lands (that seat leaves the field; the fight
+-- carries on while another wild stands), and `mmo.battle_outcome` grows a
+-- `catches` list so a fight that paid out twice can say so.
+--
+-- Every one of those degrades badly rather than visibly against a 22-era peer,
+-- which is why this is a refusal and not a feature test. A 22 hub mints one
+-- npc seat and deals the host's second monster **nowhere** -- the encounter
+-- opens as today's 2v1 and the second player's wild is silently gone. A 22
+-- client drops the unknown `caught` kind, so it watches a ball land, hears
+-- "Gotcha!", and then keeps drawing a monster that is no longer on the field
+-- and can never be hit. And a 22 outcome cleaner strips `catches`, so the
+-- monster somebody watched themselves catch never reaches a save.
+-- Refusal naming both versions is the only sentence either player can act on.
+-- This number lives here and in server/lib/relay.js -- bump them together.
+M.PROTOCOL = 23
 
 -- The port an in-game host binds, and the one a bare address is completed
 -- with.
