@@ -730,6 +730,42 @@ M.SOLO_REFUSED = {
   "safari", "ghost", "noCatch", "demo",      -- Gen 1
   "contest", "tutorial", "roaming",          -- Gen 2
 }
+-- One wild monster per player on a party encounter, unless the player says
+-- otherwise.  On by default where SOLO BATTLES is off, and the difference is
+-- the point: that row changes something the *game* already did, this one
+-- changes something this mod added.  A party encounter is already a co-op fight
+-- vanilla has no opinion about, and one monster between two players was never
+-- the interesting answer to it.  Read at the encounter (src/WildRoll.lua), so
+-- flipping it takes on the next step in the grass.
+M.WILD_EACH_DEFAULT = true
+
+-- Species that are never a grass roll, wherever they turn up.
+--
+-- **The net under the rule, not the rule.** What actually decides a scripted
+-- encounter is that the species is in no encounter list this map keeps
+-- (src/WildRoll.lua) -- which needs no names, survives a mod adding one, and is
+-- right about the cases nobody thought of.  This list is what answers when that
+-- lookup cannot run at all: a build whose encounter tables this mod fails to
+-- read would otherwise put a second Mewtwo in front of the other player, and
+-- that is the one mistake here a player could not undo.
+--
+-- Names only, no data: these are registry ids, the same strings the wire
+-- already carries, and nothing about a monster is described here.
+--
+-- Gyarados is deliberately absent. The Lake of Rage one is a *forced-shiny*
+-- battle type and is caught by SOLO_REFUSED_BATTLE_TYPES below; the species
+-- itself is an ordinary surf encounter in a dozen places, and denying it would
+-- cost those.  Lapras is absent for the same shape of reason: static in Union
+-- Cave, ordinary in the water elsewhere, and the map lookup tells them apart.
+M.WILD_STATIC_SPECIES = {
+  -- Gen 1
+  ARTICUNO = true, ZAPDOS = true, MOLTRES = true, MEWTWO = true, MEW = true,
+  SNORLAX = true,
+  -- Gen 2
+  RAIKOU = true, ENTEI = true, SUICUNE = true, LUGIA = true, CELEBI = true,
+  SUDOWOODO = true, HOOH = true,
+}
+
 M.SOLO_REFUSED_BATTLE_TYPES = {
   [3] = true,   -- BATTLETYPE_TUTORIAL   (the DUDE's demonstration)
   [5] = true,   -- BATTLETYPE_ROAMING    (the three beasts)
