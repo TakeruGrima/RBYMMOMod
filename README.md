@@ -855,6 +855,7 @@ the `PLAYERS` list to start one from.
 | `MY SPRITE` | RED | who you look like, to everyone including you — the `CHARACTER` row is the in-game way to the same thing, on your own or mid-game, and its choice sticks to your save |
 | `B TO RUN` | on | hold B on foot to move at bike speed |
 | `SOLO BATTLES` | off | fight wild encounters and every trainer on this mod's battle system, on your own and offline — see above |
+| `CLASSIC BATTLE UI` | **on** | draw the battle menus and the HP plates as the original's white Game Boy box with its big tile font, instead of the arena's dark panels. The field itself is unchanged — same seats, same throws, same 2-on-2. Turn it off if you prefer the modern look |
 
 These are just the *defaults* — HOST GAME asks the room size every time and
 JOIN GAME lets you type an address and a passcode, and those in-game choices
