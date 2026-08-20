@@ -759,7 +759,7 @@ do
      "and it fights with no bag at all")
 end
 
--- ------- coop_wild: two humans, one wild seat; 2-human gate; catcher on catch
+-- ------- coop_wild: a wild seat per human; 2-human gate; catcher on catch
 
 do
   local hub = Hub.new({ maxPlayers = 4 })
@@ -770,13 +770,36 @@ do
     mode = "coop_wild", hostId = ann.id, memberIds = { ann.id, bob.id },
   })
   ok(record ~= nil, "a coop_wild record opens with two members")
-  eq(#(record.npcIds or {}), 1, "with one synthetic wild seat")
+  eq(#(record.npcIds or {}), 2, "with a synthetic wild seat per human")
   eq(#record.sides.a, 2, "side a is two humans")
-  eq(#record.sides.b, 1, "side b is the wild seat")
-  eq(record.sides.b[1], record.npcIds[1], "side b names the wild seat")
+  eq(#record.sides.b, 2, "side b is the wild seats")
+  eq(record.sides.b[1], record.npcIds[1], "side b names the first wild seat")
+  eq(record.sides.b[2], record.npcIds[2], "and the second")
   eq(hub:battleSeat(record, ann, { side = "b" }), record.npcIds[1],
-     "the host's side-b upload fills the wild seat")
-  eq(#hub:seatsNeeded(record), 3, "three seats owe a party")
+     "the host's side-b upload starts at the first wild seat")
+  eq(#hub:seatsNeeded(record), 4, "four seats owe a party")
+end
+
+do
+  -- The scripted encounter, and the reason it needed no code of its own: the
+  -- seats are minted for the mode, the host uploads a single monster, and the
+  -- deal hands the spare seat back.  What opens is the 2v1 coop_wild has always
+  -- been -- from a record that was prepared to seat two.
+  local hub = Hub.new({ maxPlayers = 4 })
+  local ann = join(hub, "ANN")
+  local bob = join(hub, "BOB")
+
+  local record = hub:openMediatedBattle("cw-legend", {
+    mode = "coop_wild", hostId = ann.id, memberIds = { ann.id, bob.id },
+  })
+  eq(#(record.npcIds or {}), 2, "two wild seats are minted up front")
+  ok(hub:fillBattleParty(record, ann, {
+    battle = "cw-legend", side = "b",
+    mons = { mon({ species = "ARTICUNO", catchRate = 3 }) },
+  }), "a one-monster wild upload is accepted")
+  eq(#record.npcIds, 1, "and the seat it could not fill is given up")
+  eq(#record.sides.b, 1, "so side b is the single monster the script named")
+  eq(#hub:seatsNeeded(record), 3, "three seats owe a party again")
 end
 
 do
