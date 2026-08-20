@@ -18,6 +18,7 @@ Working notes for features that were (or are being) implemented in this repo.
 | [`hub-twin-parity.md`](hub-twin-parity.md) | Hub.lua ↔ relay.js drift process + carve-outs |
 | [`battle-sim-move-effects.md`](battle-sim-move-effects.md) | Complete; locked BattleSim decisions |
 | [`offline-solo-battles.md`](offline-solo-battles.md) | Solo wild + trainer fights on BattleSim, option default off, no wire change — in progress |
+| [`mmo-followers.md`](mmo-followers.md) | A POKéMON behind every remote trainer via Wilds of Kanto (PROTOCOL 23, `engine_internals`) — planned |
 
 ## Historical
 
