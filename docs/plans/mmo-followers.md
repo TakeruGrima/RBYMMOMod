@@ -224,19 +224,39 @@ Headless Lua suite (`tests/rby_mmo_test.lua`, which runs **without** WoK):
 Node: parity fixtures extended; `hub_protocol_parity.test.js`, `twin_parity.test.js`,
 `hub.test.js` green.
 
-**Blocked on this machine — must be run elsewhere.** There is no gen1recomp checkout and
-**no Lua interpreter at all** (`luajit`, `lua`, `lua5.1`, `lua5.4`, `love` — none on
-PATH). Baseline measured at the base SHA: `hub.test.js` 148/148, `twin_parity` 9/9,
-`hub_protocol_parity` 13 passed **and 2 skipped** — and the two skips are precisely
-"JS hub matches the Lua hub, scenario for scenario" and "the committed hub fixture still
-is what luajit produces". So:
+**What runs on this machine.** No `luajit` is on PATH — but **LÖVE 11.5 is installed**
+(`C:\Program Files\LOVE\`), and it ships `lovec.exe` plus `lua51.dll`, i.e. an embedded
+LuaJIT. A headless LÖVE shell (every module off, `loadfile` the script, quit) turns it
+into a plain Lua runner, and the repo's standalone drivers say exactly what they need:
+"Standalone: no love, no engine, no mod facade"
+(`tests/drivers/hub_protocol_parity.lua:18`).
 
-- The Lua suite, `modkit validate/lint/pack`, and the e2e driver cannot be run here.
-- The Lua half of the parity fixture can be **hand-authored but not regenerated**, and
-  the JS side will only be checked against that hand-authored fixture.
-- Rendering cannot be verified at all — `SpriteRenderer` needs LÖVE.
+Measured at the base SHA through that runner:
 
-Unblocking either means installing LuaJIT or cloning gen1recomp on this machine.
+| Suite | Result |
+| --- | --- |
+| `server/hub.test.js` | 148/148 |
+| `server/twin_parity.test.js` | 9/9 |
+| `server/hub_protocol_parity.test.js` | 13 passed, 2 skipped (both want `luajit` on PATH) |
+| `tests/hub_battle.lua` | 170 passed, 0 failed |
+| `tests/solo_battle.lua` | 152 passed, 0 failed |
+| `tests/battle_sim_turn.lua` | 509 passed, 0 failed |
+| `tests/drivers/hub_protocol_parity.lua` | regenerates the committed fixture **byte-identically** |
+
+That last row is the one that matters for a PROTOCOL bump: the Lua half of hub parity is
+**verifiable here, not hand-authored**. Windows appends a CRLF, so pipe a regenerated
+fixture through `tr -d '\r'` before committing it.
+
+**Still needs a real gen1recomp checkout.** Everything requiring `tests.modkit` — the
+engine's test helper, which the packaged `.love` does not ship — namely
+`rby_mmo_test.lua`, `trade2.lua`, `coop_mediated.lua`, `mediated_battle_client.lua`,
+`battle_sim{,2}_vectors.lua`; plus `solo_brain.lua` (wants the engine's `TrainerAI`),
+`modkit validate/lint/pack`, and the e2e drivers. **`rby_mmo_test.lua` is where the
+`Wire.presence` and `Followers` tests of this plan belong**, so that half of §9 is written
+blind until the engine is on disk.
+
+Rendering is not verifiable by any suite — `SpriteRenderer` needs a live LÖVE game. Two
+instances, by hand.
 
 ## 10. Rejected alternatives
 
