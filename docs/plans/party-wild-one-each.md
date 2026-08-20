@@ -373,4 +373,49 @@ and the option row disappears.
 
 ---
 
+## 9. What actually landed (2026-08-21)
+
+Approved and implemented on `worktree-party-wild-one-each`. Four things went
+differently from the plan, and they are worth reading before the file is used
+as a record of the design.
+
+**The machine could run the Lua after all.** §7 said the engine suites and both
+parity packs needed the owner's engine box. `lupa` carries LuaJIT 2.1 — the
+engine's own runtime — so every standalone suite runs here: `battle_sim_turn`
+(542), `battle_sim_vectors`, `battle_sim_effects`, `battle_sim2_turn`,
+`battle_sim2_vectors`, `hub_battle` (176), `solo_battle`, and the two new ones.
+Both parity fixtures were **regenerated** rather than hand-edited, which is how
+we know 22 of the Gen 1 pack's 24 vectors were byte-identical and only the two
+catch vectors moved. T0 therefore stopped being a blocker and became a
+verification still owed against a real checkout.
+
+**The event could not carry the sheet, and neither could the outcome alone.**
+Already caught in §2 before implementation; what emerged during it is the
+consequence for `_finish`: `catches` has to attach on *every* ending, not the
+`catch` one, or a catch followed by a run vanishes. There is a test per ending.
+
+**`_catch` pays and checks immediately** where `_faint` defers while resolving.
+The plan said "mirror `_faint`", and mirroring it was wrong twice over: it would
+put `over` before the `exp` a catch owes, and it would let the slower thrower's
+ball resolve on a single-monster encounter the catch had just ended — losing a
+rule Party vs Wild opened with.
+
+**`Coop.npcSide` is not headless-testable.** It packs through the engine's link
+`Protocol`, so `tests/coop_wild_field.lua` narrowed to the one client-side
+decision that is pure and can lose a monster (`CoopBattle.sheetNamesMon`). The
+field description, the upload and the grant stay with `tests/coop_mediated.lua`
+and the e2e drivers.
+
+### Outstanding
+
+| Item | Why it is not done here |
+| --- | --- |
+| **TT5 — e2e** (`tests/drivers/run-party-wild-e2e.sh`) | Needs two LÖVE instances, a ROM and the engine checkout |
+| **T0's three questions** — the `encounters` record's real shape, a cheaper Gen 1 monster factory than `BattleState.newWild`, whether grass can push from inside a script | Needs the engine. `WildRoll` is written to survive all three answers: every failure answers nil, which is the 2v1 that already shipped |
+| `modkit validate` / `lint` / `pack` | Same |
+| §8's open question 1 — experience on a catch | Implemented as "yes, vanilla pays". Visible in the parity pack as two `exp` events that were not there before; say if it should stay unpaid |
+
+---
+
 **Approval gate:** no production code until this is confirmed or amended.
+*(Confirmed 2026-08-20; §9 records what was built.)*

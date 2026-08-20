@@ -855,6 +855,7 @@ the `PLAYERS` list to start one from.
 | `MY SPRITE` | RED | who you look like, to everyone including you — the `CHARACTER` row is the in-game way to the same thing, on your own or mid-game, and its choice sticks to your save |
 | `B TO RUN` | on | hold B on foot to move at bike speed |
 | `SOLO BATTLES` | off | fight wild encounters and every trainer on this mod's battle system, on your own and offline — see above |
+| `WILD EACH` | on | when you and your party member walk into grass together, meet **one wild POKéMON each** instead of sharing one. Either of you can throw at either of them, a caught one leaves the field and the fight carries on, and whoever's ball landed keeps it. Legendaries, SNORLAX, the ghost and the SAFARI ZONE are untouched: those were never a grass roll, so they stay the single POKéMON you both fight |
 
 These are just the *defaults* — HOST GAME asks the room size every time and
 JOIN GAME lets you type an address and a passcode, and those in-game choices

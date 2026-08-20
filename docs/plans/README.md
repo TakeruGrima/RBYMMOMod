@@ -13,7 +13,7 @@ Working notes for features that were (or are being) implemented in this repo.
 | [`gen2-compatibility.md`](gen2-compatibility.md) | Dual Gen1+Gen2 hubs, BattleSim2, trade, co-op, e2e — shipped |
 | [`gen2-new-battle-system.md`](gen2-new-battle-system.md) | The arena, the band, exp and retargeting on Gold — shipped |
 | [`party-wild-encounter.md`](party-wild-encounter.md) | Party vs Wild (`coop_wild`) — in progress |
-| [`party-wild-one-each.md`](party-wild-one-each.md) | One wild per player on a party encounter, scripted ones stay 2v1 (PROTOCOL 23) — proposed |
+| [`party-wild-one-each.md`](party-wild-one-each.md) | One wild per player on a party encounter, scripted ones stay 2v1 (PROTOCOL 23) — implemented; e2e outstanding |
 | [`coop-battle-intro-anims.md`](coop-battle-intro-anims.md) | CoopBattle intro balls + sequential Go!/POOF — implemented |
 | [`guild-focus-battle-ui.md`](guild-focus-battle-ui.md) | CoopBattle focus stage + side strips |
 | [`hub-twin-parity.md`](hub-twin-parity.md) | Hub.lua ↔ relay.js drift process + carve-outs |

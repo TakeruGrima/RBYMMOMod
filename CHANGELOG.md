@@ -8,6 +8,49 @@ here must match `manifest.version`.
 
 ### Added
 
+- **One wild POKéMON each.** A party that walks into grass together used to
+  meet one wild POKéMON and fight it two-on-one, which left the second
+  player watching. From **PROTOCOL 23** an ordinary encounter seats **one
+  per player**: two trainers, two POKéMON, one field. A new `WILD EACH` row
+  in the mod manager (`F10` → `MMO`), **default ON**, turns it off — on by
+  default because, unlike `SOLO BATTLES`, it changes something this mod
+  added rather than something the game already did.
+  - **Scripted encounters are untouched, and no code decides that.** A
+    legendary, SNORLAX, the MAROWAK ghost, the SAFARI ZONE, the old man's
+    demonstration and Gold's contest / tutorial / roaming battles all stay
+    the single POKéMON both players fight. The rule is the same lookup that
+    finds the second one: a random encounter is a species drawn from the
+    list this map keeps for the terrain you are standing on, so a species
+    that is in no list on this map was not drawn from any — a script put it
+    there. The host then uploads one POKéMON, and the hub's existing
+    spare-seat drop opens the fight as the 2v1 it has always been.
+  - **Both of you can throw, and there is no quota.** Balls resolve in
+    active-POKéMON speed order as they always have; a ball may now name
+    which POKéMON it is aimed at. A successful catch takes that one off the
+    field and the fight **carries on** while the other is standing — so the
+    slower thrower's ball is still resolved, where a single-POKéMON
+    encounter still ends on the first ball and still costs exactly one.
+    Whoever's ball landed keeps what it caught, and a fight can pay out
+    twice.
+  - **A catch is not a faint.** The referee emits a new `caught` event: the
+    seat leaves the field without printing "fainted", without a sink over a
+    patch of grass the ball chain already emptied, and without zeroing a
+    bar — the POKéMON on that seat is on its way into somebody's party with
+    the HP it had when the ball closed. Experience is paid for it exactly
+    as vanilla pays it, which is the one change a *single*-POKéMON
+    encounter can also see.
+  - **`mmo.battle_outcome` grows `catches`**, one entry per ball that
+    landed, each naming its own thrower — delivered on **every** ending, so
+    catching one and then running from the other still brings the first one
+    home. The `caught` / `catcher` pair the wire has carried since PROTOCOL
+    18 stays, mirroring the last entry, so a solo `wild` fight reads exactly
+    as it did.
+  - PROTOCOL 22 → 23. Every part of this degrades badly rather than visibly
+    against a 22-era peer — a 22 hub deals the second POKéMON nowhere, a 22
+    client keeps drawing one that has left the field, and a 22 outcome
+    cleaner strips the list a caught POKéMON travels home on — so the
+    refusal names both versions instead.
+
 - **This mod's battle system, with nobody else in the room.** A new
   `SOLO BATTLES` row in the mod manager (`F10` → `MMO`), **default OFF**,
   routes ordinary wild encounters and *every* trainer — walked into,

@@ -2294,6 +2294,156 @@ do
   eq(#anims, 4, "coop_wild catch is one ball chain (slower throw never resolves)")
 end
 
+-- ------- one wild monster per player: a catch is a departure, not an ending
+--
+-- Everything above this line is the single-monster encounter, and it is
+-- deliberately left alone: a scripted one still seats one monster, still ends
+-- on the ball that takes it, and still costs exactly one ball.  What follows is
+-- the ordinary encounter, where a catch has to leave the other monster standing.
+
+local function twoWild(seed, over, annMoves)
+  local splash = move({ id = "splash", power = 0, effect = 85 })
+  local sides = {
+    a = {
+      { playerId = "a1", name = "Ann",
+        mons = { mon({ species = "Alpha", maxHp = 200, spd = 120,
+                       moves = annMoves or { splash } }) },
+        bag = { MASTER_BALL = 1, POKE_BALL = 1 } },
+      { playerId = "a2", name = "Abe",
+        mons = { mon({ species = "Gamma", maxHp = 200, spd = 1,
+                       moves = { splash } }) },
+        bag = { MASTER_BALL = 1, POKE_BALL = 1 } },
+    },
+    b = {
+      { playerId = "w1", name = "Wild",
+        mons = { mon({ species = "Beta", maxHp = 200, spd = 1, catchRate = 255,
+                       moves = { splash } }) } },
+      { playerId = "w2", name = "Wild",
+        mons = { mon({ species = "Delta", maxHp = 20, spd = 1, catchRate = 255,
+                       moves = { splash } }) } },
+    },
+  }
+  for key, value in pairs(over or {}) do sides[key] = value end
+  return battleOf({ mode = "coop_wild", seed = seed, sides = sides })
+end
+
+do
+  local battle = twoWild(88010)
+  drain(battle)
+  eq(#battle:snapshot().field, 4, "an ordinary party encounter is four seats")
+
+  -- Ann takes the first monster. Abe's ball is slower, and with a monster still
+  -- standing it must resolve rather than be saved by an ending.
+  battle:submitChoice("a1", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("a2", { action = "item", item = "MASTER_BALL", target = 3 })
+  battle:submitChoice("w1", { action = "fight", move = 0 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  local events = drain(battle)
+
+  local caught = {}
+  for _, event in ipairs(events) do
+    if event.t == "caught" then caught[#caught + 1] = event end
+  end
+  eq(#caught, 2, "both balls landed, in the same turn")
+  eq(caught[1].slot, 2, "the faster thrower's ball took the seat they aimed at")
+  eq(caught[1].text, "Beta", "and the event names the monster that was taken")
+  eq(caught[2].slot, 3, "the slower thrower's ball took the other one")
+  eq(battle.byId.a2.bag.MASTER_BALL, nil,
+     "so the slower thrower did spend their ball this time")
+
+  eq(battle.result and battle.result.reason, "catch",
+     "a side that left entirely inside balls ends the fight as a catch")
+  eq(#battle.result.catches, 2, "and the outcome carries both of them")
+  eq(battle.result.catches[1].catcher, "a1", "each entry names its own thrower")
+  eq(battle.result.catches[2].catcher, "a2", "including the second one")
+  eq(battle.result.catches[1].caught.species, "Beta", "with the monster it took")
+  eq(battle.result.catches[2].caught.species, "Delta", "and so does the second")
+  eq(battle.result.catcher, "a2",
+     "the singular pair mirrors the last entry for a pre-23 reader")
+  eq(battle.result.caught.species, "Delta", "monster included")
+end
+
+do
+  -- One caught, one knocked out. The fight is a `ko` -- something did faint --
+  -- and the catch survives that reading, which is the whole reason `catches`
+  -- rides every ending rather than the catch one.
+  local thump = move({ id = "thump", power = 120, accuracy = 255 })
+  local battle = twoWild(88011, nil, { thump })
+  drain(battle)
+  battle:submitChoice("a1", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("a2", { action = "fight", move = 0, target = 3 })
+  battle:submitChoice("w1", { action = "fight", move = 0 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  drain(battle)
+
+  ok(battle.result == nil, "a catch with another monster standing does not end it")
+  local seat = battle.byId.w1
+  ok(seat.caught, "the caught seat is marked as gone by catch")
+  ok(seat.active == nil, "and has nothing on the field")
+
+  -- Now take the other one down, which the thin one cannot survive.
+  battle:submitChoice("a1", { action = "fight", move = 0, target = 3 })
+  battle:submitChoice("a2", { action = "fight", move = 0, target = 3 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  drain(battle)
+
+  eq(battle.result and battle.result.reason, "ko",
+     "one caught and one beaten reads as a ko -- something did faint")
+  eq(#(battle.result.catches or {}), 1,
+     "and the catch is still on the outcome, which is why the list rides every ending")
+  eq(battle.result.catches[1].catcher, "a1", "named to the player who threw it")
+  eq(battle.result.caught, nil,
+     "the singular pair stays absent when the ending was not a catch")
+end
+
+do
+  -- A catch followed by a flight. The fight ends on the run, and the monster
+  -- somebody already watched themselves catch still comes home.
+  local battle = twoWild(88012)
+  drain(battle)
+  battle:submitChoice("a1", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("a2", { action = "fight", move = 0, target = 3 })
+  battle:submitChoice("w1", { action = "fight", move = 0 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  drain(battle)
+  ok(battle.result == nil, "still going, with one monster left")
+
+  battle:submitChoice("a1", { action = "run" })
+  battle:submitChoice("a2", { action = "fight", move = 0, target = 3 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  drain(battle)
+
+  eq(battle.result and battle.result.reason, "run", "fleeing ends it as a run")
+  eq(#(battle.result.catches or {}), 1,
+     "and the catch that happened before it is still on the outcome")
+  eq(battle.result.catches[1].catcher, "a1", "named to the player who threw it")
+  eq(battle.result.caught, nil,
+     "the singular pair stays absent on an ending that was not a catch")
+end
+
+do
+  -- The aim itself: a ball that names the far seat takes the far seat, and a
+  -- ball that names one of its own side is refused rather than redirected.
+  local battle = twoWild(88013)
+  drain(battle)
+  ok(not battle:submitChoice("a1", { action = "item", item = "MASTER_BALL",
+     target = 1 }), "a ball aimed at an ally is refused")
+  ok(not battle:submitChoice("a1", { action = "item", item = "MASTER_BALL",
+     target = 9 }), "and so is one aimed at a seat that is not there")
+  ok(battle:submitChoice("a1", { action = "item", item = "MASTER_BALL",
+     target = 3 }), "a ball aimed at the second wild monster is accepted")
+  battle:submitChoice("a2", { action = "fight", move = 0 })
+  battle:submitChoice("w1", { action = "fight", move = 0 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  local events = drain(battle)
+  local taken = nil
+  for _, event in ipairs(events) do
+    if event.t == "caught" then taken = event end
+  end
+  eq(taken and taken.slot, 3, "and it is the aimed-at seat that is taken")
+  eq(taken and taken.text, "Delta", "by name as well as by seat")
+end
+
 do
   local splash = move({ id = "splash", power = 0, effect = 85 })
   local battle = battleOf({

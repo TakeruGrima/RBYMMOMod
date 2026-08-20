@@ -531,6 +531,46 @@ scenario('wild_ball', (events) => {
   return battle;
 });
 
+// 14b. one wild monster per player (PROTOCOL 23): two balls in one turn, a
+//      `caught` event and its `exp` where the stream used to go straight to
+//      `over`, and an outcome carrying both catches with the singular pair
+//      mirroring the last of them. The aim is named on the slower throw so the
+//      retarget path is in the digest too.
+scenario('coop_wild_two', (events) => {
+  const battle = build({
+    id: 'cw2',
+    mode: 'coop_wild',
+    seed: 909,
+    choiceTimeout: 60,
+    reconnectGrace: 60,
+    sides: {
+      a: [
+        { playerId: 'p1', name: 'Ann', bag: { MASTER_BALL: 1 }, mons: [
+          mn({ species: 'Alpha', maxHp: 200, spd: 120,
+            moves: [mv('splash', 0, 255, 0)] })] },
+        { playerId: 'p2', name: 'Abe', bag: { MASTER_BALL: 1 }, mons: [
+          mn({ species: 'Gamma', maxHp: 200, spd: 1,
+            moves: [mv('splash', 0, 255, 0)] })] },
+      ],
+      b: [
+        { playerId: 'w1', name: 'Wild', mons: [
+          mn({ species: 'Beta', maxHp: 100, hp: 40, spd: 10, catchRate: 255,
+            moves: [mv('splash', 0, 255, 0)] })] },
+        { playerId: 'w2', name: 'Wild', mons: [
+          mn({ species: 'Delta', maxHp: 60, hp: 20, spd: 5, catchRate: 255,
+            moves: [mv('splash', 0, 255, 0)] })] },
+      ],
+    },
+  });
+  drainInto(battle, events);
+  battle.submitChoice('p1', { action: 'item', item: 'MASTER_BALL' });
+  battle.submitChoice('p2', { action: 'item', item: 'MASTER_BALL', target: 3 });
+  battle.submitChoice('w1', { action: 'fight', move: 0 });
+  battle.submitChoice('w2', { action: 'fight', move: 0 });
+  drainInto(battle, events);
+  return battle;
+});
+
 // 15. vitamins: fight-local Stat Exp on the sheet (+2560); Gen1 stat delta.
 scenario('vitamin', (events) => {
   const battle = build({
@@ -848,6 +888,19 @@ function slimOutcome(out) {
       hp: out.caught.hp,
       maxHp: out.caught.maxHp,
     };
+  }
+  if (out.catcher) slim.catcher = out.catcher;
+  // One line per ball that landed, in the order they landed: who threw it and
+  // what it took. The same digest the singular `caught` gets and for the same
+  // reason -- what has to match across the two runtimes is *which* monster
+  // ended up in *whose* hands.
+  if (out.catches) {
+    slim.catches = out.catches.map((entry) => ({
+      catcher: entry.catcher,
+      species: entry.caught && entry.caught.species,
+      level: entry.caught && entry.caught.level,
+      hp: entry.caught && entry.caught.hp,
+    }));
   }
   return slim;
 }
