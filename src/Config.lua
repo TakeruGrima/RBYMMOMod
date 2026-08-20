@@ -561,6 +561,170 @@ M.BATTLE_TYPE_MAX = 20
 -- ship in this repo.
 M.BATTLE_METRONOME_POOL_MAX = 200
 
+-- ------- solo battles
+--
+-- The same referee with nobody on the other end of a socket: one player's
+-- ordinary wild encounters and every trainer they walk into, run by
+-- src/BattleSim in this process instead of by a hub.  src/SoloBattle.lua owns
+-- the fight and src/SoloBrain.lua answers for the opponent; the screen is the
+-- mediated one, because from a client's side a battle it does not referee
+-- looks the same whether the referee is across a wire or a table away.
+--
+-- Nothing here is on the wire.  No message type, no PROTOCOL, no server/ twin,
+-- no new BattleSim mode -- the turn machine has never needed a socket to run
+-- (src/BattleSim/Turn.lua requires nothing at all), so a solo fight is a Turn
+-- built locally and pumped locally, and the numbers below are the only new
+-- vocabulary the feature has.
+
+-- Whether the mod takes a lone player's battles at all.
+--
+-- Off, and a mod-manager row rather than a decision made here, because this is
+-- the one thing this mod does that changes a fight the player was going to
+-- have anyway.  Everything else is an addition -- a nameplate over a stranger,
+-- a bubble, a partner in a battle that could not otherwise exist -- and a copy
+-- with nobody to talk to is meant to be as close to absent as it can be.  With
+-- this on, the screen a single-player game shows for every wild and every
+-- trainer is this mod's, which is a different game than the one that was
+-- installed: worth offering, not worth assuming.
+--
+-- Read at the encounter rather than at install, like every row but `port`, so
+-- a player who flips it mid-session gets it on the next battle and not on the
+-- next launch.
+M.SOLO_BATTLES_DEFAULT = false
+
+-- Which BattleSim mode each solo fight is seated as.
+--
+-- Two modes rather than one, and the difference is mechanical rather than
+-- descriptive: BattleSim reads the mode's *name*.  Effects.isWildMode and
+-- Effects.teleportRunAllowed both gate catching and fleeing on
+-- mode:find("wild"), so a trainer fight seated as `wild` is a fight where a
+-- Poke Ball lands on Brock's ONIX and keeps it.  Under `coop_npc` the same
+-- throw hits Turn.lua's refusal instead -- and the *mechanics* of that refusal
+-- are vanilla's, obtained without a line of the referee or its JS twin moving:
+-- the ball is debited (src/ui/BagMenu.lua:167-169 on the engine side,
+-- MediatedBattle:confirmPendingItem here), the throw does not catch, and the
+-- turn is spent -- which is exactly what BattleState:throwBall's non-wild arm
+-- does (src/battle/BattleState.lua:4886-4922: animate the block, then
+-- executeAction / queueResidual / endOfTurn).
+--
+-- **The wording is not vanilla's, and this is the one place that is written
+-- down.**  The cart prints "The trainer blocked the BALL!" and then "Don't be
+-- a thief!"; the referee narrates its own generic refusal -- "used an item",
+-- "But it failed".  A player loses the same ball and the same turn either way
+-- and reads a different sentence about it, so nobody should take the line
+-- above for a fidelity test that was passed.
+--
+-- `coop_npc` rather than `1v1` for the trainer, which is the shape it looks
+-- like, for the other half of the same argument: Turn's EXP_MODES pays the
+-- winning side in wild, coop_wild and coop_npc and deliberately not in 1v1 or
+-- coop_pvp, because paying a player for beating another player is a farming
+-- loop.  A solo trainer fight is not that -- it is the game's own trainer, and
+-- it owes exp.  coop_npc is also already the mode meaning "humans on a,
+-- something synthetic on b", which is the seating either way.
+M.SOLO_WILD_MODE = "wild"
+M.SOLO_TRAINER_MODE = "coop_npc"
+
+-- How long the local referee waits on the player's choice.  Zero, which Turn
+-- reads as "no deadline at all" rather than as "immediately".
+--
+-- BATTLE_CHOICE_TIMEOUT exists so that one player thinking cannot freeze
+-- another player's screen; in a solo fight there is no other player, and the
+-- opponent answers in the same breath the turn opens.  Every second of that
+-- clock would therefore be spent doing the one thing single-player games have
+-- never done -- picking a move for someone who paused to read their party, or
+-- put the game down mid-route.  The vanilla battle menu waits forever, so this
+-- one does too.
+M.SOLO_CHOICE_TIMEOUT = 0
+
+-- The battles this mod hands straight back to the engine.
+--
+-- Which kinds it *takes* is a whitelist read off the pushed state (`wild` and
+-- `trainer`, and nothing else -- a link battle is excluded by not being
+-- either).  These are the exceptions inside that whitelist: fights the engine
+-- spells as an ordinary wild encounter and then mutates into something
+-- BattleSim has no model for.  Safari swaps the whole menu for BALL / BAIT /
+-- ROCK / RUN over a step and ball budget; the Marowak ghost is uncatchable and
+-- unhittable until the Silph Scope; the Viridian old man is a scripted
+-- demonstration whose throw is meant to succeed (or, once, to fail) on cue.
+-- Running any of them through a referee that models none of it would not be a
+-- worse battle, it would be a wrong one.
+--
+-- Refusal is silent and the vanilla battle simply proceeds -- the player is
+-- told nothing, because from where they are standing nothing happened.
+--
+-- ------- the same list is not the same list on Gold
+--
+-- The first four names are Gen 1's, and for a while this list stopped there on
+-- the theory that a Gen 2 battle "carries none of these fields, which is the
+-- right answer there too".  That was simply false.  Gold has every one of
+-- these fights; it spells them differently:
+--
+--   * `contest` -- the Bug-Catching Contest (src/ui/gen2/BattleState.lua:225).
+--     PARK BALLs only, a ball budget, the caught mon HELD rather than added,
+--     and a draw on the last ball.  Gold's Safari Zone in all but name, and
+--     BattleSim models not one part of it.
+--   * `tutorial` -- BATTLETYPE_TUTORIAL, the DUDE's catching demonstration
+--     (src/core/gen2/CatchTutorial.lua).  An empty player party, his pack, and
+--     a throw that cannot fail.  The exact twin of Gen 1's `demo`.
+--   * `roaming` -- Raikou, Entei and Suicune.  Two things ride on it that the
+--     referee has no idea about: the beast flees on its own first turn
+--     (TryEnemyFlee's AlwaysFleeMons), and the end of the battle banks its
+--     remaining HP back into the save's roam slot.  Refereed here it would
+--     stand and fight, and its wounds would not follow it.
+--
+-- ------- and one of them is a number, not a field
+--
+-- wBattleType is a byte.  BATTLETYPE_FORCESHINY (7, the Lake of Rage Gyarados)
+-- and BATTLETYPE_TRAP (9, the Rocket base) are battles vanilla refuses to let
+-- you run from at all (src/battle/gen2/Battle.lua:3787-3792 -- running from the
+-- Gyarados used to forfeit the one-shot shiny), and a referee that ends a fight
+-- on any `run` cannot honour that.  A numeric value is truthy for every number
+-- including zero, so the field loop above cannot be asked the question: it
+-- needs its own set, keyed by value.
+--
+-- The two spellings overlap on purpose.  `contest` / `tutorial` / `roaming` are
+-- how *this engine* marks those fights, and 6 / 3 / 5 are the cart's byte for
+-- the same three -- so a script (or a later engine version) that arms the byte
+-- instead of the field is refused by the other half of the pair.
+--
+-- Audited and deliberately **not** listed: CANLOSE (1, the Cherrygrove rival),
+-- because the "do not white out" exception lives inside the engine's own
+-- post-battle closure and this mod hands the result to exactly that closure;
+-- FORCEITEM (10) and FISH ("fish"), because the held item and the fishing flag
+-- are both stamped on the wild monster before the battle exists, so what the
+-- referee is handed is already correct (the one loss is the LURE BALL's
+-- fishing multiplier, which the referee's catch maths does not read); TREE (8)
+-- and DEBUG (2), which this engine never arms.
+M.SOLO_REFUSED = {
+  "safari", "ghost", "noCatch", "demo",      -- Gen 1
+  "contest", "tutorial", "roaming",          -- Gen 2
+}
+M.SOLO_REFUSED_BATTLE_TYPES = {
+  [3] = true,   -- BATTLETYPE_TUTORIAL   (the DUDE's demonstration)
+  [5] = true,   -- BATTLETYPE_ROAMING    (the three beasts)
+  [6] = true,   -- BATTLETYPE_CONTEST    (the Bug-Catching Contest)
+  [7] = true,   -- BATTLETYPE_FORCESHINY (the Red Gyarados)
+  [9] = true,   -- BATTLETYPE_TRAP       (no escape, Rocket base)
+}
+
+-- How many frames in a row the local referee may fail before the fight is
+-- handed back.
+--
+-- `SoloBattle:_pump` contains a throw out of `tick` or `drainEvents` rather
+-- than letting it reach the mod's own pcall in src/Client.lua, because one bad
+-- event should not take a whole battle down.  The failure that is *not*
+-- survivable is the deterministic one: the same throw, every frame, forever.
+-- The turn never resolves, no outcome is ever produced, SOLO_CHOICE_TIMEOUT is
+-- zero so no deadline saves it -- and in a trainer fight RUN is refused, so the
+-- player is standing in front of a battle screen with no way out of it at all.
+--
+-- Small on purpose.  A referee that has thrown three times running is not
+-- having a bad frame, and the honest answer at that point is to put the
+-- engine's own battle back on screen (SoloBattle:reset does exactly that) and
+-- let the player fight it the ordinary way.  A count of one would give up on a
+-- single unlucky frame that the next tick would have walked straight past.
+M.SOLO_FAULT_LIMIT = 3
+
 -- Chat.  "party" is delivered to the other member wherever they are, so it
 -- is the one scope with neither a radius nor a name to type.
 M.CHAT_SCOPES = { "global", "local", "private", "party" }

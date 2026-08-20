@@ -297,21 +297,52 @@ end
 -- `blackout` is decided by the caller and handed in, because deciding it here
 -- would mean asking whether the party is wiped *after* something may already
 -- have healed it. Answers whether the engine took the ritual on.
+--
+-- The ritual itself is M.finishBuriedBattle, immediately below, which takes
+-- the buried battle and the game as arguments instead of reading them off an
+-- encounter. What is left here is the part that is genuinely co-op's: the
+-- encounter slot is cleared *first* and unconditionally -- a consume that
+-- found nothing still spends the encounter -- and "there is nothing held" is
+-- answered `false` before the ritual is ever reached. Both return values pass
+-- straight through, so a caller reading `handled, engineRitual` sees exactly
+-- what it always saw.
 function M:consume(result, blackout)
   local encounter = self.encounter
   self.encounter = nil
   if not encounter then return false end
-  local engine = encounter.engine
-  -- Gen 1 BattleState uses onFinish; Gen 2's ui/gen2/BattleState uses onDone
-  -- (Client stamps onFinish from onDone when present, but accept either).
-  local finish = engine and (engine.onFinish or engine.onDone)
-  if not finish then return false end
+  return M.finishBuriedBattle(encounter.engine, encounter.game, result, blackout)
+end
 
-  -- Prize money, which the engine pays from inside its own battle screen and
-  -- so never gets to pay for one it did not run. Its formula, at the level of
-  -- the strongest monster the trainer had -- a 2-on-2 has two last opponents,
-  -- and paying for the better of them is the reading that cannot be gamed by
-  -- ordering the party.
+-- ------- the ritual, without a co-op encounter wrapped around it
+--
+-- Lifted out of M:consume so a second caller can run it. src/SoloBattle.lua
+-- substitutes this mod's battle system for ordinary wild and trainer fights
+-- with no hub, no partner and no network at all -- and it still ends up in
+-- exactly the position co-op is in when a fight ends: a frozen engine
+-- BattleState sitting on the stack underneath, owed a result it could not
+-- compute for itself. What follows is the thing it is owed.
+--
+-- It is extracted rather than copied because every line of it is a bug that
+-- was already paid for once -- the prize the engine cannot pay for a battle it
+-- did not run, the ordering against the blackout, the Gen 1 / Gen 2 field
+-- aliasing, the pcall that hands the ritual back to the caller when the engine
+-- throws. A second copy would drift from this one and re-earn all four.
+--
+-- Statics, not methods: they read nothing off `self`, take everything they use
+-- as arguments, and are therefore callable from a sibling module loaded
+-- through the same need() resolver as `Coop.finishBuriedBattle(...)`.
+
+-- Prize money, which the engine pays from inside its own battle screen and
+-- so never gets to pay for one it did not run. Its formula, at the level of
+-- the strongest monster the trainer had -- a 2-on-2 has two last opponents,
+-- and paying for the better of them is the reading that cannot be gamed by
+-- ordering the party.
+--
+-- A wild encounter and a lost fight both land here and both pay nothing: the
+-- `result == "win" and trainer` gate is what makes this safe to call
+-- unconditionally, which is why the caller below does not repeat it.
+function M.payTrainerPrize(engine, game, result)
+  if not engine then return 0 end
   local trainer = engine.trainer
     or (engine.battle and engine.battle.trainer)
   local enemyParty = engine.enemyParty
@@ -322,11 +353,48 @@ function M:consume(result, blackout)
       best = math.max(best, tonumber(mon.level) or 0)
     end
     local prize = (tonumber(trainer.baseMoney) or 0) * best
-    local save = encounter.game and encounter.game.save
+    local save = game and game.save
     if prize > 0 and save then
       Gen.money.set(save, math.min(999999, Gen.money.get(save) + prize))
+      return prize
     end
   end
+  return 0
+end
+
+-- Which of a buried battle's two callbacks is the one that will actually run.
+--
+-- Gen 1 BattleState uses onFinish; Gen 2's ui/gen2/BattleState uses onDone
+-- (Client stamps onFinish from onDone when present, but accept either), so a
+-- Gold battle usually carries both fields pointing at the same function.
+--
+-- Exported, and the selection lives here alone, because a caller that needs to
+-- reason about *what that function does* has to be reasoning about the same
+-- function this ritual calls. src/SoloBattle.lua asks exactly that -- "does the
+-- ritual take the battle off the stack for itself?" -- and it used to ask it of
+-- `engine.onDone` while the ritual called a different `engine.onFinish`. On a
+-- Gold battle pushed by something other than World:startBattle those two are
+-- not the same function and do not agree about the pop, and the player was left
+-- standing on a battle that had already been told it was over.
+function M.buriedFinisher(engine)
+  local finish = engine and (engine.onFinish or engine.onDone)
+  if type(finish) ~= "function" then return nil end
+  return finish
+end
+
+-- Tell the buried engine battle how the fight it never ran went.
+--
+-- `engine` is the frozen BattleState underneath, `game` is what holds the
+-- save, `result` is "win"/"loss"/"draw" and `blackout` is the caller's already-
+-- taken decision (see M.blacksOut) about whether this player's own team is
+-- wiped. Returns the same pair M:consume has always returned: whether there
+-- was anything to finish at all, and -- when there was -- whether the engine
+-- ran the blackout ritual itself so the caller must not run a second one.
+function M.finishBuriedBattle(engine, game, result, blackout)
+  local finish = M.buriedFinisher(engine)
+  if not finish then return false end
+
+  M.payTrainerPrize(engine, game, result)
 
   -- Paid *before* the blackout, and halved by it, which is the order vanilla
   -- uses too: BattleState pays PAY DAY and the prize inside the battle, and
@@ -367,6 +435,13 @@ end
 -- A save with no party at all is not that player. It is a headless load, a
 -- title screen, a harness -- a state with no team to have lost, and rewriting
 -- somebody's money and position over it would be the mod inventing a defeat.
+--
+-- Already a static taking only what it inspects, so it needs no extraction to
+-- serve a second caller: a solo fight asks the same question of the same save,
+-- and "the party has nothing standing" does not become a different rule
+-- because there was nobody else in the battle. Nothing here counts partners or
+-- looks at a co-op field, so a lone player's wiped team answers `true` exactly
+-- as one half of a 2-on-2's does.
 function M.blacksOut(result, game)
   if result == "loss" then return true end
   local party = game and game.save and game.save.party
@@ -480,11 +555,42 @@ local BLACKOUT_WARP_WAIT = 60
 -- engine offered. Starting a map transition underneath those freezes it behind
 -- a menu and then fades the world out from under whatever the player was
 -- reading. See M:pumpBlackout.
-function M:blackout(game)
+--
+-- Written as a method but holding nothing of co-op's: `self` is used for one
+-- field, `pendingWarp`, which is the deferred warp's parking space and the
+-- reason this cannot be a plain static -- somebody has to remember the warp
+-- across the frames it waits for. That makes `self` a *holder* rather than a
+-- Coop instance, and a sibling module with its own table can run the ritual as
+-- `Coop.blackout(self, game)` so long as it also pumps it every frame with
+-- `Coop.pumpBlackout(self, dt)`. Nothing below reads a party, a transport or a
+-- roster, so a lone player's blackout is the same blackout.
+--
+-- ------- and the four things it may have to say
+--
+-- The ritual is holder-agnostic but its warnings were not: every one of them
+-- named the 2-on-2, because for a long time a 2-on-2 was the only fight that
+-- could reach here. A lone player who blacks out of a solo wild encounter and
+-- is then told that "a lost 2-on-2 could not black you out" is being told
+-- about a feature they were not using, which is worse than saying nothing --
+-- it sends them looking for a partner that was never there.
+--
+-- So the noun is an argument. `context` is the word the four warnings use for
+-- the fight that was lost, it defaults to "2-on-2", and every existing caller
+-- passes nothing -- which is why co-op's four lines are still, to the byte,
+-- the four lines it has always printed. `src/SoloBattle.lua` passes "battle".
+--
+-- Parked on `pendingWarp` rather than taken again by the pump, because the
+-- deferred half runs frames later and the holder is the only thing that
+-- crosses that gap: a pump that had to be told the noun every frame would be
+-- one more thing a second caller could get wrong, and its default would be
+-- co-op's word on a solo player's screen again.
+function M:blackout(game, context)
   local save = game and game.save
+  local noun = (type(context) == "string" and context ~= "") and context
+    or "2-on-2"
   if not save then
-    mod.log:warn("a lost 2-on-2 could not black you out (no save); walk to a "
-      .. "POKéMON CENTER to heal")
+    mod.log:warn("a lost %s could not black you out (no save); walk to a "
+      .. "POKéMON CENTER to heal", noun)
     return false
   end
 
@@ -506,12 +612,16 @@ function M:blackout(game)
   if not (api and target and target.map) then
     -- Healed and taxed but not moved. Said out loud rather than silently
     -- half-done: the player is standing somewhere they did not expect to be.
-    mod.log:warn("a lost 2-on-2 healed your party but could not send you to a "
-      .. "POKéMON CENTER; walk out and back in, or reload your last save")
+    mod.log:warn("a lost %s healed your party but could not send you to a "
+      .. "POKéMON CENTER; walk out and back in, or reload your last save", noun)
     return false
   end
-  self.pendingWarp = { game = game, target = target, clock = 0 }
-  return self:pumpBlackout(0)
+  self.pendingWarp = { game = game, target = target, clock = 0, context = noun }
+  -- Called through M rather than off `self` so a holder that is not a Coop
+  -- instance -- see the note above -- still reaches the pump. For a real Coop
+  -- instance this resolves to the identical function `self:pumpBlackout(0)`
+  -- found through __index, so the first-frame attempt is unchanged.
+  return M.pumpBlackout(self, 0)
 end
 
 -- The waiting half of the ritual: warp as soon as the world is what the player
@@ -530,6 +640,11 @@ function M:pumpBlackout(dt)
   local pending = self.pendingWarp
   if not pending then return false end
 
+  -- The noun M:blackout parked here, for the two warnings below. Defaulted a
+  -- second time rather than trusted, because a holder can be handed a warp
+  -- table by a suite that never went through blackout at all.
+  local noun = (type(pending.context) == "string" and pending.context ~= "")
+    and pending.context or "2-on-2"
   pending.clock = (pending.clock or 0) + (dt or 0)
   local stack = pending.game and pending.game.stack
   local top = stack and stack.top and stack:top()
@@ -539,9 +654,9 @@ function M:pumpBlackout(dt)
     -- is already gone, so this is a player standing in the wrong place, not a
     -- player stuck at zero HP.
     self.pendingWarp = nil
-    mod.log:warn("your party was healed after the 2-on-2 but the trip to a "
+    mod.log:warn("your party was healed after the %s but the trip to a "
       .. "POKéMON CENTER never got a chance to start; walk there, or reload "
-      .. "from your last save")
+      .. "from your last save", noun)
     return false
   end
 
@@ -564,9 +679,9 @@ function M:pumpBlackout(dt)
   local ok, done, why = pcall(api.warpTo, api, target.map, target.x, target.y,
                               "down")
   if not (ok and done) then
-    mod.log:warn("a lost 2-on-2 healed your party but the warp to a POKéMON "
+    mod.log:warn("a lost %s healed your party but the warp to a POKéMON "
       .. "CENTER failed (%s); reload from your last save if you are stuck",
-      tostring(ok and why or done))
+      noun, tostring(ok and why or done))
     return false
   end
   return true
@@ -889,7 +1004,13 @@ end
 -- all against a stack that only offers a top, and a caller that treats it as
 -- "yes" is exactly as safe as it was before this existed. Both readings are
 -- used below.
-function M:onStack(game, target)
+--
+-- The answer is a property of the stack and the target and of nothing else, so
+-- the work is a static and the method is a one-line forward to it. Both forms
+-- are kept deliberately: every caller in this file and in the suites reaches it
+-- as `coop:onStack(...)`, and a sibling module holding a game but no Coop
+-- instance reaches the same answer as `Coop.stackHolds(game, target)`.
+function M.stackHolds(game, target)
   local stack = game and game.stack
   local states = stack and stack.states
   if not (target and type(states) == "table") then return nil end
@@ -899,13 +1020,21 @@ function M:onStack(game, target)
   return false
 end
 
+function M:onStack(game, target) return M.stackHolds(game, target) end
+
 -- Take everything above `target` off the stack, and optionally `target` too.
 --
 -- The prompt is one or two widget states deep depending on how far the player
 -- got, so this unwinds by identity rather than by counting -- a fixed number of
 -- pops is a guess, and a wrong guess here either leaves a menu on screen or
 -- eats the world underneath it.
-function M:unwindTo(game, target, alsoPop)
+--
+-- Static plus method wrapper for the same reason M.stackHolds is: unwinding
+-- reads nothing off a Coop instance, and the caller that most needs it next is
+-- a solo battle burying an engine BattleState under exactly the same pile of
+-- text boxes and transitions. `Coop.unwindStackTo(game, target, alsoPop)` from
+-- a sibling; `self:unwindTo(...)` everywhere it already is.
+function M.unwindStackTo(game, target, alsoPop)
   local stack = game and game.stack
   if not (stack and target) then return false end
   -- Never go looking for something that is not there.
@@ -919,14 +1048,33 @@ function M:unwindTo(game, target, alsoPop)
   -- that finishes itself pops itself, and every reference anybody kept to it
   -- is stale from that instant. So this is checked rather than assumed, and
   -- the answer to a stale target is to do nothing at all.
-  if self:onStack(game, target) == false then return false end
+  if M.stackHolds(game, target) == false then return false end
   local guard = 0
   while stack:top() and stack:top() ~= target and guard < 16 do
     stack:pop()
     guard = guard + 1
   end
-  if alsoPop and stack:top() == target then stack:pop() end
+  -- **The guard tripping is not the same thing as arriving**, and until this
+  -- said so it was reported as one: sixteen pops that never reached the target
+  -- returned `true` exactly as a clean unwind did, and `alsoPop` -- the whole
+  -- point of the call on the losing path -- silently never happened.
+  --
+  -- Harmless while every caller ignored the answer. Not harmless for
+  -- src/SoloBattle.lua, which unwinds to a buried BattleState and then tells it
+  -- it was won: a target still on the stack under a pile too deep to clear
+  -- would be marked beaten *and* left where it is, so it resumes the moment the
+  -- pile comes off and the player fights the same trainer a second time. False
+  -- is what lets that caller decline to finish a battle it could not reach.
+  --
+  -- Only the guard case is new. A target that had already left the stack has
+  -- answered `false` from the line above since that check was written.
+  if stack:top() ~= target then return false end
+  if alsoPop then stack:pop() end
   return true
+end
+
+function M:unwindTo(game, target, alsoPop)
+  return M.unwindStackTo(game, target, alsoPop)
 end
 
 -- Whether the partner is currently standing on `mapId`.
