@@ -16,6 +16,7 @@ local Transport = need("Transport")
 local Roster = need("Roster")
 local Servers = need("Servers")
 local Avatars = need("Avatars")
+local Followers = need("Followers")
 local Chat = need("Chat")
 local Toast = need("Toast")
 local Party = need("Party")
@@ -59,6 +60,7 @@ local ctx = {
   roster = Roster.new(),
   chat = Chat.new(),
   avatars = Avatars.new(),
+  followers = Followers.new(),
 }
 
 local transport = Transport.new()
@@ -1539,6 +1541,7 @@ function M.disconnect()
   friends:reset()
   coop:reset()
   ctx.avatars:clear()
+  ctx.followers:clear()
   ctx.roster:reset()
   ctx.chat:clear()
   -- With the scrollback, and for the same reason: every toast this session
@@ -1745,7 +1748,16 @@ end
 
 -- ------- presence
 
-local function presenceChanged(current, busy, fast)
+-- The POKéMON the local player is showing, or nil.  Read through
+-- Followers so the option gates emission as well as display: a player who
+-- turned other people's monsters off is not asking anyone to draw theirs.
+local function localFollower()
+  if not (ctx.followers and ctx.followers:enabled()) then return nil, false end
+  local mon, shiny = ctx.followers:localMon()
+  return Wire.species(mon), shiny == true
+end
+
+local function presenceChanged(current, busy, fast, mon, shiny)
   local mapId = current and current.mapId
   local x = current and current.x
   local y = current and current.y
@@ -1762,6 +1774,11 @@ local function presenceChanged(current, busy, fast)
     -- anyway so that a future writer of fastNow cannot silently strand a
     -- pace change until the next move.
     or lastSent.fast ~= fast
+    -- Compared because a swap is the one presence change with no movement in
+    -- it.  Putting a different POKéMON out, or none, while standing still
+    -- would otherwise not reach anybody until the next step -- and standing
+    -- still is exactly when a player swaps.
+    or lastSent.mon ~= mon or lastSent.shiny ~= shiny
 end
 
 local function pushPresence(force)
@@ -1769,7 +1786,10 @@ local function pushPresence(force)
   local current = World.current()
   local busy = sessions:isBusy()
   local fast = M.fastNow and true or false
-  if not force and not presenceChanged(current, busy, fast) then return end
+  local mon, shiny = localFollower()
+  if not force and not presenceChanged(current, busy, fast, mon, shiny) then
+    return
+  end
 
   lastSent = {
     map = current and current.mapId,
@@ -1778,6 +1798,8 @@ local function pushPresence(force)
     facing = current and current.facing,
     busy = busy,
     fast = fast,
+    mon = mon,
+    shiny = shiny,
   }
   transport:send(Wire.MOVE, {
     map = lastSent.map,
@@ -1786,6 +1808,10 @@ local function pushPresence(force)
     facing = lastSent.facing,
     busy = busy,
     fast = fast,
+    -- Absent rather than false when there is nothing out, so a hub that has
+    -- never heard of followers relays a message it already understands.
+    mon = mon,
+    shiny = mon and shiny or nil,
   })
 end
 
@@ -2034,6 +2060,10 @@ handlers[Wire.MOVE] = function(_, msg)
   -- hubs are -- only a literal true is a fast step, so a client sending 0 or
   -- "" is read the same here as it is everywhere else on the wire.
   local fast = msg.fast == true
+  -- Shape-checked, never registry-checked: this mirrors Wire.presence, which
+  -- runs on the hub too and has no registry to consult.  An id nobody has art
+  -- for resolves to no sheet in Followers and the avatar walks alone.
+  ctx.roster:setFollower(id, Wire.species(msg.mon), msg.shiny == true)
   if map and x and y then
     ctx.roster:move(id, map, x, y, facing, fast)
   else
@@ -2408,6 +2438,11 @@ local function tick(game, dt)
   end
 
   ctx.avatars:sync(ctx.roster, World.current())
+  -- After the avatars, always: a follower trails an avatar, so the cell it
+  -- walks into is one the avatar has already been told about this tick.
+  local here = World.current()
+  ctx.followers:sync(here and ctx.roster:onMap(here.mapId) or nil,
+                     here and here.mapId or nil)
 end
 
 -- ------- install
@@ -2478,6 +2513,19 @@ function M.install()
     { key = "sprite", label = "MY SPRITE", type = "choice",
       default = Gen.defaultSprite(ctx.game, mod.content and mod.content.sprites),
       choices = spriteChoices },
+    -- Other players' POKéMON, walking behind them.
+    --
+    -- On by default because the feature is invisible without Wilds of Kanto
+    -- installed anyway -- a player who has never heard of it sees exactly
+    -- what they see today, and one who has it gets the thing they installed
+    -- it for without going looking for a switch.
+    --
+    -- One row for both directions. Turning it off stops drawing other
+    -- people's monsters *and* stops announcing your own, because a player
+    -- who does not want them on screen is not asking anyone else to spend a
+    -- runtime NPC on theirs either.
+    { key = Config.FOLLOWERS_OPTION, label = "PARTNER POKEMON",
+      type = "toggle", default = true },
     -- Holding B to run.  On by default because it is the reason the feature
     -- exists, and a row at all because B already means "cancel" everywhere
     -- else -- a player who finds their walk unexpectedly fast should have

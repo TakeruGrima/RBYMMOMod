@@ -109,6 +109,22 @@ function M:setSprite(id, sprite)
   return player
 end
 
+-- The POKéMON walking behind them, and whether it is the shiny sheet.
+--
+-- A field write for the same reason setSprite is one, and a pair because
+-- they are one fact: a species without its variant names a different sheet
+-- than the sender is showing. `mon` nil is a player with nothing out, which
+-- is most of them, and src/Followers.lua reads that as "remove the follower"
+-- rather than "leave the last one standing".
+function M:setFollower(id, mon, shiny)
+  local player = self.players[id]
+  if player then
+    player.mon = mon
+    player.shiny = shiny and true or false
+  end
+  return player
+end
+
 function M:remove(id)
   if not self.players[id] then return nil end
   local gone = self.players[id]

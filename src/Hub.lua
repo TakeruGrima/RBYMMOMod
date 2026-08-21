@@ -474,6 +474,12 @@ local function presenceOf(client)
     -- bike, so the client is the only authority and this is what it last
     -- reported.
     fast = client.fast == true,
+    -- The POKéMON walking behind them, and whether it is the shiny sheet.
+    -- nil is the ordinary case -- it needs Wilds of Kanto on the sender's
+    -- machine and a monster out -- and is what the far end reads as "no
+    -- follower" rather than "leave the last one standing".
+    mon = client.mon,
+    shiny = client.shiny == true,
     profile = client.profile,
     -- Carried with presence rather than with the card: a rating moves while
     -- the player is standing there, and the card is a snapshot of their
@@ -538,6 +544,8 @@ function M:accept(peer, trusted)
     sprite = Config.defaultSpriteFor(self.generation),
     map = nil, x = nil, y = nil, facing = "down",
     fast = false,     -- nobody arrives mid-stride; the first move says otherwise
+    mon = nil,        -- nor with a monster out
+    shiny = false,
     sessionId = nil,
     pendingTo = nil,
     partyId = nil,
@@ -2170,6 +2178,11 @@ handlers[Wire.MOVE] = function(self, client, msg)
   -- false to JS's Boolean().  Comparing against true is the one test both
   -- languages answer identically for every JSON value.
   client.fast = msg.fast == true
+  -- Shape, not registry: this hub has none to consult, and
+  -- server/lib/sanitize.js's cleanSpeciesId applies the identical rule on
+  -- the Node side.  Strict `shiny` for exactly the reason `fast` is strict.
+  client.mon = Wire.species(msg.mon)
+  client.shiny = msg.shiny == true
   self:broadcast(Wire.MOVE, presenceOf(client), client.id)
 end
 

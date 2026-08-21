@@ -394,6 +394,28 @@ function M.spriteId(value)
   return value
 end
 
+-- A species id, for the POKéMON walking behind a remote trainer.
+--
+-- Shape, not registry.  Wire runs on the hub as well as in the client --
+-- src/Hub.lua and server/lib/relay.js both re-derive presence from these
+-- same bytes -- and a hub has no content registry to check a species
+-- against.  So this asks the only question both sides can answer: is it
+-- id-shaped, and is it short enough.
+--
+-- The registry question belongs to the client, at the moment it asks Wilds
+-- of Kanto for a sheet.  An id nobody has art for resolves to no sheet and
+-- simply draws no follower, which is the same outcome as never having sent
+-- it -- and one the sender's own game already decided by having a follower
+-- out at all.  Borrowing spriteId's exact rule rather than aliasing it,
+-- because these are two different vocabularies that happen to agree today:
+-- a sprite id names a character sheet, a species names a monster.
+function M.species(value)
+  if type(value) ~= "string" then return nil end
+  if not value:match("^[%w_]+$") then return nil end
+  if #value > 40 then return nil end
+  return value
+end
+
 -- an id is opaque to us; it only ever has to round-trip and index a table
 function M.id(value)
   if type(value) ~= "string" then return nil end
@@ -918,6 +940,19 @@ function M.presence(raw, generation)
     -- reaching Lua as 0 or "" would be true here and false in JS.  Comparing
     -- against true is the one test both languages answer identically.
     fast = raw.fast == true,
+    -- The POKéMON walking behind them, and whether it is the shiny sheet.
+    --
+    -- Absent means no follower -- the ordinary case, since it needs Wilds of
+    -- Kanto installed *and* a monster out.  `mon` is dropped rather than
+    -- repaired when malformed: half a species id names nothing, and an
+    -- avatar walking alone is the behaviour that already shipped.
+    --
+    -- `shiny` is strict for the same reason `fast` above it is, and it is a
+    -- boolean rather than nil for the same reason `busy` and `party` are:
+    -- both hubs re-derive this from the same bytes, and a 0 or an "" would
+    -- be true in Lua and false in JS.
+    mon = M.species(raw.mon),
+    shiny = raw.shiny == true,
     profile = M.profile(raw.profile),
     -- Ranked points ride with presence rather than with the trainer card,
     -- because they are not a snapshot of who somebody was when they joined:

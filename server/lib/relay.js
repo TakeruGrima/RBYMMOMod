@@ -36,7 +36,8 @@
  */
 
 const {
-  cleanText, cleanId, cleanSpriteId, cleanMapId, cleanInt, cleanHex,
+  cleanText, cleanId, cleanSpriteId, cleanSpeciesId, cleanMapId,
+  cleanInt, cleanHex,
   cleanProfile, cleanOutcome, cleanPoints, cleanPlayerId, payloadOk, FACINGS,
   KINDS, SCOPES, NAME_MAX, MESSAGE_MAX, MOTD_MAX, LOCAL_RADIUS,
   cleanBattleKey, cleanCoopReason, cleanCoopOfferMode, cleanLabel, cleanPartyEvent, PARTY_MAX,
@@ -281,6 +282,12 @@ function presenceOf(client) {
     // the bike, so the client is the only authority on it and this is the
     // value it last reported.
     fast: Boolean(client.fast),
+    // The POKéMON walking behind them, and whether it is the shiny sheet.
+    // Null is the ordinary case -- it needs Wilds of Kanto installed on the
+    // sender's machine and a monster out -- and is what the far end reads as
+    // "no follower" rather than "leave the last one standing".
+    mon: client.mon,
+    shiny: Boolean(client.shiny),
     // The trainer card the player shows others. Carried here because
     // src/Hub.lua does (Hub.lua:74): a player on a dedicated hub would
     // otherwise silently have no card, and the two hosting paths have to
@@ -436,6 +443,11 @@ handlers['mmo.move'] = (relay, client, msg) => {
   // Lua's `and`. Comparing against true is the one test both languages
   // answer identically for every JSON value.
   client.fast = msg.fast === true;
+  // Shape, not registry: this hub has none to consult, and src/Wire.lua's
+  // M.species applies the identical rule on the Lua side. Strict `shiny` for
+  // exactly the reason `fast` above it is strict.
+  client.mon = cleanSpeciesId(msg.mon);
+  client.shiny = msg.shiny === true;
   relay.broadcast('mmo.move', presenceOf(client), client.id);
   // Crossing into another map -- or out of the world entirely, into a battle
   // or a menu, which is what a null cell means -- is the only part of a step
@@ -1723,6 +1735,9 @@ class Relay {
       // nobody arrives mid-stride: the first mmo.move says otherwise or it
       // stays false
       fast: false,
+      // nobody arrives with a monster out either; the first move says so
+      mon: null,
+      shiny: false,
       sessionId: null,
       pendingTo: null,
       partyId: null,

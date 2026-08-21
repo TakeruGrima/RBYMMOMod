@@ -8,6 +8,35 @@ here must match `manifest.version`.
 
 ### Added
 
+- **A POKéMON walking behind every remote trainer.** Other players in the
+  shared overworld are now followed by the POKéMON they have out, shiny
+  sheet included, walking into the tile they just left and keeping pace when
+  they sprint or cycle. A new `PARTNER POKEMON` row in the mod manager
+  (`F10` → `MMO`), **default ON**, turns it off.
+  - **Needs [Wilds of Kanto](https://github.com/YoDrehDenSwagAuf/overworld-spawn-mod)
+    (`overworld_wild_spawns`), on both machines.** It owns every follower
+    sheet; this mod ships none and asks for one through `mod.exports`. A
+    player without it emits nothing and sees nobody's follower — everything
+    else about the mod is unaffected, and the missing dependency is named
+    once rather than once per tick. It is declared as an
+    **optional** dependency, so its absence never costs you the mod.
+  - **No protocol bump.** Presence grew two optional fields, `mon` and
+    `shiny`. A hub that has never heard of them strips them and the avatar
+    walks alone, which is exactly what shipped before — so unlike PROTOCOL
+    23 below, this degrades invisibly and earns no refusal.
+  - **`engine_internals` is now declared**, which is why the mod manager
+    shows RBY MMO with a `!` and `PATCHES ENGINE CODE`. A follower's species
+    is chosen at runtime and the mod API cannot introduce a sprite after
+    load: content registries freeze after the boot merge, `NPC.new` takes a
+    sprite **id** and asserts on a miss, `Handle` has no sprite setter, and
+    no hook draws into the overworld's depth order. The one path left is an
+    entity-local rebind of the renderer on that single NPC — the same
+    technique Wilds of Kanto uses for your own follower. Nothing global is
+    mutated and no link registry is written, so `affects_link` stays
+    `false`.
+  - **Known gap: surfing.** Presence carries no surf state, so a trainer
+    crossing water has their POKéMON walk on it.
+
 - **One wild POKéMON each.** A party that walks into grass together used to
   meet one wild POKéMON and fight it two-on-one, which left the second
   player watching. From **PROTOCOL 23** an ordinary encounter seats **one

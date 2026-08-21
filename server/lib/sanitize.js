@@ -43,6 +43,18 @@ function cleanSpriteId(value) {
   return /^\w{1,40}$/.test(value) ? value : null;
 }
 
+// A species id, for the POKéMON walking behind a trainer.
+//
+// The same rule as cleanSpriteId and deliberately not an alias of it: a
+// sprite id names a character sheet and a species names a monster, two
+// vocabularies that happen to agree on their shape today. Shape is all a
+// hub can check -- it has no content registry -- so an id nobody has art
+// for is relayed and simply draws no follower at the far end.
+function cleanSpeciesId(value) {
+  if (typeof value !== 'string') return null;
+  return /^\w{1,40}$/.test(value) ? value : null;
+}
+
 function cleanMapId(value) {
   if (typeof value !== 'string') return null;
   return /^[\w.-]{1,64}$/.test(value) ? value : null;
@@ -1401,6 +1413,7 @@ module.exports = {
   cleanCoopReason,
   cleanPartyEvent,
   cleanSpriteId,
+  cleanSpeciesId,
   cleanMapId,
   cleanInt,
   cleanHex,

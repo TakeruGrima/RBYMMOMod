@@ -265,6 +265,50 @@ M.RESYNC_DISTANCE = 6
 -- the original, not merely close.
 M.AVATAR_DEPTH_NUDGE = 0.01
 
+-- A follower has to lose the same tie twice.
+--
+-- The nudge above buys an avatar its loss against the *local* player. The
+-- POKéMON walking behind a remote trainer has to lose against that trainer's
+-- own avatar as well, or it occludes the person it belongs to every time it
+-- stands north of them -- which is the single visible artefact the whole
+-- entity-local rebind in src/Followers.lua exists to avoid.
+--
+-- Twice the lift, for the same reason one was enough before: engine `py` is
+-- always a whole pixel, so any distinct fraction orders these three
+-- deterministically -- player, then avatar, then follower. Still far below
+-- the whole pixel the renderer would show, and confined to the sort by the
+-- same pose/cell compensation.
+M.FOLLOWER_DEPTH_NUDGE = M.AVATAR_DEPTH_NUDGE * 2
+
+-- Wilds of Kanto, which owns every follower sheet this mod draws.
+--
+-- Named here rather than inline so the one string a cross-mod lookup depends
+-- on is not spelled twice. `mod.find` takes the mod **id**, which is not the
+-- name on the box: the mod is presented as "Wilds of Kanto" and installed as
+-- `overworld_wild_spawns`.
+--
+-- The minimum version is for the warning, not for a check: the mod API has
+-- no version predicate a peer can be held to at runtime, so the honest test
+-- is whether the *function* is there (src/Followers.lua:wilds) and this is
+-- only what the remediation line tells the player to go and get.
+M.WILDS_MOD_ID = "overworld_wild_spawns"
+M.WILDS_MIN_VERSION = "2.1.8"
+
+-- The sprite a follower is spawned wearing, before its species is rebound.
+--
+-- Registered by Wilds of Kanto at load. It matters that this is a real id
+-- and not a placeholder: NPC.new asserts on a sprite the catalog does not
+-- carry, and the assert fires inside the engine's own spawn path where this
+-- mod could not catch it. Spawning as WoK's own follower sprite also means
+-- the frame between spawnNpc and the rebind shows a POKéMON rather than a
+-- trainer.
+M.FOLLOWER_SPRITE = "SPRITE_WILDS_FOLLOWER_MON"
+
+-- The option key that turns other players' POKéMON off, on both sides: a
+-- player who does not want to see them is also not asking anyone to draw
+-- theirs, so it gates emission as well as display.
+M.FOLLOWERS_OPTION = "followers"
+
 -- Running: hold B on foot and a tile takes half as long.
 --
 -- A divisor rather than a frame count, because the walk speed it divides is
