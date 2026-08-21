@@ -143,7 +143,24 @@ M.MOD_ID = "rby_mmo"
 -- the picture and the number under it are wrong. Refusal naming both versions
 -- is the only sentence either player can act on.
 -- This number lives here and in server/lib/relay.js -- bump them together.
-M.PROTOCOL = 22
+--
+-- 23 is one wild monster per player on a party encounter: `coop_wild` may seat
+-- up to COOP_SIDE monsters on side b instead of exactly one, the referee emits
+-- a `caught` event when a ball lands (that seat leaves the field; the fight
+-- carries on while another wild stands), and `mmo.battle_outcome` grows a
+-- `catches` list so a fight that paid out twice can say so.
+--
+-- Every one of those degrades badly rather than visibly against a 22-era peer,
+-- which is why this is a refusal and not a feature test. A 22 hub mints one
+-- npc seat and deals the host's second monster **nowhere** -- the encounter
+-- opens as today's 2v1 and the second player's wild is silently gone. A 22
+-- client drops the unknown `caught` kind, so it watches a ball land, hears
+-- "Gotcha!", and then keeps drawing a monster that is no longer on the field
+-- and can never be hit. And a 22 outcome cleaner strips `catches`, so the
+-- monster somebody watched themselves catch never reaches a save.
+-- Refusal naming both versions is the only sentence either player can act on.
+-- This number lives here and in server/lib/relay.js -- bump them together.
+M.PROTOCOL = 23
 
 -- The port an in-game host binds, and the one a bare address is completed
 -- with.
@@ -606,6 +623,22 @@ M.BATTLE_METRONOME_POOL_MAX = 200
 -- next launch.
 M.SOLO_BATTLES_DEFAULT = false
 
+-- Whether the battle chrome is the original's Game Boy box or the arena's own
+-- modern panels.
+--
+-- **ON by default, and unlike SOLO_BATTLES that is not a contradiction.** That
+-- row is off by default because it changes what the GAME DOES: an ordinary
+-- encounter stops being the engine's battle and becomes a refereed one. This
+-- row changes only what the mod's own screen LOOKS like, and it is on because
+-- the modern band draws 10-13px type on a 640x360 canvas in white-on-slate,
+-- which is small and low-contrast in a way the tile font on white is not.
+-- Shipping the harder-to-read look by default and hiding the readable one
+-- behind a menu would be the wrong way round.
+--
+-- Nothing about the ARENA depends on this: the field, the seats, the throws and
+-- the exp sequencing are the same either way. See Battlefield.OPTION.
+M.CLASSIC_UI_DEFAULT = true
+
 -- Which BattleSim mode each solo fight is seated as.
 --
 -- Two modes rather than one, and the difference is mechanical rather than
@@ -713,6 +746,42 @@ M.SOLO_REFUSED = {
   "safari", "ghost", "noCatch", "demo",      -- Gen 1
   "contest", "tutorial", "roaming",          -- Gen 2
 }
+-- One wild monster per player on a party encounter, unless the player says
+-- otherwise.  On by default where SOLO BATTLES is off, and the difference is
+-- the point: that row changes something the *game* already did, this one
+-- changes something this mod added.  A party encounter is already a co-op fight
+-- vanilla has no opinion about, and one monster between two players was never
+-- the interesting answer to it.  Read at the encounter (src/WildRoll.lua), so
+-- flipping it takes on the next step in the grass.
+M.WILD_EACH_DEFAULT = true
+
+-- Species that are never a grass roll, wherever they turn up.
+--
+-- **The net under the rule, not the rule.** What actually decides a scripted
+-- encounter is that the species is in no encounter list this map keeps
+-- (src/WildRoll.lua) -- which needs no names, survives a mod adding one, and is
+-- right about the cases nobody thought of.  This list is what answers when that
+-- lookup cannot run at all: a build whose encounter tables this mod fails to
+-- read would otherwise put a second Mewtwo in front of the other player, and
+-- that is the one mistake here a player could not undo.
+--
+-- Names only, no data: these are registry ids, the same strings the wire
+-- already carries, and nothing about a monster is described here.
+--
+-- Gyarados is deliberately absent. The Lake of Rage one is a *forced-shiny*
+-- battle type and is caught by SOLO_REFUSED_BATTLE_TYPES below; the species
+-- itself is an ordinary surf encounter in a dozen places, and denying it would
+-- cost those.  Lapras is absent for the same shape of reason: static in Union
+-- Cave, ordinary in the water elsewhere, and the map lookup tells them apart.
+M.WILD_STATIC_SPECIES = {
+  -- Gen 1
+  ARTICUNO = true, ZAPDOS = true, MOLTRES = true, MEWTWO = true, MEW = true,
+  SNORLAX = true,
+  -- Gen 2
+  RAIKOU = true, ENTEI = true, SUICUNE = true, LUGIA = true, CELEBI = true,
+  SUDOWOODO = true, HOOH = true,
+}
+
 M.SOLO_REFUSED_BATTLE_TYPES = {
   [3] = true,   -- BATTLETYPE_TUTORIAL   (the DUDE's demonstration)
   [5] = true,   -- BATTLETYPE_ROAMING    (the three beasts)

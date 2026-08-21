@@ -65,6 +65,8 @@ local Gen = need("Gen")
 local CoopSim = need("CoopSim")
 local CoopField = need("CoopField")
 local Battlefield = need("Battlefield")
+-- One model for both skins: level, gender and species icon on every party row.
+local BattleRows = need("BattleRows")
 -- The Gen 2 half of the award. See `src/Exp2.lua`'s header: Gold has no
 -- `src/battle/Experience.lua` twin, so a mediated Gen 2 faint is priced through
 -- the engine's own `src/battle/gen2/Mon` primitives instead.
@@ -517,6 +519,11 @@ end
 --                 (coop_wild; host and preferably partner both stash one)
 --   wildParty     optional prebuilt battleMon sheets for the host's side-"b"
 --                 upload; else snapshotMons of wildCatchMon
+--   wildExtras    the rest of the wildlife on an ordinary party encounter:
+--                 engine mons rolled by the stepper, one per other player,
+--                 uploaded behind wildCatchMon so the hub's deal puts the
+--                 host's own encounter on the first wild seat. Empty or absent
+--                 on a scripted encounter, which is how that stays a 2v1
 function M.new(game, opts)
   local eng = loadEngine(game)
   if not eng then return nil, "2-on-2 battles need the engine's battle modules." end
@@ -600,6 +607,7 @@ function M.new(game, opts)
     -- the host's side-b upload (else snapshot of wildCatchMon at upload time).
     wildCatchMon = opts.wildCatchMon,
     wildParty = opts.wildParty,
+    wildExtras = opts.wildExtras,
     mediated = false,
     medUploaded = false,
     medFailed = false, -- upload refused; do not fall back to host-sim
@@ -3246,6 +3254,30 @@ function M:playEvents(events)
         self.messages[#self.messages + 1] =
           { faintfx = shownAt, slot = event.slot }
       end
+    elseif event.kind == "caught" then
+      -- ------- "this one is somebody's now", as a *drawing* fact
+      --
+      -- `gone`, not a faint and not an HP of zero. It is the word this sim
+      -- already has for a seat that is out of the fight without being beaten
+      -- (`CoopSim:isDown` -- a trainer whose player left), and it is exactly
+      -- the truth here: never waited on for an action, never counted as
+      -- standing, and nothing said about the monster itself -- which on the
+      -- host is the engine's own, on its way into somebody's party.
+      --
+      -- No sink is queued. The ball chain that ran a moment ago ends in
+      -- HIDEPIC_ANIM, so the monster is already off the screen; a slide played
+      -- over an empty patch of grass would be a second disappearance for one
+      -- departure.
+      --
+      -- The EXP.ALL credit is armed exactly as a knockout arms it, and for the
+      -- same reason: a catch pays experience the way vanilla pays it, so the
+      -- `exp` rows that follow have a foe departure behind them.
+      local taken = self.sim:slot(event.slot)
+      if taken then
+        taken.gone = true
+        taken.awaiting = nil
+      end
+      if self:foeSide(event.slot) then self.expAllCredit = true end
     elseif event.kind == "choose" then
       -- Only its owner is asked; the other three watch an empty slot until it
       -- is filled.
@@ -6341,16 +6373,22 @@ end
 
 -- The bench, as `benchOf` filters it -- alive, and not the one already out.
 -- Same list `updateSwitch` / `updateReplace` index into.
+-- The bench, as rows.
+--
+-- This used to say the monster's name and its HP. It never said the LEVEL,
+-- which is the number that actually decides who you send out -- so the player
+-- picked blind. BattleRows answers that, and the gender and the icon with it,
+-- for whichever skin ends up painting.
+--
+-- The bench entry's own `index` is carried through rather than recomputed:
+-- these rows are positional and the handlers index the bench by it.
 function M:bandBenchRows(bench)
-  local pokemon = (self.game and self.game.data and self.game.data.pokemon) or {}
+  local data = self.game and self.game.data
   local rows = {}
   for _, entry in ipairs(bench or {}) do
-    local mon = entry.mon or {}
-    local def = pokemon[mon.species]
-    rows[#rows + 1] = {
-      label = tostring(mon.nickname or (def and def.name) or mon.species or "?"),
-      right = hpRight(mon),
-    }
+    local row = BattleRows.rowFor(entry.mon, entry.index, { data = data })
+    row.label = row.name
+    rows[#rows + 1] = row
   end
   return rows
 end
@@ -6398,7 +6436,7 @@ function M:drawBandWidgets()
       message("No one left!")
     else
       list(self:bandBenchRows(bench), self.switchIndex or 1,
-        { title = "WHO'S NEXT?" })
+        { title = "WHO'S NEXT?", game = self.game })
     end
     return true
   end
@@ -6406,7 +6444,8 @@ function M:drawBandWidgets()
     local ask = self.runAsk
     local name = ask.name
     if ask.role == "confirming" then
-      list(RUN_ANSWERS, ask.index or RUN_DEFAULT, { title = "RUN AWAY?" })
+      list(RUN_ANSWERS, ask.index or RUN_DEFAULT,
+        { title = "RUN AWAY?", game = self.game })
     elseif ask.role == "deciding" then
       list(RUN_ANSWERS, ask.index or RUN_DEFAULT,
         { title = ((name or "They") .. ": RUN?") })
@@ -6427,7 +6466,8 @@ function M:drawBandWidgets()
     -- Every move empty: Gen 1 substitutes Struggle whatever was picked, so the
     -- band says so rather than listing four moves that cannot be used.
     if not self:hasLivePP() then
-      list({ { label = "STRUGGLE" } }, 1, { title = "NO MOVES LEFT!" })
+      list({ { label = "STRUGGLE" } }, 1,
+        { title = "NO MOVES LEFT!", game = self.game })
     else
       list(self:bandMoveRows(), self.moveIndex or 1,
         { title = self:bandMoveTitle() })
@@ -6446,7 +6486,7 @@ function M:drawBandWidgets()
         dim = (mon and (mon.hp or 0) <= 0) or nil,
       }
     end
-    list(rows, self.targetIndex or 1, { title = "ATTACK WHO?" })
+    list(rows, self.targetIndex or 1, { title = "ATTACK WHO?", game = self.game })
     return true
   end
   if self.phase == "switch" then
@@ -6455,7 +6495,8 @@ function M:drawBandWidgets()
     if #bench == 0 then
       message("There's no one else to send out!")
     else
-      list(self:bandBenchRows(bench), self.switchIndex or 1, { title = "POKeMON" })
+      list(self:bandBenchRows(bench), self.switchIndex or 1,
+        { title = "POKeMON", game = self.game })
     end
     return true
   end
@@ -6472,7 +6513,7 @@ function M:drawBandWidgets()
         right = entry.count and ("x%d"):format(entry.count) or nil,
       }
     end
-    list(rows, self.itemIndex or 1, { title = "ITEMS" })
+    list(rows, self.itemIndex or 1, { title = "ITEMS", game = self.game })
     return true
   end
   if self.phase == "item_party" then
@@ -6488,7 +6529,7 @@ function M:drawBandWidgets()
         dim = row.fainted or nil,
       }
     end
-    list(rows, self.switchIndex or 1, { title = "POKeMON" })
+    list(rows, self.switchIndex or 1, { title = "POKeMON", game = self.game })
     return true
   end
   if self.phase == "item_move" then
@@ -6504,7 +6545,7 @@ function M:drawBandWidgets()
         right = tonumber(move.pp) and tostring(math.floor(move.pp)) or nil,
       }
     end
-    list(rows, self.moveIndex or 1, { title = "MOVES" })
+    list(rows, self.moveIndex or 1, { title = "MOVES", game = self.game })
     return true
   end
   message(self:boxText())
@@ -8274,15 +8315,26 @@ function M:npcMons()
   return Mediated.snapshotMons(self.game, flat)
 end
 
--- Sheets for the wild seat (coop_wild side b): prebuilt `wildParty`, else a
--- snapshot of the stashed `wildCatchMon`. Never npcMons interleave — that
--- assumes two ownerless trainer slots.
+-- Sheets for the wild seats (coop_wild side b): prebuilt `wildParty`, else a
+-- snapshot of the stashed `wildCatchMon` and whatever `wildExtras` the stepper
+-- rolled behind it. Never npcMons interleave — that assumes two ownerless
+-- trainer slots, and these are not a trainer's team.
+--
+-- **Order is the contract.** The hub deals this list across the wild seats in
+-- order, so the monster the engine actually rolled -- the one the host has been
+-- watching appear on their own screen this whole time -- lands on the first
+-- seat, and the rolled ones follow. One monster in the list is the scripted
+-- encounter, and the hub gives the spare seat back.
 function M:wildMons()
   if type(self.wildParty) == "table" and #self.wildParty > 0 then
     return self.wildParty
   end
   if self.wildCatchMon then
-    return Mediated.snapshotMons(self.game, { self.wildCatchMon })
+    local mons = { self.wildCatchMon }
+    for _, extra in ipairs(self.wildExtras or {}) do
+      mons[#mons + 1] = extra
+    end
+    return Mediated.snapshotMons(self.game, mons)
   end
   return nil
 end
@@ -8558,6 +8610,23 @@ function M:medRows(msg)
         self.medMustReplace = hasBench or nil
       end
     end
+
+  elseif kind == "caught" then
+    -- A ball closed on that seat. It is off the field, and **it did not
+    -- faint** -- which is the whole reason the referee spends a kind on this
+    -- rather than reusing `faint`.
+    --
+    -- No sentence is made here. "Gotcha" arrived as the referee's own `msg` a
+    -- moment ago, exactly as it does in a solo wild fight, and a second line
+    -- invented on this screen would be one the other three do not print.
+    --
+    -- No HP is written either, and that is the sharp end of it: on the host,
+    -- the monster behind this seat is the *engine's* monster -- the one about
+    -- to be added to somebody's party -- and zeroing its bar the way a faint
+    -- does would hand the catcher a fainted POKeMON. `slot.gone` says the same
+    -- thing about the field without saying anything about the monster, which
+    -- is what it already meant for a trainer whose player left.
+    if index then rows[#rows + 1] = { kind = "caught", slot = index } end
 
   elseif kind == "exp" then
     -- The spoils of the faint above, as a *row* rather than an award made
@@ -9035,15 +9104,36 @@ function M:onBattleOutcome(msg)
     self.medPending[#self.medPending + 1] = { kind = "msg", text = why }
   end
   self:medFlush()
-  -- Catcher-only grant: everyone sees Gotcha; only msg.catcher adds the mon.
-  if msg.reason == "catch" then
-    local catcher = msg.catcher
-    if catcher ~= nil and (catcher == self.selfId
-        or tostring(catcher) == tostring(self.selfId)) then
-      self:grantCatch(msg)
+  -- Catcher-only grants: everyone saw every Gotcha, and each entry adds a
+  -- monster to exactly one save -- the one belonging to the player who threw
+  -- that ball.
+  --
+  -- **The list, when there is one, and never both.** From PROTOCOL 23 an
+  -- outcome that paid out carries `catches`, and mirrors its last entry into
+  -- the `caught` / `catcher` pair the wire has had since 18 so a `wild` fight
+  -- reads unchanged. Walking the list *and* the pair would grant that last
+  -- monster twice, which is the one arithmetic mistake this whole feature can
+  -- make against a save.
+  local catches = msg.catches
+  if type(catches) == "table" and #catches > 0 then
+    for _, entry in ipairs(catches) do
+      if self:isSelfId(entry.catcher) then self:grantCatch(entry) end
     end
+  elseif msg.reason == "catch" and self:isSelfId(msg.catcher) then
+    self:grantCatch(msg)
   end
   return true
+end
+
+-- Is this the id this client answers to?
+--
+-- Compared as strings as well, because the two ends of this have disagreed
+-- about the type before: a hub id arrives off the wire and a selfId is held in
+-- memory, and a grant that missed on `1` vs `"1"` would be a monster nobody
+-- receives with nothing on screen to say so.
+function M:isSelfId(id)
+  if id == nil or self.selfId == nil then return false end
+  return id == self.selfId or tostring(id) == tostring(self.selfId)
 end
 
 -- Put the caught wild into this client's party (or PC). Mirrors
@@ -9053,8 +9143,47 @@ end
 -- Host usually has wildCatchMon from the engine encounter. Partner / joiner
 -- often does not; rebuild from msg.caught (Effects.caughtSheet) so a catcher
 -- who never held the wild can still Party.add / Boxes.deposit.
+-- Do this sheet and this engine monster name the same creature?
+--
+-- Loosely, because they are spelled by different layers: the sheet carries the
+-- token the fight was *narrated* under (a display name -- "NIDORAN M") and the
+-- engine monster carries a registry id ("NIDORAN_M"). Case and separators are
+-- the only differences either has ever had, and the level settles the rest.
+function M.sheetNamesMon(sheet, mon)
+  if type(sheet) ~= "table" or type(mon) ~= "table" then return false end
+  local function key(value)
+    if type(value) ~= "string" then return nil end
+    local out = value:upper():gsub("[^A-Z0-9]", "")
+    return out ~= "" and out or nil
+  end
+  local a = key(sheet.speciesId) or key(sheet.species)
+  local b = key(mon.species)
+  if not (a and b and a == b) then return false end
+  local sheetLevel, monLevel = tonumber(sheet.level), tonumber(mon.level)
+  if sheetLevel and monLevel and sheetLevel ~= monLevel then return false end
+  return true
+end
+
 function M:grantCatch(msg)
-  local mon = self.wildCatchMon
+  local mon
+  -- **The engine's own monster, once, and only for the entry that is it.**
+  --
+  -- The host is standing in front of a real encounter, so one of the monsters
+  -- on the field is an engine `Mon` this screen has held since the divert --
+  -- with the DVs the player's own game rolled, which is the copy worth keeping.
+  -- The others were never in this process at all.
+  --
+  -- Until a fight could pay out twice, "the wild monster" and "this catch" were
+  -- the same thing and this simply took the stashed one. Now it has to ask,
+  -- because handing the stashed monster to a second entry would grant the same
+  -- creature twice and drop the one that was actually caught. A sheet that
+  -- names it wins it; everything else is rebuilt.
+  if self.wildCatchMon and not self.wildCatchGranted
+     and (not (msg and msg.caught)
+          or M.sheetNamesMon(msg.caught, self.wildCatchMon)) then
+    mon = self.wildCatchMon
+    self.wildCatchGranted = true
+  end
   if not mon and msg and msg.caught then
     mon = M.monFromCaughtSheet(self.game, msg.caught)
     if not mon then
@@ -9349,15 +9478,27 @@ end
 -- The post-faint picker. Titled, because it is not the same question as the
 -- SWITCH command even though it shows the same list: this one has to be
 -- answered.
+-- The GB fallback's own rows.
+--
+-- `drawList` takes plain strings, so the level rides the label here rather than
+-- a right column this path does not have. Kept in step with the band rows on
+-- purpose: whichever chrome the player ends up looking at, the replacement
+-- picker has to name the level of what it is about to send out.
+function M:benchLabels(bench)
+  local data = self.game and self.game.data
+  local rows = {}
+  for _, entry in ipairs(bench or {}) do
+    local row = BattleRows.rowFor(entry.mon, entry.index, { data = data })
+    local right = BattleRows.rightText(row)
+    rows[#rows + 1] = right and (row.name .. " " .. right) or row.name
+  end
+  return rows
+end
+
 function M:drawReplace()
   local bench = self:benchOf(self.sim:slot(self.mine))
   if #bench == 0 then return self:drawText("No one left!") end
-  local rows = {}
-  for _, entry in ipairs(bench) do
-    local def = (self.game.data.pokemon or {})[entry.mon.species]
-    rows[#rows + 1] = (entry.mon.nickname or (def and def.name) or entry.mon.species)
-  end
-  self:drawList(rows, self.switchIndex or 1, "Who's next?")
+  self:drawList(self:benchLabels(bench), self.switchIndex or 1, "Who's next?")
 end
 
 function M:drawSwitch()
@@ -9365,12 +9506,7 @@ function M:drawSwitch()
   if #bench == 0 then
     return self:drawText("There's no one\nelse to send out!")
   end
-  local rows = {}
-  for _, entry in ipairs(bench) do
-    local def = (self.game.data.pokemon or {})[entry.mon.species]
-    rows[#rows + 1] = (entry.mon.nickname or (def and def.name) or entry.mon.species)
-  end
-  self:drawList(rows, self.switchIndex or 1)
+  self:drawList(self:benchLabels(bench), self.switchIndex or 1)
 end
 
 function M:drawItem()

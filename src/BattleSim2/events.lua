@@ -71,11 +71,14 @@ local floor = math.floor
 --   unchose    -- cancel cleared a filed answer
 --   moves      -- mid-fight move-list sync after Transform/Mimic
 --   exp        -- a faint paid out; facts only, the client prices it
+--   caught     -- a ball landed; that seat leaves the field and not because it
+--                 fainted.  The sheet rides the OUTCOME (`catches`), never the
+--                 event -- see the Gen 1 twin's header for the whole argument.
 M.KINDS = {
   msg = true, anim = true, damage = true, drain = true, faint = true,
   send = true, status = true, stat = true, switch = true, item = true,
   run = true, turn = true, over = true, wait = true, reconnect = true,
-  chose = true, unchose = true, moves = true, exp = true,
+  chose = true, unchose = true, moves = true, exp = true, caught = true,
 }
 
 -- Every key an event may carry, and the type it carries.  `battle` and `seq`
@@ -155,6 +158,9 @@ M.SHAPES = {
                 speciesId = "its registry id, when the sheet named one",
                 level = "its level", participants = "how many shares split it",
                 mon = "party index (0-5) of the mon banking this share; absent means the active one" },
+  caught    = { slot = "the seat that was caught", side = true,
+                text = "the species",
+                speciesId = "registry id for the art, when the sheet named one" },
 }
 
 -- ------------------------------------------------------------------

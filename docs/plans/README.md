@@ -13,11 +13,13 @@ Working notes for features that were (or are being) implemented in this repo.
 | [`gen2-compatibility.md`](gen2-compatibility.md) | Dual Gen1+Gen2 hubs, BattleSim2, trade, co-op, e2e — shipped |
 | [`gen2-new-battle-system.md`](gen2-new-battle-system.md) | The arena, the band, exp and retargeting on Gold — shipped |
 | [`party-wild-encounter.md`](party-wild-encounter.md) | Party vs Wild (`coop_wild`) — in progress |
+| [`party-wild-one-each.md`](party-wild-one-each.md) | One wild per player on a party encounter, scripted ones stay 2v1 (PROTOCOL 23) — implemented; e2e outstanding |
 | [`coop-battle-intro-anims.md`](coop-battle-intro-anims.md) | CoopBattle intro balls + sequential Go!/POOF — implemented |
 | [`guild-focus-battle-ui.md`](guild-focus-battle-ui.md) | CoopBattle focus stage + side strips |
 | [`hub-twin-parity.md`](hub-twin-parity.md) | Hub.lua ↔ relay.js drift process + carve-outs |
 | [`battle-sim-move-effects.md`](battle-sim-move-effects.md) | Complete; locked BattleSim decisions |
 | [`offline-solo-battles.md`](offline-solo-battles.md) | Solo wild + trainer fights on BattleSim, option default off, no wire change — in progress |
+| [`classic-battle-ui.md`](classic-battle-ui.md) | Classic GB chrome for the arena band + plates behind `CLASSIC BATTLE UI` (default on), plus level/gender/species icons in the party pickers, no wire change — implemented |
 | [`mmo-followers.md`](mmo-followers.md) | A POKéMON behind every remote trainer via Wilds of Kanto (PROTOCOL 23, `engine_internals`) — planned |
 
 ## Historical

@@ -14,6 +14,14 @@ local Gen = need("Gen")
 -- Type only: Toast owns the mod's one per-size font cache (Rajdhani, linear
 -- filter, engine-default fallback). Nothing else is borrowed from it.
 local Toast = need("Toast")
+-- What a row and a plate SAY (level, gender, icon), decided once above the skin
+-- fork so the two looks cannot disagree about facts.
+local BattleRows = need("BattleRows")
+local BattleIcon = need("BattleIcon")
+-- The second painter. It never requires this file back -- that would be a cycle
+-- and the resolver disables the whole mod on one -- so it takes its geometry as
+-- arguments instead.
+local Classic = need("ClassicChrome")
 
 local M = {}
 
@@ -318,6 +326,47 @@ function M.enabled(game)
   local ok, gen = pcall(Gen.generation, game)
   if not ok then return false end
   return THEATRE_GENERATIONS[tonumber(gen) or 1] == true
+end
+
+-- ------- which skin paints the chrome
+--
+-- `M.enabled` above decides whether there is an ARENA at all. This decides what
+-- the menu band and the plates on it LOOK like, and the two are independent:
+-- the arena, its seats, its throws and its exp sequencing are the same either
+-- way. Only the painter changes.
+--
+-- The key and the label live here rather than in Client because the file that
+-- defines the row and the file that reads it are the only two that have to
+-- agree on them -- this way they agree by construction, the same habit
+-- SoloBattle.OPTION already follows.
+M.OPTION = "classicui"
+M.OPTION_LABEL = "CLASSIC BATTLE UI"
+
+-- Cached, because this is read several times per frame by every widget, and an
+-- options lookup per widget per frame is a cost with nothing to show for it.
+-- Client clears it on `mod.options_changed`, so flipping the row takes effect
+-- on the next battle without a relaunch.
+local classicCache
+
+function M.forgetSkin()
+  classicCache = nil
+end
+
+function M.classicEnabled()
+  if classicCache ~= nil then return classicCache end
+  local on = Config.CLASSIC_UI_DEFAULT ~= false
+  if type(mod) == "table" and mod.options and mod.options.get then
+    local ok, got = pcall(function() return mod.options:get(M.OPTION) end)
+    -- nil means the player has never touched the row: keep the default rather
+    -- than reading absence as "off".
+    if ok and got ~= nil then on = got == true end
+  end
+  classicCache = on and true or false
+  return classicCache
+end
+
+function M.skin()
+  return M.classicEnabled() and "classic" or "modern"
 end
 
 -- ------- asset load
@@ -2147,10 +2196,22 @@ end
 -- moves. Nothing else on the plate moves for it -- the HP bar keeps the y it
 -- has always had, and the strip is fitted into the inset below it -- so a
 -- plate with exp and a plate without are the same picture plus a strip.
-local function drawPlate(plate)
+local function drawPlate(plate, game)
   local gfx = g()
   if not (gfx and plate) then return end
   local model = plate.model or M.plateModel(plate.mon)
+  -- What plateModel never knew: which icon belongs beside the name, and which
+  -- gender follows the level. Computed once here and handed to whichever
+  -- painter answers, so the two skins show the same monster.
+  local extras = BattleRows.plateExtras(plate.mon)
+  if M.classicEnabled() then
+    local ok, drew = pcall(Classic.drawPlate,
+      { x = plate.x, y = plate.y, w = plate.w, h = plate.h,
+        model = model, numbers = plate.numbers }, extras, game)
+    if ok and drew then return end
+    -- else fall through: a plate the classic painter could not draw is still
+    -- owed to the player as a modern one.
+  end
   pcall(function()
     local x, y, w, h = plate.x, plate.y, plate.w, plate.h
     panel(gfx, x, y, w, h)
@@ -2186,9 +2247,31 @@ local function drawPlate(plate)
         end)
       end
       withFont(gfx, M.FONT_PRIMARY, function(primary)
+        local nameX = x + pad
+        local budget = w - pad * 2 - pillW - 4
+        if extras.iconRow then
+          -- The plate is the tightest surface in the mod: 176x48 with a name
+          -- already cut to ten characters. The icon takes its column only when
+          -- what is left still holds a readable name -- otherwise the ORNAMENT
+          -- yields and the FACT keeps the space.
+          if budget - BattleIcon.SIZE >= 48 then
+            BattleIcon.draw(game, extras.iconRow, nameX, y + 2)
+            nameX = nameX + BattleIcon.SIZE + 2
+            budget = budget - BattleIcon.SIZE - 2
+          end
+        end
+        local name = fitLine(primary, model.name, budget)
         setColor(gfx, TEXT_ON)
-        local name = fitLine(primary, model.name, w - pad * 2 - pillW - 4)
-        gfx.print(name, x + pad, y + 3)
+        gfx.print(name, nameX, y + 3)
+        if extras.gender then
+          local sym = BattleRows.genderSymbol(extras.gender)
+          local okGlyph, has = pcall(function() return primary:hasGlyphs(sym) end)
+          if sym and okGlyph and has then
+            local at = nameX + widthWith(primary, name) + 3
+            setColor(gfx, BattleRows.genderColor(extras.gender) or TEXT_MUTED)
+            gfx.print(sym, at, y + 3)
+          end
+        end
       end)
     end)
     gfx.setColor(1, 1, 1, 1)
@@ -2609,7 +2692,7 @@ end
 -- arena art runs edge to edge, so a caller that wants the band to read as
 -- chrome rather than as panels floating on grass calls this once — once,
 -- because two widgets each painting their own scrim would double-darken it.
-function M.drawBandBackdrop()
+function M.modernBandBackdrop()
   local gfx = g()
   if not gfx then return end
   pcall(function()
@@ -2624,7 +2707,7 @@ end
 -- The battle line. Two lines at most; a third would not fit the band, and the
 -- caller's message queue is what splits long text anyway.
 -- opts.hint == false drops the continue triangle (a line nothing waits on).
-function M.drawMessagePanel(text, opts)
+function M.modernMessagePanel(text, opts)
   local gfx = g()
   if not gfx then return false end
   local x, y, w, h = M.bandRect(opts)
@@ -2662,6 +2745,17 @@ end
 function M.bandGridCols(n, opts)
   n = math.floor(num(n, 0))
   if n <= 0 then return 0 end
+  -- The classic skin lays the commands out as the original's 2x2, always. This
+  -- function is what the CURSOR reads, and the header above says why that
+  -- matters: a left/right press assuming four across while the band actually
+  -- drew 2x2 walks the highlight onto a slab that is not next to the one it
+  -- left. One definition, both skins.
+  --
+  -- `available` and not just `classicEnabled`, because the dispatchers below
+  -- FALL THROUGH to the modern painter when classic cannot draw. Reading the
+  -- option alone would answer 2 for a grid the modern painter had just drawn
+  -- four across -- the drift this whole comment exists to prevent.
+  if M.classicEnabled() and Classic.available() then return 2 end
   local _, _, w = M.bandRect(opts)
   return (w >= 420 and n <= 4) and n or 2
 end
@@ -2671,7 +2765,7 @@ end
 -- where 150×72 is a button shape. A caller that boxes the grid into a narrower
 -- slot falls back to two columns, where 4-across would be too tight to label.
 -- `cursor` is the 1-based highlighted item; items are { label, disabled? }.
-function M.drawCommandGrid(items, cursor, opts)
+function M.modernCommandGrid(items, cursor, opts)
   local gfx = g()
   if not gfx then return false end
   items = listOf(items)
@@ -2719,7 +2813,7 @@ end
 -- Moves / items / party: a scrolling list of { label, right?, dim? }. `right`
 -- is right-aligned in the secondary colour (PP "12/15", a type name);
 -- opts.title prints a small header, opts.visible overrides the row count.
-function M.drawListPanel(rows, cursor, opts)
+function M.modernListPanel(rows, cursor, opts)
   local gfx = g()
   if not gfx then return false end
   rows = listOf(rows)
@@ -2730,11 +2824,21 @@ function M.drawListPanel(rows, cursor, opts)
   if type(opts.title) == "string" and opts.title ~= "" then title = opts.title end
   local top = y + LIST_PAD_Y + (title and LIST_TITLE_H or 0)
   local avail = h - LIST_PAD_Y * 2 - (title and LIST_TITLE_H or 0)
-  local visible = clamp(math.floor(avail / LIST_ROW_MIN), 1, 5)
+  -- A menu icon is a 16px source and is never stretched (the rule this file
+  -- states for 16xN sheets at the top). So a list that carries icons needs
+  -- 16px rows, which costs it the fifth row -- the icon column is worth one
+  -- row, and squeezing a 16px sprite into a 12px row is not an option.
+  local iconed = false
+  for _, row in ipairs(rows) do
+    if type(row) == "table" and row.iconRow then iconed = true; break end
+  end
+  local rowMin = iconed and BattleIcon.SIZE or LIST_ROW_MIN
+  local rowMax = iconed and math.max(BattleIcon.SIZE, LIST_ROW_MAX) or LIST_ROW_MAX
+  local visible = clamp(math.floor(avail / rowMin), 1, 5)
   if opts.visible then
     visible = clamp(math.floor(num(opts.visible, visible)), 1, visible)
   end
-  local rowH = clamp(math.floor(avail / visible), LIST_ROW_MIN, LIST_ROW_MAX)
+  local rowH = clamp(math.floor(avail / visible), rowMin, rowMax)
   local count = #rows
   cursor = clamp(math.floor(num(cursor, 1)), 1, math.max(1, count))
   local first = 1
@@ -2759,10 +2863,17 @@ function M.drawListPanel(rows, cursor, opts)
           local ry = top + slot * rowH
           local label = row
           local right, dim = nil, false
+          local gender, iconRow = nil, nil
           if type(row) == "table" then
-            label = row.label
-            right = row.right
+            -- `label`/`right` are the shape this widget always took; `name`
+            -- and the model's own right column are what BattleRows produces.
+            -- Reading both keeps every existing caller working while the model
+            -- rows carry the level and HP the old rows never did.
+            label = row.label or row.name
+            right = row.right or BattleRows.rightText(row)
             dim = row.dim and true or false
+            gender = row.gender
+            iconRow = row.iconRow
           end
           local hot = (first + slot) == cursor
           if hot then
@@ -2780,9 +2891,26 @@ function M.drawListPanel(rows, cursor, opts)
             setColor(gfx, dim and TEXT_DIM or TEXT_MUTED)
             gfx.print(right, x + w - pad - rightW + 8, ty)
           end
+          local labelX = x + pad + 4
+          if iconRow then
+            -- The registry is read HERE, at paint time, which is what makes
+            -- whichever icon mod loaded last the one that wins -- no dependency
+            -- declared, no load order assumed. A miss costs its own cell only.
+            BattleIcon.draw(opts.game, iconRow, x + pad, ry)
+            labelX = labelX + BattleIcon.SIZE
+          end
+          -- The gender sign rides the name rather than the right column, which
+          -- already carries level and HP. Rajdhani may simply not have the
+          -- glyph; asking the font beats drawing a tofu box at it.
+          local text = tostring(label or "")
+          if gender then
+            local sym = BattleRows.genderSymbol(gender)
+            local okGlyph, has = pcall(function() return font:hasGlyphs(sym) end)
+            if sym and okGlyph and has then text = text .. " " .. sym end
+          end
           setColor(gfx, dim and TEXT_DIM or (hot and TEXT_ON or TEXT_MUTED))
-          gfx.print(fitLine(font, tostring(label or ""),
-            w - pad * 2 - rightW - 6), x + pad + 4, ty)
+          gfx.print(fitLine(font, text,
+            x + w - pad - rightW - 6 - labelX), labelX, ty)
         end
       end
       -- Scroll thumb, only when there is something off-panel.
@@ -2800,6 +2928,47 @@ function M.drawListPanel(rows, cursor, opts)
     gfx.setColor(1, 1, 1, 1)
   end)
   return ok
+end
+
+-- ------- skin dispatch
+--
+-- The four names both battle screens already call. Nothing in MediatedBattle or
+-- CoopBattle changed: they still call `Battlefield.drawListPanel(...)` and are
+-- told nothing about which painter answered.
+--
+-- Every one of them falls THROUGH to the modern painter when the classic one
+-- reports it could not paint -- no render stack, no engine Font, a throw caught
+-- inside. A skin that cannot draw must cost its own looks and nothing else; an
+-- empty band over a live fight reads as the battle having frozen, which is the
+-- failure this file already guards against everywhere else.
+
+function M.drawBandBackdrop()
+  if M.classicEnabled() and Classic.drawBandBackdrop() then return true end
+  return M.modernBandBackdrop()
+end
+
+function M.drawMessagePanel(text, opts)
+  if M.classicEnabled()
+    and Classic.drawMessagePanel(text, M.WIDTH, M.HEIGHT, opts) then
+    return true
+  end
+  return M.modernMessagePanel(text, opts)
+end
+
+function M.drawCommandGrid(items, cursor, opts)
+  if M.classicEnabled()
+    and Classic.drawCommandGrid(items, cursor, M.WIDTH, M.HEIGHT) then
+    return true
+  end
+  return M.modernCommandGrid(items, cursor, opts)
+end
+
+function M.drawListPanel(rows, cursor, opts)
+  if M.classicEnabled()
+    and Classic.drawListPanel(rows, cursor, M.WIDTH, M.HEIGHT, opts) then
+    return true
+  end
+  return M.modernListPanel(rows, cursor, opts)
 end
 
 -- battle: screen state (unused for pure layout; reserved for callers).
@@ -2846,7 +3015,7 @@ function M.draw(battle, ctx, eng)
       -- on) but under the HUD, which never yields the field.
       if hasFx then pcall(drawFieldFx, layout) end
       for _, plate in ipairs(layout.plates) do
-        pcall(drawPlate, plate)
+        pcall(drawPlate, plate, drawGame)
       end
       if layout.arrow then
         pcall(drawArrow, layout.arrow)

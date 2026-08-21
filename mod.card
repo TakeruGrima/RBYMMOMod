@@ -14,6 +14,14 @@ return {
       "Spawns runtime NPCs for other players on your current map.",
       "Hooks movement.speed so holding B on foot moves at bike speed; off "
         .. "the moment you are biking or surfing.",
+      "Draws the battle menus and HP plates as the original's white Game "
+        .. "Boy box and tile font by default, instead of the arena's dark "
+        .. "panels — a CLASSIC BATTLE UI row turns it off. The field is "
+        .. "unchanged either way: same seats, same ball throws, same 2-on-2.",
+      "Names the level, the gender and the species icon of every POKéMON "
+        .. "in the switch, item and post-faint pickers, which used to show "
+        .. "a name and nothing else — and prefers a nickname over the "
+        .. "species, which that list used to discard.",
     },
     added = {
       "HOST GAME and JOIN GAME in the MMO menu -- no separate server to "
@@ -332,6 +340,19 @@ return {
       .. "through the same widescreen seam the game's own battle screen "
       .. "uses, so it sits over the whole window rather than in the 160×144 "
       .. "panel. See docs/plans/gen2-new-battle-system.md.",
+    "Plays well with the icon packs. The party rows and the field plates "
+      .. "draw species icons through the engine's own PartyMenu.drawIcon, "
+      .. "which resolves icons.bySpecies and then the pokemon.icon hook — "
+      .. "exactly where Unique Menu Icons and new_icons write — and it does "
+      .. "so at draw time, so whichever pack loaded last is the one that "
+      .. "shows. Neither is declared as a dependency and no load order is "
+      .. "assumed; with none of them installed this is the same code path "
+      .. "rather than a degraded mode.",
+    "Shows gender when Gender Mod is installed, on your own party and on "
+      .. "an MMO opponent's POKéMON alike — the Attack DV already travels "
+      .. "on the battle sheet, so nothing on the wire was added for it. "
+      .. "Gender Mod is Gen 1 only, so on Gold no symbol is drawn; that is "
+      .. "the absence of an ornament and costs nothing else.",
     "Runs alongside DramaticShapeVoxelMod: both load clean and everything "
       .. "works with the diorama on. Remote players render as voxel "
       .. "characters, since this mod spawns real NPCs rather than drawing "

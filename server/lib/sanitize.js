@@ -553,6 +553,14 @@ const BATTLE_ACTIONS = new Map([
  *              species table and can never compute one, so the referee states
  *              the facts and each client runs its own Experience formula over
  *              its own party.
+ *   caught     a ball landed on that slot, and the slot is out. Not a faint:
+ *              with a second wild monster on the field the fight carries on, so
+ *              the two cannot share a kind -- one of them pays experience and
+ *              prints "fainted", and only one of them means somebody just
+ *              gained a monster. The monster itself is not here; it is on the
+ *              outcome, in `catches`, because an event is a flat whitelist and
+ *              a sheet is not flat. `exp` split the same way for the same
+ *              reason.
  *
  * Closed, because the vocabulary is the contract between the turn machine and
  * the screen: an unknown kind has no animation, no sentence and no state change
@@ -562,7 +570,7 @@ const BATTLE_ACTIONS = new Map([
 const BATTLE_EVENT_TYPES = new Set([
   'msg', 'anim', 'damage', 'drain', 'faint', 'send', 'status', 'stat',
   'switch', 'item', 'run', 'turn', 'over', 'wait', 'reconnect',
-  'chose', 'unchose', 'moves', 'exp',
+  'chose', 'unchose', 'moves', 'exp', 'caught',
 ]);
 
 // The reasons a mediated fight ends that a screen currently has a sentence for:
@@ -1338,6 +1346,36 @@ function cleanBattleOutcome(raw) {
     const catcher = cleanId(raw.catcher);
     if (!catcher) return null;
     result.catcher = catcher;
+  }
+  // Every catch the fight paid out, oldest first: one entry per ball that
+  // landed, each naming its own thrower.
+  //
+  // **This is the plural of the two fields above, not a replacement for them.**
+  // A `wild` fight seats one monster and ends on the ball that takes it, so its
+  // outcome says `caught` / `catcher` and always will -- a hub, a client or a
+  // log line written before this existed reads that fight exactly as it did.
+  // A `coop_wild` with a monster per player can pay twice and can end on
+  // something other than a catch (the other one fainted, somebody ran), which
+  // is a sentence the singular pair has no grammar for.
+  //
+  // Bounded by COOP_SIDE because that is how many wild monsters a field can
+  // seat, so it is how many balls can land on one.
+  //
+  // Refused whole on a bad entry, like winners/losers and for the same reason:
+  // this is the list a monster moves on, and a half-read grant is worse than a
+  // refused one.
+  if (raw.catches !== undefined && raw.catches !== null) {
+    if (!Array.isArray(raw.catches)) return null;
+    const catches = [];
+    for (const entry of raw.catches) {
+      if (catches.length >= COOP_SIDE) return null;
+      if (entry === null || typeof entry !== 'object') return null;
+      const caught = cleanBattleMon(entry.caught);
+      const catcher = cleanId(entry.catcher);
+      if (!caught || !catcher) return null;
+      catches.push({ caught, catcher });
+    }
+    if (catches.length > 0) result.catches = catches;
   }
   return result;
 }

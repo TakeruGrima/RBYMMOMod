@@ -1648,11 +1648,20 @@ end
 --                 holds no species table and can never compute one, so the
 --                 referee states the facts and each client runs its own
 --                 Experience formula over its own party.
+--   caught     -- a ball landed on that slot, and the slot is out.  Not a
+--                 faint: with a second wild monster on the field the fight
+--                 carries on, so the two cannot share a kind -- one of them
+--                 pays experience and prints "fainted", and only one of them
+--                 means somebody just gained a monster.
+--                 The monster itself is **not** here.  It is on the OUTCOME,
+--                 in `catches`, for the reason the next function's header
+--                 gives: an event is a flat whitelist and a sheet is not flat.
+--                 `exp` split the same way for the same reason.
 M.BATTLE_EVENTS = {
   msg = true, anim = true, damage = true, drain = true, faint = true,
   send = true, status = true, stat = true, switch = true, item = true,
   run = true, turn = true, over = true, wait = true, reconnect = true,
-  chose = true, unchose = true, moves = true, exp = true,
+  chose = true, unchose = true, moves = true, exp = true, caught = true,
 }
 
 -- One thing to draw.
@@ -1850,6 +1859,36 @@ function M.battleOutcome(raw)
     out.catcher = M.id(raw.catcher)
     if not out.catcher then return nil end
   end
+  -- Every catch the fight paid out, oldest first: one entry per ball that
+  -- landed, each naming its own thrower.
+  --
+  -- **This is the plural of the two fields above, not a replacement for them.**
+  -- A `wild` fight seats one monster and ends on the ball that takes it, so its
+  -- outcome says `caught` / `catcher` and always will -- a hub, a client or a
+  -- log line written before this existed reads that fight exactly as it did.
+  -- A `coop_wild` with a monster per player can pay twice and can end on
+  -- something other than a catch (the other one fainted, somebody ran), which
+  -- is a sentence the singular pair has no grammar for.
+  --
+  -- Bounded by COOP_SIDE because that is how many wild monsters a field can
+  -- seat, so it is how many balls can land on one.
+  --
+  -- Refused whole on a bad entry, like winners/losers and for the same reason:
+  -- this is the list a monster moves on, and a half-read grant is worse than a
+  -- refused one.
+  if raw.catches ~= nil then
+    if type(raw.catches) ~= "table" then return nil end
+    local catches = {}
+    for _, entry in ipairs(raw.catches) do
+      if #catches >= Config.COOP_SIDE then return nil end
+      if type(entry) ~= "table" then return nil end
+      local mon = M.battleMon(entry.caught)
+      local catcher = M.id(entry.catcher)
+      if not (mon and catcher) then return nil end
+      catches[#catches + 1] = { caught = mon, catcher = catcher }
+    end
+    if #catches > 0 then out.catches = catches end
+  end
   return out
 end
 
@@ -1874,8 +1913,13 @@ end
 --   coop_pvp  -- two parties against each other
 --   wild      -- one player against one hub NPC seat (catch/run legal;
 --               protocol-only; no overworld divert)
---   coop_wild -- two humans vs one wild NPC seat (catch/run legal; overworld
---               divert when partied + same map — seating lands in a later wave)
+--   coop_wild -- two humans vs wildlife on the synthetic NPC seats: **one wild
+--               monster per human** on an ordinary encounter, and exactly one
+--               when the encounter was scripted (a legendary, the ghost) or
+--               the option is off.  Catch/run legal; overworld divert when
+--               partied + same map.  The count is not in the token -- it is
+--               how many seats the host filled, which is why a scripted
+--               encounter needs no mode of its own
 --
 -- Named on the wire rather than inferred from how many ids arrived, because the
 -- two co-op modes have the same four field slots and differ only in whether one

@@ -8,6 +8,104 @@ here must match `manifest.version`.
 
 ### Added
 
+- **One wild POKéMON each.** A party that walks into grass together used to
+  meet one wild POKéMON and fight it two-on-one, which left the second
+  player watching. From **PROTOCOL 23** an ordinary encounter seats **one
+  per player**: two trainers, two POKéMON, one field. A new `WILD EACH` row
+  in the mod manager (`F10` → `MMO`), **default ON**, turns it off — on by
+  default because, unlike `SOLO BATTLES`, it changes something this mod
+  added rather than something the game already did.
+  - **Scripted encounters are untouched, and no code decides that.** A
+    legendary, SNORLAX, the MAROWAK ghost, the SAFARI ZONE, the old man's
+    demonstration and Gold's contest / tutorial / roaming battles all stay
+    the single POKéMON both players fight. The rule is the same lookup that
+    finds the second one: a random encounter is a species drawn from the
+    list this map keeps for the terrain you are standing on, so a species
+    that is in no list on this map was not drawn from any — a script put it
+    there. The host then uploads one POKéMON, and the hub's existing
+    spare-seat drop opens the fight as the 2v1 it has always been.
+  - **Both of you can throw, and there is no quota.** Balls resolve in
+    active-POKéMON speed order as they always have; a ball may now name
+    which POKéMON it is aimed at. A successful catch takes that one off the
+    field and the fight **carries on** while the other is standing — so the
+    slower thrower's ball is still resolved, where a single-POKéMON
+    encounter still ends on the first ball and still costs exactly one.
+    Whoever's ball landed keeps what it caught, and a fight can pay out
+    twice.
+  - **A catch is not a faint.** The referee emits a new `caught` event: the
+    seat leaves the field without printing "fainted", without a sink over a
+    patch of grass the ball chain already emptied, and without zeroing a
+    bar — the POKéMON on that seat is on its way into somebody's party with
+    the HP it had when the ball closed. Experience is paid for it exactly
+    as vanilla pays it, which is the one change a *single*-POKéMON
+    encounter can also see.
+  - **`mmo.battle_outcome` grows `catches`**, one entry per ball that
+    landed, each naming its own thrower — delivered on **every** ending, so
+    catching one and then running from the other still brings the first one
+    home. The `caught` / `catcher` pair the wire has carried since PROTOCOL
+    18 stays, mirroring the last entry, so a solo `wild` fight reads exactly
+    as it did.
+  - PROTOCOL 22 → 23. Every part of this degrades badly rather than visibly
+    against a 22-era peer — a 22 hub deals the second POKéMON nowhere, a 22
+    client keeps drawing one that has left the field, and a 22 outcome
+    cleaner strips the list a caught POKéMON travels home on — so the
+    refusal names both versions instead.
+- **The original's Game Boy chrome on the battle screen, behind a
+  `CLASSIC BATTLE UI` row (`F10` → `MMO`), default ON.** The menu band
+  and every field plate draw as the white bordered box with the engine's
+  own 8px tile font, its tile cursor and a GB-shaped HP bar, instead of
+  the arena's dark translucent panels. **The arena itself is untouched** —
+  same seats, same ball throws, same exp sequencing, same 2-on-2 field.
+  Only the painter changes.
+  - **On by default, unlike `SOLO BATTLES`, and the difference is the
+    point.** That row is off by default because it changes what the game
+    *does*. This one changes only how the mod's own screen *reads*, and
+    the modern band draws 10–13px type in white-on-slate over bright,
+    busy field art where the tile font draws 16px black on white.
+    Shipping the harder-to-read look by default and hiding the readable
+    one behind a menu would be the wrong way round.
+  - **No layout constant moved.** The plate rect is 176×48, which is
+    exactly 11×3 tiles at ×2, so the seats, the plate dodge and the pitch
+    rules stay as measured. The band box does not fit inside the 80px
+    band and is not meant to — a bordered box spends two tile rows on its
+    border — so it is bottom-anchored and overhangs *upward* over the
+    arena, the way the original's message box overlays the scene. The
+    field never consults it, so that costs nothing and keeps five content
+    rows.
+  - **If the classic painter cannot draw, the modern one still does.**
+    Every widget falls through rather than leaving an empty band over a
+    live fight.
+
+- **The level of a benched POKéMON, at the moment you choose it.** The
+  switch list, the item-on-POKéMON list and the post-faint replacement
+  picker now read `PIKACHU ♂ L30 45/60` instead of `PIKACHU`. This was
+  the one number that decides who you send out and the menu never said
+  it: `partyRows` built `{ label = tostring(mon.species) }` and nothing
+  else — which on a save monster also threw the player's own **nickname**
+  away, so a nicknamed POKéMON was offered under its species name. Both
+  are fixed, in **both** skins: the facts are computed once in a new
+  `src/BattleRows.lua`, above the fork between painters, so the two looks
+  cannot disagree about the same monster.
+
+- **Gender, when `gender_mod` is installed** — on your own party *and* on
+  an MMO opponent's POKéMON. No protocol work was needed: the Attack DV
+  already travels end to end (`ivs` on the party sheet, through
+  `Wire.statsOf` and `server/lib/sanitize.js`), so this is a key
+  translation (`ivs.atk` → the `dvs.attack` spelling the other mod reads)
+  rather than a wire change. `Config.PROTOCOL`, the hub twin and
+  `affects_link` are all untouched. Without `gender_mod` — including on
+  Gold, where it does not load at all — no symbol is drawn and nothing
+  errors.
+
+- **Species icons from whichever icon mod is installed** (Unique Menu
+  Icons, new_icons, …) on the party list rows and beside the name on each
+  field plate. They are resolved through the engine's own
+  `PartyMenu.drawIcon`, which reads `icons.bySpecies` and then the
+  `pokemon.icon` hook — exactly where those mods write — **at draw time**,
+  so whichever one loaded last wins with no dependency declared here and
+  no load order assumed. With none of them installed this is the same
+  code path, not a degraded mode.
+
 - **This mod's battle system, with nobody else in the room.** A new
   `SOLO BATTLES` row in the mod manager (`F10` → `MMO`), **default OFF**,
   routes ordinary wild encounters and *every* trainer — walked into,

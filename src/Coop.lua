@@ -63,6 +63,7 @@ local Wire = need("Wire")
 local Gen = need("Gen")
 local CoopBattle = need("CoopBattle")
 local Mediated = need("MediatedBattle")
+local WildRoll = need("WildRoll")
 
 -- How often a standing offer is re-attempted while this client is busy.
 --
@@ -950,6 +951,22 @@ function M:onWildEncounter(game, state, mapId)
   local label = Wire.label(tostring(species or ""):gsub("_", " "))
   local key = M.battleKey(mapId, species, mon.level)
 
+  -- One wild monster per *other* player, rolled here and only here.
+  --
+  -- The stepper owns the encounter, so the stepper owns everything that is in
+  -- it: the partner's client never rolls wildlife of its own, and the two
+  -- clients never have to agree about a draw neither of them can see. What
+  -- comes back is a list of engine monsters, which is what the upload path
+  -- already snapshots -- and an empty list is the whole of the scripted case,
+  -- the option-off case and every failure case at once. See src/WildRoll.lua.
+  --
+  -- The battle key and the label stay the host's own monster's, deliberately:
+  -- the partner joins on that key before the second monster has been named to
+  -- anybody, and "Wild X appeared" is the sentence the waiter is watching their
+  -- own screen say.
+  local extras = WildRoll.extras(game, mapId, state, mon,
+    math.max(0, self.party:count() - 1))
+
   self.encounter = {
     battle = key,
     label = label,
@@ -958,6 +975,7 @@ function M:onWildEncounter(game, state, mapId)
     game = game,
     kind = "wild",
     wildCatchMon = mon,
+    wildExtras = extras,
   }
   return self:beginWildCoop()
 end
@@ -986,6 +1004,10 @@ function M:beginWildCoop()
     kind = "wild",
     mode = "coop_wild",
     wildCatchMon = encounter.wildCatchMon,
+    -- Rolled at the encounter and held for the whole round trip: a wait that
+    -- times out releases the engine wild untouched, and a wait that is joined
+    -- hands these to the fight along with the monster the engine rolled.
+    wildExtras = encounter.wildExtras,
     clock = 0,
   }
   self.transport:send(Wire.COOP_WAIT, {
@@ -1704,6 +1726,10 @@ function M:onJoined(game, msg)
     engine = waiting.engine,
     trainer = waiting.trainer,
     wildCatchMon = waiting.wildCatchMon or M.wildMonOf(waiting.engine),
+    -- The host's, and the host's alone: the joiner's plan carries none of
+    -- these, because the joiner never rolled any. What reaches their screen is
+    -- the field the hub sends back.
+    wildExtras = waiting.wildExtras,
     npcId = waiting.npcId,
     event = waiting.event,
     allies = self.party:list(),
@@ -2217,12 +2243,18 @@ end
 function M:npcSide(game, plan)
   local engine = plan.engine
   local party = engine and engine.enemyParty
-  -- Wild battles (and coop_wild plans) carry one mon on wildCatchMon / enemy.mon
-  -- rather than enemyParty. Feed that into the same pack path so buildField
-  -- still produces a side-b slot the screen can draw.
+  -- Wild battles (and coop_wild plans) carry their monsters on wildCatchMon /
+  -- enemy.mon plus wildExtras rather than on enemyParty. Feed those into the
+  -- same pack path so buildField still produces the side-b slots the screen can
+  -- draw -- one on a scripted encounter, one per player on an ordinary one.
   if not (party and #party > 0) then
     local mon = plan.wildCatchMon or M.wildMonOf(engine)
-    if mon then party = { mon } end
+    if mon then
+      party = { mon }
+      for _, extra in ipairs(plan.wildExtras or {}) do
+        party[#party + 1] = extra
+      end
+    end
   end
   if not (party and #party > 0) then return nil end
 
@@ -2552,6 +2584,15 @@ function M:startBattle(game, field)
       if not plan then return nil end
       if plan.kind ~= "wild" and plan.mode ~= "coop_wild" then return nil end
       return plan.wildCatchMon or M.wildMonOf(plan.engine)
+    end)(),
+    -- The rest of the wildlife, host-side only. CoopBattle uploads these behind
+    -- the monster the engine rolled, so the deal at the hub puts the host's own
+    -- encounter on the first wild seat.
+    wildExtras = (function()
+      local plan = battle.plan
+      if not plan then return nil end
+      if plan.kind ~= "wild" and plan.mode ~= "coop_wild" then return nil end
+      return plan.wildExtras
     end)(),
     -- Whether a win here is worth points, so the screen can say so once
     -- rather than leave a player wondering why their rating did not move.

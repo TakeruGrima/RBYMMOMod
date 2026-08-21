@@ -25616,4 +25616,319 @@ end
 
 end)()
 
+-- ------------------------------------------------------------------
+-- BattleRows / ClassicChrome: the classic skin and what a row says
+-- ------------------------------------------------------------------
+--
+-- The battle UI grew a second skin (the original's Game Boy box, behind
+-- Battlefield.OPTION) and three facts it never showed: the LEVEL of a benched
+-- monster at switch time, its gender, and its species icon.
+--
+-- The level is the point. `partyRows` used to build
+-- `{ label = tostring(mon.species) }` and nothing else, so the player choosing
+-- who to send out could not see the one number that decides it -- and on a save
+-- mon that label also threw the player's own nickname away.
+--
+-- BattleRows answers all three ABOVE the skin fork, which is what stops the two
+-- painters from disagreeing about the monster. It is pure -- no love, no engine
+-- require -- so all of it is assertable here.
+;(function()
+
+-- gender_mod is optional in every direction. Both a present and an absent one
+-- are driven, because "no gender mod installed" is a supported state and not a
+-- degraded one.
+local genderStub = {
+  genderOfSpecies = function(id, dvs)
+    if id == "MAGNEMITE" then return nil end
+    local atk = dvs and dvs.attack
+    if atk == nil then return nil end
+    return atk <= 7 and "F" or "M"
+  end,
+  genderOf = function(mon)
+    local atk = mon and mon.dvs and mon.dvs.attack
+    if atk == nil then return nil end
+    return atk <= 7 and "F" or "M"
+  end,
+  tile = function(g) return g == "M" and 0xEF or 0xF5 end,
+  symbol = function(g) return g == "M" and "<m>" or "<f>" end,
+  palette = function() return { 1, 0, 0, 1 } end,
+}
+
+local function modWith(find)
+  local copy = {}
+  for k, v in pairs(stubMod) do copy[k] = v end
+  copy.find = find
+  return copy
+end
+
+local Rows = resolver(modWith(function(id)
+  if id == "gender_mod" then return { exports = genderStub } end
+  return nil
+end))("BattleRows")
+local RowsBare = resolver(modWith(function() return nil end))("BattleRows")
+
+local DEX = { pokemon = { PIKACHU = { name = "PIKACHU" },
+  MAGNEMITE = { name = "MAGNEMITE" } } }
+
+-- A local save party: `species` IS the registry id, DVs use engine keys.
+local saveParty = {
+  { species = "PIKACHU", nickname = "SPARKY", level = 30, hp = 45,
+    stats = { hp = 60 }, dvs = { attack = 3 } },
+  { species = "MAGNEMITE", level = 28, hp = 0, stats = { hp = 40 },
+    dvs = { attack = 9 } },
+  { species = "PIKACHU", level = 12, hp = 20, stats = { hp = 22 },
+    dvs = { attack = 12 } },
+}
+-- A mediated party: `species` is PROSE, `speciesId` is the id, IVs use wire
+-- keys. Both shapes reach the same switch menu, which is why both are pinned.
+local wireParty = {
+  { species = "Bolt", speciesId = "PIKACHU", level = 55, hp = 100, maxHp = 130,
+    ivs = { atk = 2, def = 9, spd = 9, spc = 9 } },
+  { species = "MAGNEMITE", speciesId = "MAGNEMITE", level = 40, hp = 60,
+    maxHp = 60, ivs = { atk = 15, def = 9, spd = 9, spc = 9 } },
+}
+
+-- ------- the level, the name, and the refusals
+
+do
+  local rows = Rows.rowsFor(saveParty, { all = true, active = 1, data = DEX })
+  eq(#rows, 3, "all=true keeps every monster")
+  eq(rows[1].level, 30, "the level is on the row at last")
+  eq(rows[1].name, "SPARKY", "the nickname beats the species")
+  eq(rows[2].name, "MAGNEMITE", "no nickname falls back to the dex name")
+  eq(rows[2].fainted, true, "a fainted row is marked")
+  eq(rows[2].dim, true, "and dimmed rather than hidden")
+  eq(rows[1].active, true, "the active monster is marked")
+  eq(rows[1].maxHp, 60, "maxHp is read off stats.hp on a save mon")
+
+  local switch = Rows.rowsFor(saveParty, { active = 1, data = DEX })
+  eq(#switch, 1, "the switch list drops the active and the fainted")
+  eq(switch[1].index, 3, "and the party index survives the filter")
+end
+
+-- ------- the right column
+
+do
+  local rows = Rows.rowsFor(saveParty, { all = true, active = 1, data = DEX })
+  eq(Rows.rightText(rows[1]), "L30 45/60", "level then HP, the series order")
+  eq(Rows.rightText({ level = 7 }), "L7", "absent HP is omitted, never invented")
+  eq(Rows.rightText({}), nil, "nothing to say is nil, not an empty column")
+end
+
+-- ------- gender, both dialects
+--
+-- REGRESSION PIN. `attackDv` used to walk `ipairs({ mon.dvs, mon.ivs })`. A
+-- mediated sheet has no `dvs`, so that list is `{ nil, ivs }` -- a table with a
+-- hole at index 1 -- and ipairs stops before it ever reaches the ivs. Gender
+-- therefore resolved for your own party and NEVER for an MMO opponent, silently
+-- and with no error anywhere. The wire cases below are what catch that.
+
+do
+  local rows = Rows.rowsFor(saveParty, { all = true, active = 1, data = DEX })
+  eq(rows[1].gender, "F", "attack DV 3 is female (save mon, engine keys)")
+  eq(rows[3].gender, "M", "attack DV 12 is male")
+
+  local wire = Rows.rowsFor(wireParty, { all = true, data = DEX })
+  eq(wire[1].gender, "F", "ivs.atk resolves for an MMO opponent")
+  eq(wire[2].gender, nil, "a genderless species stays genderless")
+  eq(Rows.attackDv({ ivs = { atk = 0 } }), 0, "a zero DV is a real answer")
+  eq(Rows.attackDv({ dvs = { attack = 5 }, ivs = { atk = 9 } }), 5,
+    "the save spelling wins when a monster somehow carries both")
+
+  eq(RowsBare.rowsFor(saveParty, { all = true, data = DEX })[1].gender, nil,
+    "no gender mod installed means no gender, and no error")
+  eq(Rows.gender({ species = "PIKACHU", speciesId = "PIKACHU" }), nil,
+    "no DVs at all means no gender")
+  eq(Rows.gender(nil), nil, "a nil monster is answered, not raised at")
+end
+
+-- ------- the wire nickname survives
+--
+-- A sheet carries BOTH `species` (prose, already the nickname when there is
+-- one) and `speciesId`. Looking the id up in the dex would quietly replace the
+-- other player's nickname with a species name.
+
+do
+  local wire = Rows.rowsFor(wireParty, { all = true, data = DEX })
+  eq(wire[1].name, "Bolt", "the wire nickname is NOT replaced by the dex name")
+  eq(wire[1].level, 55, "the opponent's level reaches the row")
+  eq(Rows.rightText(wire[1]), "L55 100/130", "and its maxHp is used directly")
+end
+
+-- ------- icons
+--
+-- The row carries the minimal record the painter resolves art from, never an
+-- image: the registry is read at PAINT time, which is what makes whichever icon
+-- mod loaded last (unique_menu_icons, new_icons) the one that wins, with no
+-- dependency declared here and no load order assumed.
+
+do
+  local rows = Rows.rowsFor(saveParty, { all = true, active = 1, data = DEX })
+  local wire = Rows.rowsFor(wireParty, { all = true, data = DEX })
+  eq(rows[1].iconRow.species, "PIKACHU", "the icon row keys off the registry id")
+  eq(wire[1].iconRow.species, "PIKACHU",
+    "a mediated icon uses speciesId, never the prose nickname")
+  eq(Rows.rowFor({ level = 5, hp = 1 }, 1, {}).iconRow, nil,
+    "an unnameable monster gets no icon row, and no crash")
+end
+
+-- ------- a field SEAT is spelled the other way round
+--
+-- REGRESSION PIN. A Battlefield seat carries `species` = the REGISTRY KEY and
+-- `name` = the prose; a wire sheet carries the two the opposite way. Running
+-- the seat through the sheet-shaped resolver answered nil, and a nil id drops
+-- the icon AND the gender together -- which is why the first shipped frame had
+-- neither on any plate, with nothing in any log to say so.
+
+do
+  local seat = {
+    name = "CHARMANDER", species = "CHARMANDER", level = 9,
+    hp = 25, maxHp = 25, ivs = { atk = 3, def = 9, spd = 9, spc = 9 },
+  }
+  local extras = Rows.plateExtras(seat)
+  eq(extras.speciesId, "CHARMANDER", "a seat's `species` IS the registry id")
+  eq(extras.iconRow.species, "CHARMANDER", "so the plate gets its icon row")
+  eq(extras.gender, "F", "and the seat's own ivs.atk resolves the gender")
+
+  -- A remote PVP opponent: this client never holds their sheet, so the seat
+  -- builder stamps no ivs. The icon still resolves; the gender must not be
+  -- invented.
+  local noSheet = { name = "RATTATA", species = "RATTATA", level = 3,
+    hp = 12, maxHp = 12 }
+  local bare = Rows.plateExtras(noSheet)
+  eq(bare.iconRow.species, "RATTATA", "an icon needs no sheet")
+  eq(bare.gender, nil, "a seat with no sheet has no gender, and says so")
+end
+
+-- ------- glyph helpers
+
+do
+  eq(Rows.genderTile("M"), 0xEF, "the male tile")
+  eq(Rows.genderTile(nil), nil, "genderless draws nothing at all")
+  eq(Rows.genderSymbol("F"), "<f>", "the symbol comes from the other mod")
+  -- Raw UTF-8, not "\u{2640}": that escape is Lua 5.3 and LuaJIT refuses to
+  -- parse it, which would purge the whole mod at load with nothing on screen.
+  eq(RowsBare.genderSymbol("F"), "\226\153\128", "the fallback is raw UTF-8")
+end
+
+-- ------- the classic chrome's geometry
+--
+-- The numbers are the whole reason this skin fits. The plate rect is 176x48,
+-- which is exactly 11x3 tiles at x2 -- so NO placement constant moves and the
+-- seats, the plate dodge and the pitch rules stay as measured.
+--
+-- REGRESSION PIN, and it cost a shipped frame. The box was first built seven
+-- tile rows tall (112px), overhanging upward over the arena on the theory that
+-- "the field never consults the box". The ALLY PLATE does: Battlefield seats it
+-- at FIELD_BOTTOM - PLATE_H - PLATE_PAD, so it occupies y 220..268, and a box
+-- starting at 248 ate its bottom 20px -- the HP bar and the whole exp strip, on
+-- the player's own monster. The owner saw it in the very first frame.
+--
+-- So the box is capped at five rows (80px), which starts exactly on
+-- FIELD_BOTTOM. The derived assertion at the end of this block is the one that
+-- would have caught it, and the one to keep if any here is ever dropped.
+
+do
+  local bfNeed = resolver()
+  local Bf = bfNeed("Battlefield")
+  local Classic = bfNeed("ClassicChrome")
+
+  eq(Classic.BOX_W, Bf.WIDTH, "the box spans the canvas width exactly")
+  eq(Classic.BOX_H, 80, "five tile rows at x2")
+  eq(Classic.CONTENT_ROWS, 3, "three content rows fit above the border")
+  eq(Classic.BOX_H, Bf.MENU_BAND, "the box IS the band -- it never overhangs")
+  check(Classic.BOX_H <= Bf.HEIGHT, "and never leaves the canvas")
+  eq(Classic.CELL, 16, "a text cell is 16px on screen (10-13px modern)")
+
+  -- Derived, not restated: the bottom edge of the lowest ally plate.
+  local allyPlateBottom = Bf.FIELD_BOTTOM - Bf.PLATE_PAD
+  local boxTop = Bf.HEIGHT - Classic.BOX_H
+  check(boxTop >= allyPlateBottom,
+    "the box must never cover the ally plate's HP bar or exp strip")
+
+  -- ...and it has to hold with more than one monster a side. A co-op field
+  -- stacks two plates per side, so this drives the real layout rather than
+  -- trusting the single-seat arithmetic above: ally plates climb from the
+  -- field floor and foe plates descend from the top, and NONE of them may
+  -- reach into the box.
+  local function seat(i)
+    return { index = i, name = "MON" .. i, species = "PIKACHU",
+      level = 10 + i, hp = 20, maxHp = 20 }
+  end
+  local okLayout, layout = pcall(Bf.layout, {
+    mode = "coop_npc",
+    allySeats = { seat(1), seat(2) },
+    foeSeats = { seat(3), seat(4) },
+    allyHumans = {}, foeHumans = {},
+  })
+  check(okLayout, "the layout builds a 2-on-2 field")
+  if okLayout and type(layout) == "table" and type(layout.plates) == "table" then
+    eq(#layout.plates, 4, "four seats, four plates")
+    local lowest = 0
+    for _, plate in ipairs(layout.plates) do
+      local bottom = plate.y + plate.h
+      if bottom > lowest then lowest = bottom end
+    end
+    check(lowest <= boxTop,
+      "no plate on a 2-on-2 field reaches into the classic box")
+  end
+
+  eq(Classic.PLATE_TILES_W * Classic.TILE * Classic.SCALE, Bf.PLATE_W,
+    "the plate is exactly 11 tiles wide at x2")
+  eq(Classic.PLATE_TILES_H * Classic.TILE * Classic.SCALE, Bf.PLATE_H,
+    "and exactly 3 tiles tall -- so no seat constant moves")
+
+  eq(Classic.fit("PIKACHU", 8 * 8), "PIKACHU", "a name inside budget is untouched")
+  eq(Classic.fit("BULBASAUR", 5 * 8), "BULB.", "an overlong name ends in a period")
+  eq(Classic.fit("PIKACHU", 0), "", "no budget draws nothing, not a torn glyph")
+  eq(Classic.fit(nil, 80), "", "nil is text too")
+
+  local lines = Classic.wrap("THE WILD RATTATA USED TAIL WHIP", 10 * 8)
+  check(#lines >= 2, "a long line wraps")
+  check(#lines[1] <= 10, "and no wrapped line exceeds the cell budget")
+  local hard = Classic.wrap("ONE\nTWO", 10 * 8)
+  eq(#hard, 2, "an explicit newline splits")
+  eq(hard[2], "TWO", "and keeps its text")
+end
+
+-- ------- the skin switch
+--
+-- One toggle, default ON, and the CURSOR has to agree with the PAINT: the
+-- classic skin always lays the commands out as the original's 2x2, so
+-- bandGridCols must say 2 or a left/right press walks the highlight onto a slab
+-- that is not next to the one it left.
+
+do
+  local skinNeed = resolver()
+  local Bf = skinNeed("Battlefield")
+  local Classic = skinNeed("ClassicChrome")
+  eq(Bf.OPTION, "classicui", "the key lives with the file that reads it")
+  eq(type(Bf.OPTION_LABEL), "string", "and so does the label")
+  Bf.forgetSkin()
+  -- The stub's options:get answers nil, which is "never touched": the default
+  -- must survive that rather than being read as off.
+  eq(Bf.classicEnabled(), true, "an untouched row keeps the ON default")
+  eq(Bf.skin(), "classic", "and the skin name agrees")
+  eq(type(Bf.drawListPanel), "function", "the dispatcher keeps the old name")
+  eq(type(Bf.modernListPanel), "function", "and the modern painter is still there")
+
+  -- The cursor must agree with whichever painter actually draws. Both branches
+  -- are driven, because the dispatchers FALL THROUGH to the modern painter when
+  -- classic cannot paint -- and a grid drawn four across while the cursor steps
+  -- a 2x2 walks the highlight onto a slab that is not next to the one it left.
+  eq(Classic.available(), false, "headless: no love.graphics, so classic cannot paint")
+  eq(Bf.bandGridCols(4), 4, "so the cursor follows the MODERN grid it will get")
+  -- Now pretend the render stack is there. `useEngine` is the seam that lets a
+  -- headless suite reach the other branch at all.
+  Classic.useEngine({ Font = { draw = function() end, drawBox = function() end,
+    drawCode = function() end } })
+  eq(Classic.available(), false, "still false without love.graphics: both are needed")
+  eq(Bf.bandGridCols(0), 0, "nothing to lay out is still nothing")
+  -- Put the module back the way the rest of the suite expects to find it.
+  Classic.useEngine(nil)
+  Bf.forgetSkin()
+end
+
+end)()
+
 T.finish("rby_mmo")

@@ -435,14 +435,33 @@ function testCoopWildSeating() {
     hostId: a.id,
     memberIds: [a.id, b.id],
   });
-  ok(record && record.npcIds.length === 1,
-    'coop_wild opens with one synthetic wild seat');
-  ok(record.sides.a.length === 2 && record.sides.b.length === 1,
-    'side a is two humans and side b is the wild seat');
-  ok(record.sides.b[0] === record.npcIds[0],
-    'side b names the wild seat');
+  ok(record && record.npcIds.length === 2,
+    'coop_wild opens with a synthetic wild seat per human');
+  ok(record.sides.a.length === 2 && record.sides.b.length === 2,
+    'side a is two humans and side b is the two wild seats');
+  ok(record.sides.b[0] === record.npcIds[0] && record.sides.b[1] === record.npcIds[1],
+    'side b names both wild seats');
   ok(relay.battleSeat(record, relay.get(a.id), { side: 'b' }) === record.npcIds[0],
-    "the host's side-b upload fills the wild seat");
+    "the host's side-b upload starts at the first wild seat");
+
+  // The scripted encounter, and the reason it needed no code of its own: the
+  // seats are minted for the mode, the host uploads a single monster, and the
+  // deal hands the spare seat back. What opens is the 2v1 coop_wild has always
+  // been -- from a record that was prepared to seat two.
+  const scripted = relay.openMediatedBattle('cw-legend', {
+    mode: 'coop_wild',
+    hostId: a.id,
+    memberIds: [a.id, b.id],
+  });
+  ok(scripted.npcIds.length === 2, 'two wild seats are minted up front');
+  ok(relay.fillBattleParty(scripted, relay.get(a.id), {
+    battle: 'cw-legend',
+    side: 'b',
+    mons: [mon(40)],
+  }), 'a one-monster wild upload is accepted');
+  ok(scripted.npcIds.length === 1, 'and the seat it could not fill is given up');
+  ok(scripted.sides.b.length === 1,
+    'so side b is the single monster the script named');
 
   const solo = relay.openMediatedBattle('cw-2', {
     mode: 'coop_wild',

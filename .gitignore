@@ -19,5 +19,5 @@
 tmp/e2e-battlefield-gen2/
 tmp/e2e-solo-battle/
 
-# claude code worktrees
+# agent worktrees (registered via `git worktree`, never content)
 .claude/worktrees/

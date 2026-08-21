@@ -133,7 +133,16 @@ function defaultSpriteFor(generation) {
 // protocol-21 hub strips the field from the upload and states none on the
 // events, which is exactly that failure -- and it is one no player can
 // diagnose from inside the fight, since every other part of it works.
-const PROTOCOL = 22;
+// 23: one wild monster per player on a party encounter. `coop_wild` may seat
+// up to COOP_SIDE monsters on side b instead of exactly one; the referee
+// emits a `caught` event when a ball lands (that seat leaves the field and
+// the fight carries on while another wild stands); and mmo.battle_outcome
+// grows a `catches` list so a fight that paid out twice can say so. Each of
+// those degrades badly rather than visibly against a 22-era peer: a 22 hub
+// deals the host's second monster nowhere, a 22 client keeps drawing a
+// monster that has left the field, and a 22 outcome cleaner strips the list
+// a caught monster travels home on.
+const PROTOCOL = 23;
 
 // How long a four-way PARTY BATTLE ask waits for its three answers. Mirrors
 // Config.COOP_ASK_TIMEOUT: every one of the four is looking at a box right
@@ -2476,12 +2485,21 @@ class Relay {
    * Open the hub's record of a fight. The sim is still null: a ruleset and
    * every required party have to arrive before tryStartSim takes it over.
    *
-   * `npcIds` is set for coop_npc (two synthetic seats) and for wild /
-   * coop_wild (one seat). Coop_npc: two players meet two monsters. Wild: one
-   * player meets one wild mon on a hub NPC seat (protocol-only — no overworld
-   * divert). Coop_wild: two humans on side a, one wild seat on side b
-   * (overworld divert is client-side). The host uploads the NPC / wild team
-   * as side "b".
+   * `npcIds` is set for coop_npc (two synthetic seats), for solo wild (one
+   * seat) and for coop_wild (one per human). Coop_npc: two players meet two
+   * monsters. Wild: one player meets one wild mon on a hub NPC seat
+   * (protocol-only — no overworld divert). Coop_wild: two humans on side a
+   * and, from PROTOCOL 23, a wild seat each — an ordinary grass encounter puts
+   * one monster in front of each player, and a scripted one (a legendary, the
+   * ghost) puts a single monster in front of both. The host uploads the NPC /
+   * wild team as side "b".
+   *
+   * **Seats are minted for what the mode allows, not for what the host is
+   * about to send**, and that is what makes the scripted case free:
+   * fillBattleParty deals the upload across these ids and gives back the ones
+   * it could not fill, so a one-monster upload collapses this to the 2v1
+   * coop_wild has always been without a branch anywhere asking which kind of
+   * encounter it was.
    *
    * They are ids a client could in principle type, and that is safe rather than
    * sloppy: client ids are minted as decimal counters, these carry a letter and
@@ -2504,7 +2522,8 @@ class Relay {
         && mode !== 'wild' && mode !== 'coop_wild') {
       mode = memberIds.length <= 2 ? '1v1' : 'coop_pvp';
     }
-    // coop_wild is a 2v1 contract (exactly two humans vs one wild seat).
+    // coop_wild is a party contract: exactly two humans, whatever the wildlife
+    // turns out to be. The count on side b is the host's upload's business.
     if (mode === 'coop_wild' && memberIds.length !== 2) return null;
 
     const hostId = p.hostId || memberIds[0];
@@ -2514,10 +2533,19 @@ class Relay {
       for (let i = 0; i < COOP_SIDE; i += 1) {
         npcIds.push(`n${id}${String.fromCharCode(97 + i)}`);
       }
-    } else if (mode === 'wild' || mode === 'coop_wild') {
-      // One synthetic wild seat. Wild: one human. Coop_wild: two humans.
-      // Protocol-only here — overworld divert for coop_wild is client-side.
+    } else if (mode === 'wild') {
+      // One human, one synthetic wild seat. Protocol-only — no overworld
+      // divert.
       npcIds = [`n${id}a`];
+    } else if (mode === 'coop_wild') {
+      // A wild seat per human, bounded by the same COOP_SIDE the sim bounds a
+      // side by, so a roster the sim would refuse is never seated in the first
+      // place. What actually fills them is the host's upload; see the header.
+      npcIds = [];
+      const seats = Math.min(memberIds.length, COOP_SIDE);
+      for (let i = 0; i < seats; i += 1) {
+        npcIds.push(`n${id}${String.fromCharCode(97 + i)}`);
+      }
     }
 
     let sides = p.sides;

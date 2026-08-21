@@ -124,6 +124,27 @@ local function encOutcome(out)
       .. '"maxHp":' .. encNumber(out.caught.maxHp)
       .. "}"
   end
+  if out.catcher then
+    parts[#parts + 1] = '"catcher":' .. encString(out.catcher)
+  end
+  -- One line per ball that landed, in the order they landed: who threw it and
+  -- what it took.  The same digest the singular `caught` gets and for the same
+  -- reason -- what has to match across the two runtimes is *which* monster
+  -- ended up in *whose* hands, and the full sheet would bloat the fixture
+  -- without pinning anything the event stream does not already pin.
+  if out.catches then
+    local rows = {}
+    for i = 1, #out.catches do
+      local entry = out.catches[i]
+      rows[i] = "{"
+        .. '"catcher":' .. encString(entry.catcher) .. ","
+        .. '"species":' .. encString(entry.caught and entry.caught.species) .. ","
+        .. '"level":' .. encNumber(entry.caught and entry.caught.level) .. ","
+        .. '"hp":' .. encNumber(entry.caught and entry.caught.hp)
+        .. "}"
+    end
+    parts[#parts + 1] = '"catches":[' .. table.concat(rows, ",") .. "]"
+  end
   return "{" .. table.concat(parts, ",") .. "}"
 end
 
@@ -634,6 +655,45 @@ scenario("wild_ball", function(events)
     battle:submitChoice("p2", { action = "fight", move = 0 })
     drainInto(battle, events)
   end
+  return battle
+end)
+
+-- 14b. one wild monster per player (PROTOCOL 23): two balls in one turn, a
+--      `caught` event and its `exp` where the stream used to go straight to
+--      `over`, and an outcome carrying both catches with the singular pair
+--      mirroring the last of them. The aim is named on the slower throw so the
+--      retarget path is in the digest too.
+scenario("coop_wild_two", function(events)
+  local battle = build({
+    id = "cw2", mode = "coop_wild", seed = 909, choiceTimeout = 60,
+    reconnectGrace = 60,
+    sides = {
+      a = {
+        { playerId = "p1", name = "Ann", mons = {
+          mn({ species = "Alpha", maxHp = 200, spd = 120,
+               moves = { mv("splash", 0, 255, 0) } }) },
+          bag = { MASTER_BALL = 1 } },
+        { playerId = "p2", name = "Abe", mons = {
+          mn({ species = "Gamma", maxHp = 200, spd = 1,
+               moves = { mv("splash", 0, 255, 0) } }) },
+          bag = { MASTER_BALL = 1 } },
+      },
+      b = {
+        { playerId = "w1", name = "Wild", mons = {
+          mn({ species = "Beta", maxHp = 100, hp = 40, spd = 10, catchRate = 255,
+               moves = { mv("splash", 0, 255, 0) } }) } },
+        { playerId = "w2", name = "Wild", mons = {
+          mn({ species = "Delta", maxHp = 60, hp = 20, spd = 5, catchRate = 255,
+               moves = { mv("splash", 0, 255, 0) } }) } },
+      },
+    },
+  })
+  drainInto(battle, events)
+  battle:submitChoice("p1", { action = "item", item = "MASTER_BALL" })
+  battle:submitChoice("p2", { action = "item", item = "MASTER_BALL", target = 3 })
+  battle:submitChoice("w1", { action = "fight", move = 0 })
+  battle:submitChoice("w2", { action = "fight", move = 0 })
+  drainInto(battle, events)
   return battle
 end)
 

@@ -66,11 +66,19 @@ function toNumber(value) {
 //                 this share (`mon`). Never an amount: the intermediator holds
 //                 no species table, so each client runs its own formula over
 //                 its own party.
+//   caught     -- a ball landed. That seat leaves the field, and **not**
+//                 because it fainted: a fight with a second wild monster still
+//                 standing carries on, and `_checkOver` is what decides.
+//                 The sheet does not ride this -- FIELDS is scalars by design,
+//                 and sanitize.js says why -- it travels with the OUTCOME, in
+//                 `catches`, which is where a grant already happened before any
+//                 of this existed. Same division of labour as `exp`: the event
+//                 states the fact, the client does the work.
 const KINDS = {
   msg: true, anim: true, damage: true, drain: true, faint: true,
   send: true, status: true, stat: true, switch: true, item: true,
   run: true, turn: true, over: true, wait: true, reconnect: true,
-  chose: true, unchose: true, moves: true, exp: true,
+  chose: true, unchose: true, moves: true, exp: true, caught: true,
 };
 
 // Every key an event may carry, and the type it carries. `battle` and `seq` are
@@ -175,6 +183,9 @@ const SHAPES = {
     speciesId: 'its registry id, when the sheet named one',
     level: 'its level', participants: 'how many shares split it',
     mon: 'party index (0-5) of the mon banking this share; absent means the active one' },
+  caught: { slot: 'the seat that was caught', side: true,
+    text: 'the species',
+    speciesId: 'registry id for the art, when the sheet named one' },
 };
 
 // ------------------------------------------------------------------
