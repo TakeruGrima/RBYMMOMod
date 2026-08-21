@@ -324,16 +324,36 @@ M.RUN_DIVISOR = 2
 -- and this count serves both.
 --
 -- NPCs get no movement.speed hook to divide: their pace is a field read
--- fresh each frame, and its unset default is NPC.lua's hardcoded
--- STEP_FRAMES = 16 -- the engine's NPC walk default, *not* the player's walk
--- speed, which the divisor above is deliberately never told.  So the count
--- is derived from that 16 rather than written out beside it: tuning
--- RUN_DIVISOR then moves the local runner and the remote avatar together,
--- and one speed stays one speed.  Two independent numbers would drift apart
--- on the first tune, and avatars pacing faster than the presence stream
--- describes strobe past RESYNC_DISTANCE -- which is exactly what remote
--- cyclists did for as long as the wire had no way to say they were fast.
+-- fresh each frame.  It is derived from the **player's** step length, 16,
+-- because that is what an avatar is mirroring -- tuning RUN_DIVISOR then
+-- moves the local runner and the remote avatar together and one speed stays
+-- one speed.
 M.FAST_STEP_FRAMES = math.max(1, math.floor(16 / M.RUN_DIVISOR))
+
+-- What a walking avatar's step must cost, and why it is never left unset.
+--
+-- **The engine's two step lengths are not the same number.**
+-- `src/world/Player.lua:14` walks the player a tile in `STEP_FRAMES = 16`;
+-- `src/world/NPC.lua:11` walks an NPC a tile in `STEP_FRAMES = 32`, and
+-- `NPC:update` reads `self.stepFrames or STEP_FRAMES` fresh every frame. So
+-- leaving `stepFrames` nil on an avatar does not mean "walking pace", it
+-- means **half** walking pace.
+--
+-- That was this file's own long-standing mistake -- the comment here used to
+-- assert the NPC default *was* 16 -- and the cost was not cosmetic: an
+-- avatar animating at half the speed of the player it mirrors loses a tile
+-- for every tile they walk, crosses RESYNC_DISTANCE in about six of them,
+-- and is despawned and rebuilt at the true cell. A teleport every couple of
+-- seconds, for every walking player on the map, for as long as they walk.
+--
+-- It hid behind the pace flag: FAST_STEP_FRAMES is derived from the
+-- player's 16 and so was always right, which left *running* players
+-- smooth and *walking* ones -- the ordinary case -- strobing.
+--
+-- Written explicitly rather than as `or nil` for that reason: the engine's
+-- default is the wrong number here, so there is never a moment when handing
+-- the pace back to it is what this mod means.
+M.WALK_STEP_FRAMES = 16
 
 -- Parties: you and one friend, travelling together.
 --

@@ -411,10 +411,15 @@ function M:advance(playerId, player)
     av.x, av.y = player.x, player.y
   end
 
-  -- Set every tick rather than per step: NPC:update reads `stepFrames or 16`
-  -- fresh every frame, so a trainer who breaks into a sprint mid-step takes
-  -- their POKéMON with them instead of stretching the lead by a tile.
-  npc.stepFrames = player.fast and Config.FAST_STEP_FRAMES or nil
+  -- Set every tick rather than per step: NPC:update reads
+  -- `stepFrames or 32` fresh every frame, so a trainer who breaks into a
+  -- sprint mid-step takes their POKéMON with them instead of stretching the
+  -- lead by a tile.  Never nil, for the reason Config.WALK_STEP_FRAMES
+  -- gives: the engine's own NPC default is half the player's pace, so
+  -- handing it back is what makes a follower shed ground until it is
+  -- rebuilt -- a teleport wearing the name of a default.
+  npc.stepFrames = player.fast and Config.FAST_STEP_FRAMES
+                                or Config.WALK_STEP_FRAMES
 
   -- mid-step: let NPC:update finish it. Interrupting strands px/py between
   -- two cells.

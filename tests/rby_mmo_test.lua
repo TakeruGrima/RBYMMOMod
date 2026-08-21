@@ -3059,8 +3059,16 @@ fakeNpc.cellX, fakeNpc.cellY = 6, 5
 
 local walkerRow = { id = "a", x = 7, y = 5, facing = "right", fast = false }
 check(avatars:advance(av, walkerRow), "advance starts the next step")
-eq(fakeNpc.stepFrames, nil,
-   "and a walking-pace row clears it back to the engine's own default")
+-- **Not** nil, which is what this asserted while the bug was in.  NPC.lua's
+-- own default is 32 frames a tile (src/world/NPC.lua:11) against the
+-- player's 16, so "clearing it back to the engine's default" walked every
+-- remote avatar at half the speed of the player it mirrors: it shed a tile
+-- per tile, crossed RESYNC_DISTANCE in about six of them and was rebuilt at
+-- the true cell -- a teleport every couple of seconds, for every *walking*
+-- player on the map.  It hid behind the pace flag, because
+-- FAST_STEP_FRAMES is derived from the player's 16 and so was always right.
+eq(fakeNpc.stepFrames, Config.WALK_STEP_FRAMES,
+   "and a walking-pace row paces the step at the player's own walk speed")
 
 -- The bug this flag's rename fixed: a cyclist's row says fast the same way a
 -- sprinter's does, because the wire carries the pace and not the reason for

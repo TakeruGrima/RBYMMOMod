@@ -424,7 +424,13 @@ section("trail", function()
   eq(npc.stepFrames, 8, "a fast trainer's follower runs too")
 
   f:advance("a", { x = 5, y = 10, facing = "down", fast = false })
-  eq(npc.stepFrames, nil, "and back to the engine's own default when they walk")
+  -- **Not** nil, which is what this asserted while the bug was in: NPC.lua's
+  -- own default is 32 frames a tile against the player's 16, so handing the
+  -- pace back to the engine walks the follower at half the speed of the
+  -- trainer it is following -- it sheds a tile per tile until it is rebuilt,
+  -- which is what a player sees as a teleport.
+  eq(npc.stepFrames, 16,
+     "and back to the *player's* walking pace, never the engine's NPC default")
 end)
 
 -- ------------------------------------------------------------------

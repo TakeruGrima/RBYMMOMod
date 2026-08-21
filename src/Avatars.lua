@@ -20,7 +20,7 @@
 --
 -- But the queue is only what *starts* a step. NPC:update owns the step
 -- itself: given facing, targetX/targetY, moving and progress, it
--- interpolates px/py over 16 frames, lands on the target cell and flips the
+-- interpolates px/py over stepFrames, lands on the target cell and flips the
 -- walk frame, all from the overworld's ordinary per-frame NPC update. So
 -- setting those five fields directly gets the full walk animation with none
 -- of the input lock -- NPC:walkPhase() returns the standing frame whenever
@@ -29,15 +29,19 @@
 --
 -- One tile is started per completed step, so an avatar walks the same way a
 -- player does and catches up naturally: presence arrives at 8Hz and a step
--- takes 16 frames, so a remote player moving at walking pace stays in step.
+-- is made to take the player's own 16 frames, so a remote player moving at
+-- walking pace stays in step.  It has to be *made* to: NPC:update's unset
+-- default is 32 (src/world/NPC.lua:11), half the player's pace, which is
+-- what used to strobe every walking avatar past RESYNC_DISTANCE every few
+-- seconds.  See Config.WALK_STEP_FRAMES.
 -- When it falls further behind than RESYNC_DISTANCE (a warp we never saw, a
 -- long stall), it is respawned rather than walked all the way.
 --
 -- A player moving at the fast pace is the same arithmetic with the 16
--- halved. NPC:update reads `stepFrames or 16` fresh every frame, so the
+-- halved. NPC:update reads `stepFrames or 32` fresh every frame, so the
 -- sixth field written below sets the pace of the step it starts:
--- FAST_STEP_FRAMES while the roster says that step was a fast one, and nil
--- -- back to the engine's own default -- the moment it says otherwise. At 8
+-- FAST_STEP_FRAMES while the roster says that step was a fast one, and
+-- WALK_STEP_FRAMES -- never nil -- the moment it says otherwise. At 8
 -- frames a tile a fast avatar covers 0.133s per tile against a 0.125s
 -- presence interval, still about one update per tile, so nothing about the
 -- catch-up above needed rethinking.
@@ -307,6 +311,22 @@ function M:cellOf(playerId)
   return av.x, av.y
 end
 
+-- The live NPC behind a player's avatar.
+--
+-- For anything that has to move in lockstep with the avatar rather than with
+-- the network -- src/Followers.lua is the caller. The distinction matters:
+-- self.spawned holds the cell the network last confirmed, which is where the
+-- avatar is *going*, while this table is where it actually is. A follower
+-- that chased the network cell would drift from the sprite it is supposed to
+-- be walking behind by however far that sprite is itself behind, and drift
+-- ends in a rebuild -- which is what a player sees as a teleport.
+function M:npcOf(playerId)
+  local av = self.spawned[playerId]
+  if not av then return nil end
+  local handle = self:handle(av)
+  return (handle and handle.npc) or av.npc
+end
+
 -- whether the avatar is mid-step right now; the end-to-end driver asserts
 -- this is ever true, which is what proves the walk actually animates
 function M:isWalking(playerId)
@@ -417,10 +437,14 @@ function M:advance(av, player)
   npc.moving = true
   npc.marching = false
   npc.progress = 0
-  -- Set per step rather than once, because the flag is per step: clearing it
-  -- to nil hands the pace back to NPC:update's own default instead of
-  -- leaving the avatar sprinting after its player stopped.
-  npc.stepFrames = player.fast and Config.FAST_STEP_FRAMES or nil
+  -- Set per step rather than once, because the flag is per step -- but never
+  -- cleared to nil.  NPC:update's own default is 32 frames a tile
+  -- (src/world/NPC.lua:11) against the player's 16, so nil is not "walking
+  -- pace", it is half of it: the avatar sheds a tile for every tile its
+  -- player walks and is rebuilt at RESYNC_DISTANCE every few seconds.  See
+  -- Config.WALK_STEP_FRAMES.
+  npc.stepFrames = player.fast and Config.FAST_STEP_FRAMES
+                                or Config.WALK_STEP_FRAMES
   av.facing = dir
   return true
 end
