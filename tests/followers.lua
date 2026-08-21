@@ -127,6 +127,10 @@ end
 -- assertions
 -- ------------------------------------------------------------------
 
+-- how far behind a follower may legitimately be before the module
+-- rebuilds it rather than walking it back (Config.RESYNC_DISTANCE)
+local Config_RESYNC_MAX = 6
+
 local passed, failed = 0, 0
 
 local function ok(condition, what)
@@ -478,6 +482,102 @@ section("dark", function()
   ok(ran, "a missing renderer never raises out of a mod callback")
   eq(next(f.spawned), nil, "nothing half-spawned is left holding an NPC")
   ok(#warns - before <= 1, "and it says why once, not every tick")
+end)
+
+-- ------------------------------------------------------------------
+-- 9. A follower walks the gap; it never jumps it
+-- ------------------------------------------------------------------
+--
+-- The failure this pins was reported from a live game as "the POK\u00e9MON
+-- teleports". Presence arrives at 8Hz and a step takes 16 frames, so a
+-- trainer walking at an ordinary pace is *always* further along than their
+-- follower has finished walking to -- being behind is the normal state, not
+-- an error state.
+--
+-- What turns that into a teleport is writing the goal straight into
+-- targetX/targetY. NPC:update interpolates px/py from the current cell to
+-- the target over stepFrames regardless of how far apart they are, so a goal
+-- four tiles away is four tiles crossed in one step. The target has to be
+-- one tile toward the goal, which is the same rule Avatars.stepToward
+-- already applies for the trainer itself.
+
+section("no teleport", function()
+  wilds = fakeWilds({ species = "MONSTER_A" })
+  spawnedNpcs, removed, nextNpcId = {}, {}, 0
+
+  local Followers = need("Followers")
+  local f = Followers.new()
+  Followers.newSprite = function(def) return { def = def } end
+
+  f:sync({ { id = "a", map = "MAP_1", x = 5, y = 7, facing = "down",
+             mon = "MONSTER_A" } }, "MAP_1")
+  local av = f.spawned["a"]
+  ok(av ~= nil, "a follower to walk")
+  if not av then return end
+  local jumps, steps, rebuilds = 0, 0, 0
+  local wasMoving = false
+  local y = 7
+
+  -- The NPC is re-read every tick rather than held: past RESYNC_DISTANCE the
+  -- module rebuilds the follower behind its trainer instead of marching it
+  -- back, and that is a *new* NPC. Holding the old table would be testing a
+  -- follower nobody is updating any more.
+  local function live()
+    local rec = f.spawned["a"]
+    return rec and spawnedNpcs[rec.npcId] or nil
+  end
+
+  -- The trainer takes a tile per tick and the engine lands the follower's
+  -- step every third one. That 3:1 is not a contrived ratio: presence
+  -- arrives every 0.125s while a walking step costs 16 frames, so a trainer
+  -- who is running -- 8 frames a tile -- outpaces a follower that has not
+  -- picked the pace up yet, and being behind is the ordinary condition this
+  -- has to survive.
+  for tick = 1, 15 do
+    y = y + 1
+    local before = f.spawned["a"] and f.spawned["a"].npcId
+    -- the same record shape sync hands it, map included: a rebuild needs a
+    -- map to spawn onto
+    f:advance("a", { id = "a", map = "MAP_1", x = 5, y = y, facing = "down",
+                     mon = "MONSTER_A" })
+    local npc = live()
+    if not npc then break end
+    if f.spawned["a"].npcId ~= before then
+      rebuilds = rebuilds + 1
+      wasMoving = false
+    end
+
+    if npc.moving and not wasMoving then
+      steps = steps + 1
+      local dx = math.abs((npc.targetX or npc.cellX) - npc.cellX)
+      local dy = math.abs((npc.targetY or npc.cellY) - npc.cellY)
+      if dx + dy > 1 then jumps = jumps + 1 end
+    end
+    wasMoving = npc.moving
+
+    if npc.moving and tick % 3 == 0 then
+      npc.cellX, npc.cellY = npc.targetX, npc.targetY
+      npc.px, npc.py = npc.cellX * 16, npc.cellY * 16
+      npc.moving = false
+      wasMoving = false
+    end
+  end
+
+  ok(steps > 0, "the follower actually took steps")
+  eq(jumps, 0,
+     "every step is one tile: a multi-tile target is what reads as a teleport")
+
+  -- And it is still trailing rather than stranded: a follower that answered
+  -- the bug by never moving would pass the check above and be just as wrong.
+  local npc = live()
+  ok(npc ~= nil and math.abs(npc.cellY - y) <= Config_RESYNC_MAX,
+     "and it is still within reach of its trainer, not left behind")
+
+  -- Falling behind is walked back where it can be and rebuilt where it
+  -- cannot, but a rebuild every step would be the teleport wearing a
+  -- different hat.
+  ok(rebuilds <= 2,
+     "and it is rebuilt rarely, not once a step: got " .. tostring(rebuilds))
 end)
 
 -- ------------------------------------------------------------------

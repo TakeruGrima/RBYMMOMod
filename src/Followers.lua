@@ -30,6 +30,9 @@
 local need, mod = ...
 local Config = need("Config")
 local Gen = need("Gen")
+-- stepToward: one tile at a time, one axis first, so a follower that has
+-- fallen behind walks the gap instead of crossing it in a single step.
+local Avatars = need("Avatars")
 
 local M = {}
 M.__index = M
@@ -317,6 +320,12 @@ function M:spawn(player)
     x = player.x,
     y = player.y,
     facing = player.facing,
+    -- Its own cell, so it stands where it was put until the trainer actually
+    -- moves. Left nil, the first goal would fall back to the trainer's
+    -- current cell and the POKéMON would take one step onto its own trainer
+    -- before the trail had anything in it.
+    goalX = cellX,
+    goalY = cellY,
     mon = player.mon,
     shiny = player.shiny == true,
     dressed = false,
@@ -386,8 +395,21 @@ function M:advance(playerId, player)
     M.decorate(npc)
   end
 
-  local fromX, fromY = av.x, av.y
-  av.x, av.y = player.x, player.y
+  -- The goal is the cell the trainer has just left, and it only moves when
+  -- they do.
+  --
+  -- **A goal, never a target.** Presence arrives at 8Hz and a step takes 16
+  -- frames, so the follower is behind for most of an ordinary walk -- that
+  -- is the normal state, not an error state. NPC:update interpolates px/py
+  -- from the current cell to targetX/targetY over stepFrames *regardless of
+  -- how far apart they are*, so writing the goal straight into the target
+  -- crosses the whole gap in one step. That is what reads as a teleport, and
+  -- it is why the step below is one tile toward the goal rather than the
+  -- goal itself -- the same rule Avatars.stepToward applies to the trainer.
+  if player.x ~= av.x or player.y ~= av.y then
+    if av.x ~= nil then av.goalX, av.goalY = av.x, av.y end
+    av.x, av.y = player.x, player.y
+  end
 
   -- Set every tick rather than per step: NPC:update reads `stepFrames or 16`
   -- fresh every frame, so a trainer who breaks into a sprint mid-step takes
@@ -398,9 +420,23 @@ function M:advance(playerId, player)
   -- two cells.
   if npc.moving then return true end
 
-  local sameCell = (fromX == player.x and fromY == player.y)
-  local alreadyThere = (npc.cellX == fromX and npc.cellY == fromY)
-  if fromX == nil or sameCell or alreadyThere then
+  local goalX = av.goalX or av.x
+  local goalY = av.goalY or av.y
+  if goalX == nil or goalY == nil or npc.cellX == nil then return true end
+
+  -- Too far behind to walk back -- a warp we never saw, a long stall -- so
+  -- rebuild it behind the trainer rather than march it across the map. The
+  -- same bound and the same reasoning as Avatars:advance.
+  if math.max(math.abs(goalX - npc.cellX), math.abs(goalY - npc.cellY))
+       > Config.RESYNC_DISTANCE then
+    return self:resync(player)
+  end
+
+  local dir, tx, ty = Avatars.stepToward(npc.cellX, npc.cellY, goalX, goalY)
+  if not dir then
+    -- Standing on the goal: face the way its trainer is facing, so a
+    -- follower waiting behind a stopped player looks at them rather than
+    -- keeping whatever heading its last step left it with.
     if player.facing and npc.facing ~= player.facing then
       npc.facing = player.facing
       av.facing = player.facing
@@ -408,14 +444,20 @@ function M:advance(playerId, player)
     return true
   end
 
-  local dir = dirFrom(npc.cellX, npc.cellY, fromX, fromY) or player.facing
-  npc.facing = dir or npc.facing
-  npc.targetX, npc.targetY = fromX, fromY
+  npc.facing = dir
+  npc.targetX, npc.targetY = tx, ty
   npc.moving = true
   npc.marching = false
   npc.progress = 0
-  av.facing = npc.facing
+  av.facing = dir
   return true
+end
+
+-- Despawn and spawn, which is the only way to move a follower without
+-- walking it: the sheet is baked into the NPC at creation.
+function M:resync(player)
+  self:despawn(player.id)
+  return self:spawn(player)
 end
 
 -- One pass per tick, over the same roster Avatars walks.
