@@ -7,11 +7,12 @@
 -- mod refuse to load without that one.
 --
 -- WHY THROUGH THE ENGINE AND NOT OFF THE REGISTRY DIRECTLY. PartyMenu.drawIcon
--- resolves `icons.bySpecies` and then the `pokemon.icon` hook -- which is
--- exactly where unique_menu_icons and new_icons write (unique_menu_icons
--- main.lua:440 and :444). Drawing through it therefore picks their art up with
--- no branch naming either mod, and with none of them installed this is the
--- same code rather than a degraded mode.
+-- resolves `icons.bySpecies` AND THEN the `pokemon.icon` hook. Icon packs sit
+-- on the first of those -- unique_menu_icons main.lua:440 and :444, new_icons
+-- main.lua:292, all `icons:override` -- while other mods write the hook
+-- instead, and only the engine's own call reads both. Drawing through it
+-- therefore picks every pack's art up with no branch naming any of them, and
+-- with none installed this is the same code rather than a degraded mode.
 --
 -- Three traps, all closed here:
 --
