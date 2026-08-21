@@ -623,6 +623,22 @@ M.BATTLE_METRONOME_POOL_MAX = 200
 -- next launch.
 M.SOLO_BATTLES_DEFAULT = false
 
+-- Whether the battle chrome is the original's Game Boy box or the arena's own
+-- modern panels.
+--
+-- **ON by default, and unlike SOLO_BATTLES that is not a contradiction.** That
+-- row is off by default because it changes what the GAME DOES: an ordinary
+-- encounter stops being the engine's battle and becomes a refereed one. This
+-- row changes only what the mod's own screen LOOKS like, and it is on because
+-- the modern band draws 10-13px type on a 640x360 canvas in white-on-slate,
+-- which is small and low-contrast in a way the tile font on white is not.
+-- Shipping the harder-to-read look by default and hiding the readable one
+-- behind a menu would be the wrong way round.
+--
+-- Nothing about the ARENA depends on this: the field, the seats, the throws and
+-- the exp sequencing are the same either way. See Battlefield.OPTION.
+M.CLASSIC_UI_DEFAULT = true
+
 -- Which BattleSim mode each solo fight is seated as.
 --
 -- Two modes rather than one, and the difference is mechanical rather than

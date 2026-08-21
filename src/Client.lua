@@ -33,6 +33,10 @@ local SoloBattle = need("SoloBattle")
 -- Required here for its option row alone; the divert that reads it lives in
 -- src/Coop.lua, which requires it for itself.
 local WildRoll = need("WildRoll")
+-- For the CLASSIC BATTLE UI row below, and to drop its cached answer when the
+-- player changes it. The key and the label are spelled there, not here, so the
+-- file that defines the row and the file that reads it cannot drift apart.
+local Battlefield = need("Battlefield")
 local Ui = need("Ui")
 local Overlay = need("Overlay")
 local Sessions = need("Sessions")
@@ -2513,7 +2517,33 @@ function M.install()
     -- from the module that reads them, the SoloBattle.OPTION pattern.
     { key = WildRoll.OPTION, label = WildRoll.OPTION_LABEL,
       type = "toggle", default = Config.WILD_EACH_DEFAULT },
+    -- The battle chrome: the original's white Game Boy box and tile font, or
+    -- the arena's own dark panels.
+    --
+    -- **On by default**, which is the opposite posture to the row above, on
+    -- purpose: that one changes what the game DOES and has to be asked for,
+    -- this one changes only how the mod's own screen reads. The modern band
+    -- draws 10-13px type in white-on-slate over busy field art; the tile font
+    -- draws 16px black on white. Defaulting to the harder-to-read one and
+    -- hiding the other behind a menu would be the wrong way round.
+    --
+    -- The arena is untouched either way -- seats, ball throws and exp
+    -- sequencing are the same; only the painter changes.
+    { key = Battlefield.OPTION, label = Battlefield.OPTION_LABEL,
+      type = "toggle", default = Config.CLASSIC_UI_DEFAULT },
   })
+
+  -- The skin answer is cached per frame-storm rather than looked up by every
+  -- widget; without this the player would flip the row and keep seeing the old
+  -- chrome until the process restarted. Idempotent and throw-proof, because
+  -- `game.ready` and friends re-fire under the dev hot reload.
+  if mod.events and mod.events.on then
+    pcall(function()
+      mod.events:on("mod.options_changed", function()
+        Battlefield.forgetSkin()
+      end)
+    end)
+  end
 
   ui:install()
 

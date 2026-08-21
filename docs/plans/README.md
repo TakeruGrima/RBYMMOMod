@@ -19,6 +19,7 @@ Working notes for features that were (or are being) implemented in this repo.
 | [`hub-twin-parity.md`](hub-twin-parity.md) | Hub.lua ↔ relay.js drift process + carve-outs |
 | [`battle-sim-move-effects.md`](battle-sim-move-effects.md) | Complete; locked BattleSim decisions |
 | [`offline-solo-battles.md`](offline-solo-battles.md) | Solo wild + trainer fights on BattleSim, option default off, no wire change — in progress |
+| [`classic-battle-ui.md`](classic-battle-ui.md) | Classic GB chrome for the arena band + plates behind `CLASSIC BATTLE UI` (default on), plus level/gender/species icons in the party pickers, no wire change — implemented |
 
 ## Historical
 

@@ -45,6 +45,8 @@ local Wire = need("Wire")
 local Effects1 = need("BattleSim/Effects")
 local Gen = need("Gen")
 local Battlefield = need("Battlefield")
+-- One model for both skins: level, gender and species icon on every party row.
+local BattleRows = need("BattleRows")
 -- The Gen 2 half of the award. Gen 1 prices a refereed faint with the engine's
 -- `src/battle/Experience.lua`, which Gold does not have -- its award lives
 -- inside a live `src/battle/gen2/Battle.lua` this screen never owns. `Exp2` is
@@ -1523,6 +1525,31 @@ function M:seatFront(speciesKey, monHint, slot, isOwn)
 end
 
 -- One Battlefield seat from a live field slot (player or foe active).
+-- The battle sheet this client actually holds for a seat, or nil.
+--
+-- Only for the plate's gender glyph, which needs an Attack DV. Ownership is the
+-- rule, exactly as it is for the exp clock below: this client holds its OWN
+-- party (`self.mine`) and, in a wild fight, the encounter it uploaded itself
+-- (`self.wildParty`). It never holds a remote peer's sheet -- the referee's
+-- field events carry no DVs -- so a PVP opponent's plate resolves nil here and
+-- draws no glyph, which is the honest answer rather than a guessed one.
+function M:seatSheet(slotIndex, isPlayer)
+  if isPlayer then
+    if slotIndex ~= self:mySlot() then return nil end
+    return self.mine and self.mine[self.active]
+  end
+  if self.mode ~= "wild" or type(self.wildParty) ~= "table" then return nil end
+  local slot = self.slots and self.slots[slotIndex]
+  if not slot then return nil end
+  local key = self:seatSpeciesKey(slot, false) or slot.species
+  for _, sheet in ipairs(self.wildParty) do
+    if sheet.speciesId == key or sheet.species == key then return sheet end
+  end
+  -- A one-monster wild encounter that named itself differently is still that
+  -- monster; a multi-monster one that matched nothing is not worth guessing at.
+  return (#self.wildParty == 1) and self.wildParty[1] or nil
+end
+
 function M:battlefieldSeat(slotIndex, isPlayer)
   local slot = self.slots[slotIndex]
   if not slot or not slot.species then return nil end
@@ -1617,6 +1644,14 @@ function M:battlefieldSeat(slotIndex, isPlayer)
     icon = icon,
     front = front,
     acting = acting,
+    -- Attack DV carrier for the plate's gender glyph. Wire spelling (`atk`),
+    -- because that is what a sheet holds; BattleRows reads either dialect.
+    -- Absent whenever this client has no sheet for the seat, which is the whole
+    -- of a remote PVP opponent -- and absent means no glyph, not a guess.
+    ivs = (function()
+      local sheet = self:seatSheet(slotIndex, isPlayer)
+      return sheet and sheet.ivs or nil
+    end)(),
   }
 end
 
@@ -3565,17 +3600,30 @@ function M:confirmPendingItem(itemId, amount)
   return true
 end
 
+-- Every party picker's rows: the switch list, the item target list, the
+-- post-faint replacement, and the two GB paths.
+--
+-- These used to be `{ index, label = tostring(mon.species), fainted, active }`,
+-- which said the monster's name and nothing else -- so the player picking a
+-- replacement could not see the LEVEL of what they were sending out, which is
+-- the one number that decides the choice. BattleRows answers that, plus the
+-- gender and the icon, for both skins at once.
+--
+-- `label` is kept alongside `name` because eight call sites read it, several of
+-- them for logic rather than paint; the enrichment is additive and nothing that
+-- worked before had to change.
 function M:partyRows()
-  local out = {}
-  for i, mon in ipairs(self.mine or {}) do
-    out[#out + 1] = {
-      index = i,
-      label = tostring(mon.species or ("#" .. i)),
-      fainted = (mon.hp or 0) <= 0,
-      active = i == self.active,
-    }
+  local rows = BattleRows.rowsFor(self.mine, {
+    -- All of them: the filtering (fainted, active, replaceOnly) is each
+    -- caller's own rule and stays where it was.
+    all = true,
+    active = self.active,
+    data = self.game and self.game.data,
+  })
+  for i, row in ipairs(rows) do
+    row.label = row.name or ("#" .. i)
   end
-  return out
+  return rows
 end
 
 function M:commitItem(partyIndex, moveIndex)
@@ -5597,12 +5645,11 @@ function M:bandPartyRows(all)
     -- SWITCH shows what it will let you pick; the item menu shows the whole
     -- party (a Revive wants the fainted one). Both match their handler.
     if all or (not row.fainted and (self.replaceOnly or not row.active)) then
-      local mon = (self.mine or {})[row.index]
-      local entry = { label = row.label, dim = row.fainted or nil }
-      if mon and tonumber(mon.hp) and tonumber(mon.maxHp) then
-        entry.right = ("%d/%d"):format(mon.hp, mon.maxHp)
-      end
-      rows[#rows + 1] = entry
+      -- The row IS the model now. The right column (level, then HP) and the
+      -- gender and icon it carries are BattleRows' answer, so the classic and
+      -- the modern painter show the same monster rather than each composing
+      -- its own idea of one.
+      rows[#rows + 1] = row
     end
   end
   return rows
@@ -5647,7 +5694,8 @@ function M:drawModernBand()
     return bandDrew(grid(self:bandCommandItems(), self.commandIndex or 1))
   end
   if self.phase == "move" or self.phase == "item_move" then
-    return bandDrew(list(self:bandMoveRows(), self.cursor, { title = "MOVES" }))
+    return bandDrew(list(self:bandMoveRows(), self.cursor,
+      { title = "MOVES", game = self.game }))
   end
   if self.phase == "target" then
     local rows = {}
@@ -5659,7 +5707,8 @@ function M:drawModernBand()
       if (seat.hp or 0) <= 0 then entry.dim = true end
       rows[#rows + 1] = entry
     end
-    return bandDrew(list(rows, self.targetIndex or 1, { title = "TARGET" }))
+    return bandDrew(list(rows, self.targetIndex or 1,
+      { title = "TARGET", game = self.game }))
   end
   if self.phase == "item" then
     local rows = {}
@@ -5669,15 +5718,16 @@ function M:drawModernBand()
         right = item.count and ("x%d"):format(item.count) or nil,
       }
     end
-    return bandDrew(list(rows, self.itemIndex or 1, { title = "ITEMS" }))
+    return bandDrew(list(rows, self.itemIndex or 1,
+      { title = "ITEMS", game = self.game }))
   end
   if self.phase == "item_party" then
     return bandDrew(list(self:bandPartyRows(true), self.switchIndex or 1,
-      { title = "POKeMON" }))
+      { title = "POKeMON", game = self.game }))
   end
   if self.phase == "switch" then
     return bandDrew(list(self:bandPartyRows(false), self.switchIndex or 1,
-      { title = "POKeMON" }))
+      { title = "POKeMON", game = self.game }))
   end
   if self.phase == "setup" then
     return bandDrew(message("Getting ready..."))

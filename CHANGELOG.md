@@ -50,6 +50,61 @@ here must match `manifest.version`.
     client keeps drawing one that has left the field, and a 22 outcome
     cleaner strips the list a caught POKéMON travels home on — so the
     refusal names both versions instead.
+- **The original's Game Boy chrome on the battle screen, behind a
+  `CLASSIC BATTLE UI` row (`F10` → `MMO`), default ON.** The menu band
+  and every field plate draw as the white bordered box with the engine's
+  own 8px tile font, its tile cursor and a GB-shaped HP bar, instead of
+  the arena's dark translucent panels. **The arena itself is untouched** —
+  same seats, same ball throws, same exp sequencing, same 2-on-2 field.
+  Only the painter changes.
+  - **On by default, unlike `SOLO BATTLES`, and the difference is the
+    point.** That row is off by default because it changes what the game
+    *does*. This one changes only how the mod's own screen *reads*, and
+    the modern band draws 10–13px type in white-on-slate over bright,
+    busy field art where the tile font draws 16px black on white.
+    Shipping the harder-to-read look by default and hiding the readable
+    one behind a menu would be the wrong way round.
+  - **No layout constant moved.** The plate rect is 176×48, which is
+    exactly 11×3 tiles at ×2, so the seats, the plate dodge and the pitch
+    rules stay as measured. The band box does not fit inside the 80px
+    band and is not meant to — a bordered box spends two tile rows on its
+    border — so it is bottom-anchored and overhangs *upward* over the
+    arena, the way the original's message box overlays the scene. The
+    field never consults it, so that costs nothing and keeps five content
+    rows.
+  - **If the classic painter cannot draw, the modern one still does.**
+    Every widget falls through rather than leaving an empty band over a
+    live fight.
+
+- **The level of a benched POKéMON, at the moment you choose it.** The
+  switch list, the item-on-POKéMON list and the post-faint replacement
+  picker now read `PIKACHU ♂ L30 45/60` instead of `PIKACHU`. This was
+  the one number that decides who you send out and the menu never said
+  it: `partyRows` built `{ label = tostring(mon.species) }` and nothing
+  else — which on a save monster also threw the player's own **nickname**
+  away, so a nicknamed POKéMON was offered under its species name. Both
+  are fixed, in **both** skins: the facts are computed once in a new
+  `src/BattleRows.lua`, above the fork between painters, so the two looks
+  cannot disagree about the same monster.
+
+- **Gender, when `gender_mod` is installed** — on your own party *and* on
+  an MMO opponent's POKéMON. No protocol work was needed: the Attack DV
+  already travels end to end (`ivs` on the party sheet, through
+  `Wire.statsOf` and `server/lib/sanitize.js`), so this is a key
+  translation (`ivs.atk` → the `dvs.attack` spelling the other mod reads)
+  rather than a wire change. `Config.PROTOCOL`, the hub twin and
+  `affects_link` are all untouched. Without `gender_mod` — including on
+  Gold, where it does not load at all — no symbol is drawn and nothing
+  errors.
+
+- **Species icons from whichever icon mod is installed** (Unique Menu
+  Icons, new_icons, …) on the party list rows and beside the name on each
+  field plate. They are resolved through the engine's own
+  `PartyMenu.drawIcon`, which reads `icons.bySpecies` and then the
+  `pokemon.icon` hook — exactly where those mods write — **at draw time**,
+  so whichever one loaded last wins with no dependency declared here and
+  no load order assumed. With none of them installed this is the same
+  code path, not a degraded mode.
 
 - **This mod's battle system, with nobody else in the room.** A new
   `SOLO BATTLES` row in the mod manager (`F10` → `MMO`), **default OFF**,

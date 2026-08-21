@@ -65,6 +65,8 @@ local Gen = need("Gen")
 local CoopSim = need("CoopSim")
 local CoopField = need("CoopField")
 local Battlefield = need("Battlefield")
+-- One model for both skins: level, gender and species icon on every party row.
+local BattleRows = need("BattleRows")
 -- The Gen 2 half of the award. See `src/Exp2.lua`'s header: Gold has no
 -- `src/battle/Experience.lua` twin, so a mediated Gen 2 faint is priced through
 -- the engine's own `src/battle/gen2/Mon` primitives instead.
@@ -6371,16 +6373,22 @@ end
 
 -- The bench, as `benchOf` filters it -- alive, and not the one already out.
 -- Same list `updateSwitch` / `updateReplace` index into.
+-- The bench, as rows.
+--
+-- This used to say the monster's name and its HP. It never said the LEVEL,
+-- which is the number that actually decides who you send out -- so the player
+-- picked blind. BattleRows answers that, and the gender and the icon with it,
+-- for whichever skin ends up painting.
+--
+-- The bench entry's own `index` is carried through rather than recomputed:
+-- these rows are positional and the handlers index the bench by it.
 function M:bandBenchRows(bench)
-  local pokemon = (self.game and self.game.data and self.game.data.pokemon) or {}
+  local data = self.game and self.game.data
   local rows = {}
   for _, entry in ipairs(bench or {}) do
-    local mon = entry.mon or {}
-    local def = pokemon[mon.species]
-    rows[#rows + 1] = {
-      label = tostring(mon.nickname or (def and def.name) or mon.species or "?"),
-      right = hpRight(mon),
-    }
+    local row = BattleRows.rowFor(entry.mon, entry.index, { data = data })
+    row.label = row.name
+    rows[#rows + 1] = row
   end
   return rows
 end
@@ -6428,7 +6436,7 @@ function M:drawBandWidgets()
       message("No one left!")
     else
       list(self:bandBenchRows(bench), self.switchIndex or 1,
-        { title = "WHO'S NEXT?" })
+        { title = "WHO'S NEXT?", game = self.game })
     end
     return true
   end
@@ -6436,7 +6444,8 @@ function M:drawBandWidgets()
     local ask = self.runAsk
     local name = ask.name
     if ask.role == "confirming" then
-      list(RUN_ANSWERS, ask.index or RUN_DEFAULT, { title = "RUN AWAY?" })
+      list(RUN_ANSWERS, ask.index or RUN_DEFAULT,
+        { title = "RUN AWAY?", game = self.game })
     elseif ask.role == "deciding" then
       list(RUN_ANSWERS, ask.index or RUN_DEFAULT,
         { title = ((name or "They") .. ": RUN?") })
@@ -6457,7 +6466,8 @@ function M:drawBandWidgets()
     -- Every move empty: Gen 1 substitutes Struggle whatever was picked, so the
     -- band says so rather than listing four moves that cannot be used.
     if not self:hasLivePP() then
-      list({ { label = "STRUGGLE" } }, 1, { title = "NO MOVES LEFT!" })
+      list({ { label = "STRUGGLE" } }, 1,
+        { title = "NO MOVES LEFT!", game = self.game })
     else
       list(self:bandMoveRows(), self.moveIndex or 1,
         { title = self:bandMoveTitle() })
@@ -6476,7 +6486,7 @@ function M:drawBandWidgets()
         dim = (mon and (mon.hp or 0) <= 0) or nil,
       }
     end
-    list(rows, self.targetIndex or 1, { title = "ATTACK WHO?" })
+    list(rows, self.targetIndex or 1, { title = "ATTACK WHO?", game = self.game })
     return true
   end
   if self.phase == "switch" then
@@ -6485,7 +6495,8 @@ function M:drawBandWidgets()
     if #bench == 0 then
       message("There's no one else to send out!")
     else
-      list(self:bandBenchRows(bench), self.switchIndex or 1, { title = "POKeMON" })
+      list(self:bandBenchRows(bench), self.switchIndex or 1,
+        { title = "POKeMON", game = self.game })
     end
     return true
   end
@@ -6502,7 +6513,7 @@ function M:drawBandWidgets()
         right = entry.count and ("x%d"):format(entry.count) or nil,
       }
     end
-    list(rows, self.itemIndex or 1, { title = "ITEMS" })
+    list(rows, self.itemIndex or 1, { title = "ITEMS", game = self.game })
     return true
   end
   if self.phase == "item_party" then
@@ -6518,7 +6529,7 @@ function M:drawBandWidgets()
         dim = row.fainted or nil,
       }
     end
-    list(rows, self.switchIndex or 1, { title = "POKeMON" })
+    list(rows, self.switchIndex or 1, { title = "POKeMON", game = self.game })
     return true
   end
   if self.phase == "item_move" then
@@ -6534,7 +6545,7 @@ function M:drawBandWidgets()
         right = tonumber(move.pp) and tostring(math.floor(move.pp)) or nil,
       }
     end
-    list(rows, self.moveIndex or 1, { title = "MOVES" })
+    list(rows, self.moveIndex or 1, { title = "MOVES", game = self.game })
     return true
   end
   message(self:boxText())
@@ -9467,15 +9478,27 @@ end
 -- The post-faint picker. Titled, because it is not the same question as the
 -- SWITCH command even though it shows the same list: this one has to be
 -- answered.
+-- The GB fallback's own rows.
+--
+-- `drawList` takes plain strings, so the level rides the label here rather than
+-- a right column this path does not have. Kept in step with the band rows on
+-- purpose: whichever chrome the player ends up looking at, the replacement
+-- picker has to name the level of what it is about to send out.
+function M:benchLabels(bench)
+  local data = self.game and self.game.data
+  local rows = {}
+  for _, entry in ipairs(bench or {}) do
+    local row = BattleRows.rowFor(entry.mon, entry.index, { data = data })
+    local right = BattleRows.rightText(row)
+    rows[#rows + 1] = right and (row.name .. " " .. right) or row.name
+  end
+  return rows
+end
+
 function M:drawReplace()
   local bench = self:benchOf(self.sim:slot(self.mine))
   if #bench == 0 then return self:drawText("No one left!") end
-  local rows = {}
-  for _, entry in ipairs(bench) do
-    local def = (self.game.data.pokemon or {})[entry.mon.species]
-    rows[#rows + 1] = (entry.mon.nickname or (def and def.name) or entry.mon.species)
-  end
-  self:drawList(rows, self.switchIndex or 1, "Who's next?")
+  self:drawList(self:benchLabels(bench), self.switchIndex or 1, "Who's next?")
 end
 
 function M:drawSwitch()
@@ -9483,12 +9506,7 @@ function M:drawSwitch()
   if #bench == 0 then
     return self:drawText("There's no one\nelse to send out!")
   end
-  local rows = {}
-  for _, entry in ipairs(bench) do
-    local def = (self.game.data.pokemon or {})[entry.mon.species]
-    rows[#rows + 1] = (entry.mon.nickname or (def and def.name) or entry.mon.species)
-  end
-  self:drawList(rows, self.switchIndex or 1)
+  self:drawList(self:benchLabels(bench), self.switchIndex or 1)
 end
 
 function M:drawItem()
